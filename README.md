@@ -79,6 +79,13 @@ docker run -d --name newapi-monitor \
 | `SMTP_USER` | 发件邮箱 | — |
 | `SMTP_PASS` | 邮箱授权码 | — |
 
+## 预览
+<img width="2176" height="1378" alt="image" src="https://github.com/user-attachments/assets/ffed3141-eb3d-4be0-a660-d41358d6f917" />
+<img width="2187" height="1392" alt="image" src="https://github.com/user-attachments/assets/900718b7-3ffa-4d97-9d61-a5697dc8b6f8" />
+<img width="2215" height="1412" alt="image" src="https://github.com/user-attachments/assets/cd10df56-500b-4108-bebc-59fec3653491" />
+<img width="2203" height="1374" alt="image" src="https://github.com/user-attachments/assets/5022b4be-e379-4a50-9aca-186d189dc8a4" />
+
+
 ## License
 
 [MIT](LICENSE)
