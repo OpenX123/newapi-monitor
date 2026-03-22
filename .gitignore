@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+
+# Environment & Secrets
+.env
+.env.local
+.env.*.local
+
+# Database (旧 SQLite 文件)
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Build output
+dist/
+.next/
+
+# IDE & Editor
+.claude/
+.playwright-mcp/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+
+# 非项目核心文件
+docs/
+client/
+方案.md
+设计规范.md

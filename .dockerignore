@@ -1,0 +1,15 @@
+node_modules
+.env
+.env.local
+*.db
+*.db-*
+docs
+client
+.claude
+.playwright-mcp
+.git
+.gitignore
+方案.md
+设计规范.md
+README.md
+LICENSE

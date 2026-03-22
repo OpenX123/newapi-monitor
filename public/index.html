@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NewAPI Monitor</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <header>
+    <div class="header-left">
+      <h1>NewAPI Monitor</h1>
+      <span class="subtitle" id="updateTime">等待数据...</span>
+    </div>
+    <div class="header-right">
+      <div class="range-selector">
+        <button class="range-btn active" data-range="today">1天</button>
+        <button class="range-btn" data-range="3d">3天</button>
+        <button class="range-btn" data-range="7d">7天</button>
+        <button class="range-btn" data-range="30d">30天</button>
+      </div>
+      <button class="btn btn-primary" id="btnRefresh"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.92-5.27l3.08-3.08"/></svg> 刷新</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- 统计卡片 -->
+    <section class="stats-row">
+      <div class="stat-card">
+        <div class="stat-value" id="statTotalLogs">-</div>
+        <div class="stat-label">总请求</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" id="statRpm">-</div>
+        <div class="stat-label">RPM</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" id="statTpm">-</div>
+        <div class="stat-label">TPM</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" id="statTokens">-</div>
+        <div class="stat-label">活跃 Token</div>
+      </div>
+      <div class="stat-card warn">
+        <div class="stat-value" id="statOverLimit">-</div>
+        <div class="stat-label">超标 Token</div>
+      </div>
+    </section>
+
+    <!-- 主 Tab -->
+    <nav class="tabs">
+      <button class="tab active" data-tab="ranking"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 20V10M12 20V4M6 20v-6"/></svg> 排行</button>
+      <button class="tab" data-tab="trend"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg> 趋势</button>
+      <button class="tab" data-tab="logs"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg> 调用记录</button>
+      <button class="tab" data-tab="actions"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg> 通知记录</button>
+      <button class="tab" data-tab="whitelist"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg> 白名单</button>
+      <button class="tab" data-tab="settings"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg> 设置</button>
+    </nav>
+
+    <!-- 排行面板 -->
+    <section class="tab-panel active" id="panel-ranking">
+      <!-- 维度子 Tab -->
+      <div class="sub-tabs">
+        <button class="sub-tab active" data-dim="token">按 Token</button>
+        <button class="sub-tab" data-dim="user">按用户</button>
+        <button class="sub-tab" data-dim="model">按模型</button>
+        <button class="sub-tab" data-dim="group">按分组</button>
+        <button class="sub-tab" data-dim="channel">按渠道</button>
+      </div>
+      <div class="toolbar">
+        <input type="text" class="search-input" id="searchInput" placeholder="搜索 Token / 用户...">
+      </div>
+      <table id="rankingTable">
+        <thead><tr id="rankingHead"></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div id="pagination" class="pagination"></div>
+    </section>
+
+    <!-- 趋势面板 -->
+    <section class="tab-panel" id="panel-trend">
+      <div class="chart-row chart-row-half">
+        <div class="chart-container">
+          <h3 class="chart-title"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg> 用户调用量排名 TOP10</h3>
+          <canvas id="userRankChart"></canvas>
+        </div>
+        <div class="chart-container">
+          <h3 class="chart-title"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg> 用户额度消耗排名 TOP10</h3>
+          <canvas id="userQuotaRankChart"></canvas>
+        </div>
+      </div>
+      <div class="chart-row chart-row-half">
+        <div class="chart-container">
+          <h3 class="chart-title"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 20V10M12 20V4M6 20v-6"/></svg> 每小时调用量</h3>
+          <canvas id="trendChart"></canvas>
+        </div>
+        <div class="chart-container">
+          <h3 class="chart-title"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg> 每小时活跃 Token / 用户</h3>
+          <canvas id="activeChart"></canvas>
+        </div>
+      </div>
+      <div class="chart-row chart-row-half">
+        <div class="chart-container">
+          <h3 class="chart-title"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg> Token 调用量排名 TOP10</h3>
+          <canvas id="tokenRankChart"></canvas>
+        </div>
+        <div class="chart-container">
+          <h3 class="chart-title"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.21 15.89A10 10 0 1 1 8 2.83"/><path d="M22 12A10 10 0 0 0 12 2v10z"/></svg> 模型调用分布</h3>
+          <canvas id="modelPieChart"></canvas>
+        </div>
+      </div>
+    </section>
+
+    <!-- 调用记录面板 -->
+    <section class="tab-panel" id="panel-logs">
+      <table id="logsTable">
+        <thead>
+          <tr>
+            <th>时间</th><th>用户</th><th>Token</th><th>模型</th><th>额度</th><th>Prompt</th><th>Completion</th><th>渠道</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <div id="logsPagination" class="pagination"></div>
+    </section>
+
+    <!-- 通知记录 -->
+    <section class="tab-panel" id="panel-actions">
+      <table id="actionsTable">
+        <thead>
+          <tr>
+            <th>时间</th><th>Token</th><th>用户</th><th>动作</th><th>说明</th><th>超限次数</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <!-- 白名单 -->
+    <section class="tab-panel" id="panel-whitelist">
+      <div class="whitelist-form">
+        <input type="number" id="wlTokenId" placeholder="Token ID">
+        <input type="text" id="wlTokenName" placeholder="Token 名称（选填）">
+        <input type="text" id="wlNote" placeholder="备注（选填）">
+        <button class="btn btn-primary" id="btnAddWhitelist">添加</button>
+      </div>
+      <table id="whitelistTable">
+        <thead>
+          <tr>
+            <th>Token ID</th><th>名称</th><th>备注</th><th>添加时间</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <!-- 设置 -->
+    <section class="tab-panel" id="panel-settings">
+      <div class="settings-form">
+        <div class="setting-item">
+          <label>轮询间隔（秒）</label>
+          <input type="number" id="cfgPollInterval" min="10" step="10">
+          <span class="setting-hint">数据自动刷新间隔</span>
+        </div>
+        <div class="setting-item">
+          <label>每日调用警告阈值</label>
+          <input type="number" id="cfgDailyLimit" min="1">
+          <span class="setting-hint">超过此值将触发通知并尝试禁用 Token</span>
+        </div>
+        <div class="setting-item">
+          <label>通知邮箱</label>
+          <input type="email" id="cfgNotifyEmail" placeholder="接收告警通知的邮箱">
+          <span class="setting-hint">留空则默认使用 SMTP 发件人邮箱</span>
+        </div>
+        <button class="btn btn-primary" id="btnSaveConfig"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg> 保存设置</button>
+        <span id="cfgSaveStatus" class="save-status"></span>
+      </div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
