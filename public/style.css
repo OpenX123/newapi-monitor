@@ -247,3 +247,109 @@ tr.over-limit:hover { background: rgba(255,77,79,0.12); }
   header { padding: 12px 16px; flex-wrap: wrap; gap: 8px; }
   .search-input { width: 100%; }
 }
+
+/* ==================== 用户分析 Modal ==================== */
+.modal-overlay {
+  display: none; position: fixed; inset: 0; z-index: 1000;
+  background: rgba(0,0,0,0.6); backdrop-filter: blur(4px);
+  justify-content: center; align-items: flex-start; padding: 40px 20px;
+  overflow-y: auto;
+}
+.modal-overlay.active { display: flex; }
+.modal {
+  background: var(--card-bg); border: 1px solid var(--border); border-radius: 16px;
+  width: 100%; max-width: 720px; box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+  animation: modalIn 0.25s ease-out;
+}
+@keyframes modalIn { from { opacity: 0; transform: translateY(-20px); } to { opacity: 1; transform: translateY(0); } }
+.modal-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 20px 24px; border-bottom: 1px solid var(--border);
+}
+.modal-header h2 { margin: 0; font-size: 18px; color: var(--text); }
+.modal-close {
+  background: none; border: none; color: var(--text-dim); font-size: 28px;
+  cursor: pointer; line-height: 1; padding: 0 4px; transition: color 0.2s;
+}
+.modal-close:hover { color: var(--text); }
+.modal-body { padding: 24px; }
+
+/* 评分条 */
+.score-section { margin-bottom: 24px; }
+.score-bar-wrap {
+  display: flex; align-items: center; gap: 12px; margin-bottom: 8px;
+}
+.score-bar {
+  flex: 1; height: 10px; background: var(--bg); border-radius: 5px; overflow: hidden;
+}
+.score-bar-fill {
+  height: 100%; border-radius: 5px; transition: width 0.6s ease-out;
+}
+.score-bar-fill.low { background: #27ae60; }
+.score-bar-fill.mid { background: #f39c12; }
+.score-bar-fill.high { background: #e74c3c; }
+.score-label { font-size: 22px; font-weight: 700; min-width: 60px; text-align: right; }
+.score-label.low { color: #2ecc71; }
+.score-label.mid { color: #f1c40f; }
+.score-label.high { color: #e74c3c; }
+.score-verdict {
+  font-size: 15px; font-weight: 600; margin-bottom: 6px;
+}
+.score-reasons {
+  display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px;
+}
+.score-reasons span {
+  padding: 3px 10px; border-radius: 12px; font-size: 12px;
+  background: rgba(231,76,60,0.15); color: #e74c3c; border: 1px solid rgba(231,76,60,0.25);
+}
+
+/* 分析模块 */
+.analysis-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
+}
+.analysis-card {
+  background: var(--bg); border-radius: 12px; padding: 16px;
+  border: 1px solid var(--border);
+}
+.analysis-card.full { grid-column: 1 / -1; }
+.analysis-card h4 {
+  margin: 0 0 12px; font-size: 13px; color: var(--text-dim);
+  text-transform: uppercase; letter-spacing: 0.5px;
+}
+.analysis-card .big-num { font-size: 28px; font-weight: 700; color: var(--text); }
+.analysis-card .sub-num { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+
+/* 间隔统计行 */
+.interval-stats {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 12px;
+}
+.interval-stat { text-align: center; }
+.interval-stat .val { font-size: 18px; font-weight: 700; color: var(--text); }
+.interval-stat .lbl { font-size: 11px; color: var(--text-dim); }
+
+/* 文字柱状图 */
+.text-bar-chart { font-family: monospace; font-size: 12px; line-height: 1.6; }
+.text-bar-chart .row { display: flex; align-items: center; gap: 6px; }
+.text-bar-chart .lbl { width: 48px; text-align: right; color: var(--text-dim); flex-shrink: 0; }
+.text-bar-chart .bar { height: 14px; border-radius: 3px; background: var(--primary); min-width: 2px; transition: width 0.4s; }
+.text-bar-chart .cnt { width: 40px; font-size: 11px; color: var(--text-dim); flex-shrink: 0; }
+
+/* 模型列表 */
+.model-list { list-style: none; padding: 0; margin: 0; }
+.model-list li {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 6px 0; border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.model-list li:last-child { border-bottom: none; }
+.model-list .mname { color: var(--text); }
+.model-list .mcount { color: var(--text-dim); }
+
+/* 分析按钮 */
+.btn-analyze {
+  background: rgba(74,158,255,0.12); color: #4a9eff; border: 1px solid rgba(74,158,255,0.25);
+  padding: 3px 10px; border-radius: 6px; font-size: 12px; cursor: pointer;
+  transition: all 0.2s;
+}
+.btn-analyze:hover { background: rgba(74,158,255,0.25); }
+

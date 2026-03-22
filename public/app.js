@@ -52,6 +52,7 @@ const COLUMNS = {
     { key: 'token_count', label: 'Token数', sortable: true },
     { key: 'count', label: '调用次数', sortable: true },
     { key: 'quota', label: '额度消耗', sortable: true },
+    { key: 'action', label: '操作', sortable: false },
   ],
   model: [
     { key: '#', label: '#' },
@@ -214,7 +215,7 @@ function renderTokenRow(t, i, limit) {
     </tr>`;
 }
 function renderUserRow(r, i) {
-  return `<tr><td>${i+1}</td><td><strong>${r.username || '-'}</strong></td><td>${r.token_count || '-'}</td><td>${r.count}</td><td>${formatQuota(r.quota)}</td></tr>`;
+  return `<tr><td>${i+1}</td><td><strong>${r.username || '-'}</strong></td><td>${r.token_count || '-'}</td><td>${r.count}</td><td>${formatQuota(r.quota)}</td><td><button class="btn-analyze" onclick="analyzeUser('${r.username}')">分析</button></td></tr>`;
 }
 function renderModelRow(r, i) {
   return `<tr><td>${i+1}</td><td><span class="model-tag">${r.model_name || '-'}</span></td><td>${r.count}</td><td>${formatQuota(r.quota)}</td></tr>`;
@@ -590,6 +591,127 @@ document.getElementById('btnSaveConfig').addEventListener('click', async () => {
   btn.disabled = false;
   setTimeout(() => { status.textContent = ''; }, 3000);
 });
+
+// ==================== 用户分析 Modal ====================
+const analysisModal = document.getElementById('analysisModal');
+document.getElementById('btnCloseModal').addEventListener('click', () => analysisModal.classList.remove('active'));
+analysisModal.addEventListener('click', e => { if (e.target === analysisModal) analysisModal.classList.remove('active'); });
+
+let analysisChart = null;
+async function analyzeUser(username) {
+  document.getElementById('modalTitle').textContent = `用户分析：${username}`;
+  document.getElementById('modalBody').innerHTML = '<div class="loading">正在分析...</div>';
+  analysisModal.classList.add('active');
+
+  const res = await api(`/api/user-analysis?username=${encodeURIComponent(username)}&range=${currentRange}`);
+  if (!res.success || !res.data) {
+    document.getElementById('modalBody').innerHTML = '<div class="loading">该时间段无该用户数据</div>';
+    return;
+  }
+  const d = res.data;
+  const b = d.basic;
+  const sc = d.score;
+  const level = sc.value >= 8 ? 'high' : sc.value >= 5 ? 'mid' : 'low';
+  const verdict = sc.value >= 8 ? '⛔ 极大概率是脚本' : sc.value >= 5 ? '⚠️ 较大可能是脚本' : sc.value >= 3 ? '🟡 有部分脚本特征' : '✅ 看起来像正常用户';
+
+  let html = '';
+
+  // 评分区
+  html += `<div class="score-section">
+    <div class="score-bar-wrap">
+      <div class="score-bar"><div class="score-bar-fill ${level}" style="width:${sc.value/sc.max*100}%"></div></div>
+      <div class="score-label ${level}">${sc.value}/${sc.max}</div>
+    </div>
+    <div class="score-verdict">${verdict}</div>
+    <div class="score-reasons">${sc.reasons.map(r => `<span>${r}</span>`).join('')}</div>
+  </div>`;
+
+  html += '<div class="analysis-grid">';
+
+  // 基本信息
+  html += `<div class="analysis-card">
+    <h4>📊 调用统计</h4>
+    <div class="big-num">${b.total_calls.toLocaleString()}</div>
+    <div class="sub-num">总调用次数</div>
+    <div style="margin-top:10px;font-size:13px;color:var(--text-dim);line-height:1.8">
+      Token数: ${b.token_count} · 模型数: ${b.model_count}<br>
+      额度: ${formatQuota(b.total_quota)}<br>
+      Prompt: ${formatNumber(b.total_prompt)} · Completion: ${formatNumber(b.total_completion)}
+    </div>
+  </div>`;
+
+  // 间隔核心指标
+  if (d.intervals) {
+    const iv = d.intervals;
+    html += `<div class="analysis-card">
+      <h4>⏱️ 间隔分析</h4>
+      <div class="interval-stats">
+        <div class="interval-stat"><div class="val">${iv.median}s</div><div class="lbl">中位数</div></div>
+        <div class="interval-stat"><div class="val">${iv.avg}s</div><div class="lbl">平均</div></div>
+        <div class="interval-stat"><div class="val">${iv.p5}s</div><div class="lbl">P5</div></div>
+        <div class="interval-stat"><div class="val">${iv.p95}s</div><div class="lbl">P95</div></div>
+      </div>
+      <div style="font-size:12px;color:var(--text-dim);line-height:1.8">
+        ≤1s: ${iv.sub1}(${(iv.sub1/iv.count*100).toFixed(1)}%)
+        · ≤3s: ${iv.sub3}(${(iv.sub3/iv.count*100).toFixed(1)}%)<br>
+        ≤5s: ${iv.sub5}(${(iv.sub5/iv.count*100).toFixed(1)}%)
+        · ≤10s: ${iv.sub10}(${(iv.sub10/iv.count*100).toFixed(1)}%)
+      </div>
+    </div>`;
+  }
+
+  // 每小时分布（文字柱状图）
+  if (d.hourly.length > 0) {
+    const maxH = Math.max(...d.hourly.map(h => h.count));
+    html += `<div class="analysis-card full">
+      <h4>🕐 每小时分布</h4>
+      <div class="text-bar-chart">
+        ${d.hourly.map(h => {
+          const pct = Math.round(h.count / maxH * 100);
+          return `<div class="row"><span class="lbl">${String(h.hour).padStart(2,'0')}:00</span><div class="bar" style="width:${pct}%"></div><span class="cnt">${h.count}</span></div>`;
+        }).join('')}
+      </div>
+    </div>`;
+  }
+
+  // 间隔直方图
+  if (d.intervals) {
+    const labels = ['0-1s','1-2s','2-3s','3-5s','5-10s','10-30s','30-60s','1-5m','5-10m','10-60m','>1h'];
+    const maxB = Math.max(...d.intervals.hist);
+    html += `<div class="analysis-card full">
+      <h4>📊 间隔分布</h4>
+      <div class="text-bar-chart">
+        ${d.intervals.hist.map((v, i) => {
+          const pct = maxB > 0 ? Math.round(v / maxB * 100) : 0;
+          return `<div class="row"><span class="lbl">${labels[i]}</span><div class="bar" style="width:${pct}%"></div><span class="cnt">${v}</span></div>`;
+        }).join('')}
+      </div>
+    </div>`;
+  }
+
+  // 模型分布
+  if (d.models.length > 0) {
+    html += `<div class="analysis-card">
+      <h4>🤖 模型分布</h4>
+      <ul class="model-list">
+        ${d.models.map(m => `<li><span class="mname">${m.model_name || '(空)'}</span><span class="mcount">${m.count}次 · ${formatQuota(m.quota)}</span></li>`).join('')}
+      </ul>
+    </div>`;
+  }
+
+  // 并发 & 快速调用
+  html += `<div class="analysis-card">
+    <h4>🔥 异常行为</h4>
+    <div style="font-size:13px;line-height:2;color:var(--text)">
+      <div>并发请求: <strong>${d.concurrentPoints}</strong> 个时间点</div>
+      <div>连续快速调用: <strong>${d.streaks.length}</strong> 段${d.streaks.length > 0 ? ' (最长 ' + Math.max(...d.streaks) + ' 次)' : ''}</div>
+      <div>深夜(0-6点): <strong>${d.nightCalls}</strong> 次 (${d.nightPct}%)</div>
+    </div>
+  </div>`;
+
+  html += '</div>'; // close analysis-grid
+  document.getElementById('modalBody').innerHTML = html;
+}
 
 // ==================== 初始化 ====================
 (async () => {

@@ -36,5 +36,3 @@ npm-debug.log*
 # 非项目核心文件
 docs/
 client/
-方案.md
-设计规范.md

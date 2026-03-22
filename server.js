@@ -358,6 +358,138 @@ app.get('/api/distribution', async (req, res) => {
   res.json({ success: true, data });
 });
 
+app.get('/api/user-analysis', async (req, res) => {
+  const { username, range } = req.query;
+  if (!username) return res.json({ success: false, message: '缺少 username' });
+  const ts = getRangeTs(range || 'today');
+
+  try {
+    // 1. 基本统计
+    const basicRes = await pool.query(`
+      SELECT COUNT(*) as total_calls, COUNT(DISTINCT token_id) as token_count,
+        COUNT(DISTINCT model_name) as model_count, user_id,
+        MIN(created_at) as first_at, MAX(created_at) as last_at,
+        SUM(quota) as total_quota, SUM(prompt_tokens) as total_prompt,
+        SUM(completion_tokens) as total_completion
+      FROM logs WHERE username = $1 AND created_at >= $2 GROUP BY user_id
+    `, [username, ts]);
+    if (basicRes.rows.length === 0) return res.json({ success: true, data: null });
+    const basic = basicRes.rows[0];
+    basic.total_calls = parseInt(basic.total_calls);
+    basic.total_quota = parseInt(basic.total_quota) || 0;
+    basic.total_prompt = parseInt(basic.total_prompt) || 0;
+    basic.total_completion = parseInt(basic.total_completion) || 0;
+
+    // 2. 每小时分布
+    const hourlyRes = await pool.query(`
+      SELECT EXTRACT(HOUR FROM TO_TIMESTAMP(created_at) AT TIME ZONE 'Asia/Shanghai')::INT as hour,
+        COUNT(*) as count
+      FROM logs WHERE username = $1 AND created_at >= $2 GROUP BY hour ORDER BY hour
+    `, [username, ts]);
+    const hourly = hourlyRes.rows.map(r => ({ hour: r.hour, count: parseInt(r.count) }));
+
+    // 3. 调用间隔分析（最近5000条）
+    const intRes = await pool.query(`
+      WITH ordered AS (
+        SELECT created_at, LAG(created_at) OVER (ORDER BY created_at) as prev_at
+        FROM logs WHERE username = $1 AND created_at >= $2
+      )
+      SELECT (created_at - prev_at) as gap FROM ordered WHERE prev_at IS NOT NULL
+      ORDER BY created_at DESC LIMIT 5000
+    `, [username, ts]);
+    let intervals = null;
+    if (intRes.rows.length > 0) {
+      const gaps = intRes.rows.map(r => parseInt(r.gap)).sort((a, b) => a - b);
+      const len = gaps.length;
+      const avg = gaps.reduce((s, v) => s + v, 0) / len;
+      const stddev = Math.sqrt(gaps.reduce((s, v) => s + (v - avg) ** 2, 0) / len);
+      const sub1 = gaps.filter(v => v <= 1).length;
+      const sub3 = gaps.filter(v => v <= 3).length;
+      const sub5 = gaps.filter(v => v <= 5).length;
+      const sub10 = gaps.filter(v => v <= 10).length;
+      // 直方图
+      const buckets = [0,1,2,3,5,10,30,60,300,600,3600,Infinity];
+      const hist = new Array(buckets.length - 1).fill(0);
+      for (const v of gaps) { for (let i = 0; i < buckets.length - 1; i++) { if (v >= buckets[i] && v < buckets[i+1]) { hist[i]++; break; } } }
+      intervals = {
+        count: len, avg: +avg.toFixed(2), median: gaps[Math.floor(len/2)],
+        min: gaps[0], max: gaps[len-1], p5: gaps[Math.floor(len*0.05)], p95: gaps[Math.floor(len*0.95)],
+        stddev: +stddev.toFixed(2), cv: +(stddev/avg).toFixed(4),
+        sub1, sub3, sub5, sub10, hist,
+      };
+    }
+
+    // 4. 模型分布
+    const modelRes = await pool.query(`
+      SELECT model_name, COUNT(*) as count, SUM(quota) as quota
+      FROM logs WHERE username = $1 AND created_at >= $2
+      GROUP BY model_name ORDER BY count DESC LIMIT 20
+    `, [username, ts]);
+    const models = modelRes.rows.map(r => ({ ...r, count: parseInt(r.count), quota: parseInt(r.quota) || 0 }));
+
+    // 5. 并发检测
+    const concurRes = await pool.query(`
+      SELECT COUNT(*) as cnt FROM (
+        SELECT created_at FROM logs WHERE username = $1 AND created_at >= $2
+        GROUP BY created_at HAVING COUNT(*) > 1
+      ) t
+    `, [username, ts]);
+    const concurrentPoints = parseInt(concurRes.rows[0].cnt);
+
+    // 6. 连续快速调用
+    const streakRes = await pool.query(`
+      WITH ordered AS (
+        SELECT created_at, LAG(created_at) OVER (ORDER BY created_at) as prev_at
+        FROM logs WHERE username = $1 AND created_at >= $2
+      ),
+      flagged AS (
+        SELECT created_at, CASE WHEN (created_at - prev_at) <= 2 THEN 0 ELSE 1 END as ng
+        FROM ordered WHERE prev_at IS NOT NULL
+      ),
+      grouped AS (SELECT *, SUM(ng) OVER (ORDER BY created_at) as grp FROM flagged)
+      SELECT COUNT(*)+1 as len FROM grouped WHERE ng = 0
+      GROUP BY grp HAVING COUNT(*) >= 4
+      ORDER BY len DESC LIMIT 10
+    `, [username, ts]);
+    const streaks = streakRes.rows.map(r => parseInt(r.len));
+
+    // 7. 深夜活跃
+    const nightRes = await pool.query(`
+      SELECT COUNT(*) FILTER (WHERE EXTRACT(HOUR FROM TO_TIMESTAMP(created_at) AT TIME ZONE 'Asia/Shanghai') BETWEEN 0 AND 5) as n
+      FROM logs WHERE username = $1 AND created_at >= $2
+    `, [username, ts]);
+    const nightCalls = parseInt(nightRes.rows[0].n);
+
+    // 8. 脚本评分
+    let score = 0; const reasons = [];
+    if (intervals) {
+      if (intervals.cv < 0.3) { score += 3; reasons.push('间隔变异系数极低'); }
+      else if (intervals.cv < 0.6) { score += 1; reasons.push('间隔变异系数较低'); }
+      const sub3pct = intervals.sub3 / intervals.count;
+      if (sub3pct > 0.5) { score += 3; reasons.push('>50%间隔≤3s'); }
+      else if (sub3pct > 0.2) { score += 2; reasons.push('>20%间隔≤3s'); }
+      else if (sub3pct > 0.05) { score += 1; reasons.push(`${(sub3pct*100).toFixed(1)}%间隔≤3s`); }
+      if (intervals.median <= 5) { score += 2; reasons.push(`中位数间隔仅${intervals.median}s`); }
+    }
+    if (basic.total_calls > 10000) { score += 2; reasons.push('调用量极高'); }
+    else if (basic.total_calls > 3000) { score += 1; reasons.push('调用量较高'); }
+    const nightPct = basic.total_calls > 0 ? nightCalls / basic.total_calls : 0;
+    if (nightPct > 0.25) { score += 1; reasons.push('深夜活跃比例高'); }
+    if (concurrentPoints > 10) { score += 2; reasons.push('大量并发请求'); }
+    else if (concurrentPoints > 0) { score += 1; reasons.push('有并发请求'); }
+    if (streaks.length > 0) { score += 2; reasons.push(`${streaks.length}段连续快速调用`); }
+
+    res.json({ success: true, data: {
+      username, basic, hourly, intervals, models, concurrentPoints, streaks,
+      nightCalls, nightPct: +(nightPct * 100).toFixed(1),
+      score: { value: score, max: 15, reasons },
+    }});
+  } catch (err) {
+    console.error('用户分析错误:', err.message);
+    res.json({ success: false, message: err.message });
+  }
+});
+
 app.get('/api/recent-logs', async (req, res) => {
   const page = Math.max(1, parseInt(req.query.p) || 1);
   const pageSize = Math.min(100, parseInt(req.query.page_size) || 20);
