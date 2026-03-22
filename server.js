@@ -119,12 +119,14 @@ function apiRequest(urlPath, method = 'GET', body = null, userId = null) {
 
 // ==================== 直接从 PostgreSQL logs 表聚合 ====================
 function getRangeTs(range) {
+  // 用 Asia/Shanghai 时区计算"今天 0 点"，避免 Docker UTC 时区导致偏移
   const now = new Date();
-  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  if (range === '3d') return Math.floor(todayStart.getTime() / 1000) - 2 * 86400;
-  if (range === '7d') return Math.floor(todayStart.getTime() / 1000) - 6 * 86400;
-  if (range === '30d') return Math.floor(todayStart.getTime() / 1000) - 29 * 86400;
-  return Math.floor(todayStart.getTime() / 1000);
+  const cnStr = now.toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' }); // YYYY-MM-DD
+  const todayStart = Math.floor(new Date(cnStr + 'T00:00:00+08:00').getTime() / 1000);
+  if (range === '3d') return todayStart - 2 * 86400;
+  if (range === '7d') return todayStart - 6 * 86400;
+  if (range === '30d') return todayStart - 29 * 86400;
+  return todayStart;
 }
 
 async function getTodayAggregation() {
@@ -286,9 +288,7 @@ async function pollAndCheck() {
     console.log(`[${new Date().toLocaleString()}] 今日共 ${total} 条日志，${tokens.length} 个 token`);
 
     // 自动通知并尝试禁用超标 token
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const startOfDayUnix = Math.floor(today.getTime() / 1000);
+    const startOfDayUnix = getRangeTs('today');
 
     for (const t of tokens) {
       if (t.count > CONFIG.dailyLimit && !whitelistSet.has(t.token_id)) {
