@@ -73,6 +73,8 @@ npm start
 <img width="2203" height="1374" alt="image" src="https://github.com/user-attachments/assets/5022b4be-e379-4a50-9aca-186d189dc8a4" />
 <img width="1659" height="935" alt="image" src="https://github.com/user-attachments/assets/78de8bce-c90d-46cb-b74c-785e29a94c43" />
 
+## 社区支持
+https://linux.do
 
 ## License
 
