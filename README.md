@@ -71,6 +71,7 @@ npm start
 <img width="2187" height="1392" alt="image" src="https://github.com/user-attachments/assets/900718b7-3ffa-4d97-9d61-a5697dc8b6f8" />
 <img width="2215" height="1412" alt="image" src="https://github.com/user-attachments/assets/cd10df56-500b-4108-bebc-59fec3653491" />
 <img width="2203" height="1374" alt="image" src="https://github.com/user-attachments/assets/5022b4be-e379-4a50-9aca-186d189dc8a4" />
+<img width="1659" height="935" alt="image" src="https://github.com/user-attachments/assets/78de8bce-c90d-46cb-b74c-785e29a94c43" />
 
 
 ## License
