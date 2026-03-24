@@ -359,9 +359,12 @@ app.get('/api/distribution', async (req, res) => {
 });
 
 app.get('/api/user-analysis', async (req, res) => {
-  const { username, range } = req.query;
-  if (!username) return res.json({ success: false, message: '缺少 username' });
+  const { username, token_id, token_name, range } = req.query;
+  if (!username && !token_id) return res.json({ success: false, message: '缺少 username 或 token_id' });
   const ts = getRangeTs(range || 'today');
+
+  const filterCol = username ? 'username' : 'token_id';
+  const filterVal = username ? username : parseInt(token_id);
 
   try {
     // 1. 基本统计
@@ -371,8 +374,8 @@ app.get('/api/user-analysis', async (req, res) => {
         MIN(created_at) as first_at, MAX(created_at) as last_at,
         SUM(quota) as total_quota, SUM(prompt_tokens) as total_prompt,
         SUM(completion_tokens) as total_completion
-      FROM logs WHERE username = $1 AND created_at >= $2 GROUP BY user_id
-    `, [username, ts]);
+      FROM logs WHERE ${filterCol} = $1 AND created_at >= $2 GROUP BY user_id
+    `, [filterVal, ts]);
     if (basicRes.rows.length === 0) return res.json({ success: true, data: null });
     const basic = basicRes.rows[0];
     basic.total_calls = parseInt(basic.total_calls);
@@ -384,22 +387,28 @@ app.get('/api/user-analysis', async (req, res) => {
     const hourlyRes = await pool.query(`
       SELECT EXTRACT(HOUR FROM TO_TIMESTAMP(created_at) AT TIME ZONE 'Asia/Shanghai')::INT as hour,
         COUNT(*) as count
-      FROM logs WHERE username = $1 AND created_at >= $2 GROUP BY hour ORDER BY hour
-    `, [username, ts]);
+      FROM logs WHERE ${filterCol} = $1 AND created_at >= $2 GROUP BY hour ORDER BY hour
+    `, [filterVal, ts]);
     const hourly = hourlyRes.rows.map(r => ({ hour: r.hour, count: parseInt(r.count) }));
 
-    // 3. 调用间隔分析（最近5000条）
+    // 3. 调用间隔分析（最近5000条，含时间序列用于散点图）
     const intRes = await pool.query(`
       WITH ordered AS (
         SELECT created_at, LAG(created_at) OVER (ORDER BY created_at) as prev_at
-        FROM logs WHERE username = $1 AND created_at >= $2
+        FROM logs WHERE ${filterCol} = $1 AND created_at >= $2
       )
-      SELECT (created_at - prev_at) as gap FROM ordered WHERE prev_at IS NOT NULL
+      SELECT created_at, (created_at - prev_at) as gap FROM ordered WHERE prev_at IS NOT NULL
       ORDER BY created_at DESC LIMIT 5000
-    `, [username, ts]);
+    `, [filterVal, ts]);
     let intervals = null;
+    let intervalTimeline = []; // 用于散点图
     if (intRes.rows.length > 0) {
       const gaps = intRes.rows.map(r => parseInt(r.gap)).sort((a, b) => a - b);
+      // 时间序列（采样最多200点用于散点图，避免前端卡顿）
+      const timelineRaw = intRes.rows.map(r => ({ t: parseInt(r.created_at), gap: parseInt(r.gap) })).reverse();
+      const step = Math.max(1, Math.floor(timelineRaw.length / 200));
+      intervalTimeline = timelineRaw.filter((_, i) => i % step === 0);
+
       const len = gaps.length;
       const avg = gaps.reduce((s, v) => s + v, 0) / len;
       const stddev = Math.sqrt(gaps.reduce((s, v) => s + (v - avg) ** 2, 0) / len);
@@ -422,25 +431,25 @@ app.get('/api/user-analysis', async (req, res) => {
     // 4. 模型分布
     const modelRes = await pool.query(`
       SELECT model_name, COUNT(*) as count, SUM(quota) as quota
-      FROM logs WHERE username = $1 AND created_at >= $2
+      FROM logs WHERE ${filterCol} = $1 AND created_at >= $2
       GROUP BY model_name ORDER BY count DESC LIMIT 20
-    `, [username, ts]);
+    `, [filterVal, ts]);
     const models = modelRes.rows.map(r => ({ ...r, count: parseInt(r.count), quota: parseInt(r.quota) || 0 }));
 
     // 5. 并发检测
     const concurRes = await pool.query(`
       SELECT COUNT(*) as cnt FROM (
-        SELECT created_at FROM logs WHERE username = $1 AND created_at >= $2
+        SELECT created_at FROM logs WHERE ${filterCol} = $1 AND created_at >= $2
         GROUP BY created_at HAVING COUNT(*) > 1
       ) t
-    `, [username, ts]);
+    `, [filterVal, ts]);
     const concurrentPoints = parseInt(concurRes.rows[0].cnt);
 
     // 6. 连续快速调用
     const streakRes = await pool.query(`
       WITH ordered AS (
         SELECT created_at, LAG(created_at) OVER (ORDER BY created_at) as prev_at
-        FROM logs WHERE username = $1 AND created_at >= $2
+        FROM logs WHERE ${filterCol} = $1 AND created_at >= $2
       ),
       flagged AS (
         SELECT created_at, CASE WHEN (created_at - prev_at) <= 2 THEN 0 ELSE 1 END as ng
@@ -450,39 +459,125 @@ app.get('/api/user-analysis', async (req, res) => {
       SELECT COUNT(*)+1 as len FROM grouped WHERE ng = 0
       GROUP BY grp HAVING COUNT(*) >= 4
       ORDER BY len DESC LIMIT 10
-    `, [username, ts]);
+    `, [filterVal, ts]);
     const streaks = streakRes.rows.map(r => parseInt(r.len));
 
     // 7. 深夜活跃
     const nightRes = await pool.query(`
       SELECT COUNT(*) FILTER (WHERE EXTRACT(HOUR FROM TO_TIMESTAMP(created_at) AT TIME ZONE 'Asia/Shanghai') BETWEEN 0 AND 5) as n
-      FROM logs WHERE username = $1 AND created_at >= $2
-    `, [username, ts]);
+      FROM logs WHERE ${filterCol} = $1 AND created_at >= $2
+    `, [filterVal, ts]);
     const nightCalls = parseInt(nightRes.rows[0].n);
 
-    // 8. 脚本评分
+    // 8. 会话检测（间隔 > 300s 即视为新会话）
+    const sessionRes = await pool.query(`
+      WITH ordered AS (
+        SELECT created_at, LAG(created_at) OVER (ORDER BY created_at) as prev_at
+        FROM logs WHERE ${filterCol} = $1 AND created_at >= $2
+      ),
+      breaks AS (
+        SELECT created_at, prev_at,
+          CASE WHEN prev_at IS NULL OR (created_at - prev_at) > 300 THEN 1 ELSE 0 END as is_break
+        FROM ordered
+      ),
+      sessions AS (
+        SELECT *, SUM(is_break) OVER (ORDER BY created_at) as session_id FROM breaks
+      )
+      SELECT session_id, COUNT(*) as calls, MIN(created_at) as start_at, MAX(created_at) as end_at,
+        MAX(created_at) - MIN(created_at) as duration
+      FROM sessions GROUP BY session_id ORDER BY session_id
+    `, [filterVal, ts]);
+    const sessionList = sessionRes.rows.map(r => ({
+      calls: parseInt(r.calls), duration: parseInt(r.duration) || 0,
+      start: parseInt(r.start_at), end: parseInt(r.end_at),
+    }));
+    const sessions = {
+      count: sessionList.length,
+      avgDuration: sessionList.length > 0 ? Math.round(sessionList.reduce((s, v) => s + v.duration, 0) / sessionList.length) : 0,
+      avgCalls: sessionList.length > 0 ? Math.round(sessionList.reduce((s, v) => s + v.calls, 0) / sessionList.length) : 0,
+      maxDuration: sessionList.length > 0 ? Math.max(...sessionList.map(s => s.duration)) : 0,
+      maxCalls: sessionList.length > 0 ? Math.max(...sessionList.map(s => s.calls)) : 0,
+    };
+
+    // 9. 星期分布
+    const weekdayRes = await pool.query(`
+      SELECT EXTRACT(DOW FROM TO_TIMESTAMP(created_at) AT TIME ZONE 'Asia/Shanghai')::INT as dow,
+        COUNT(*) as count
+      FROM logs WHERE ${filterCol} = $1 AND created_at >= $2 GROUP BY dow ORDER BY dow
+    `, [filterVal, ts]);
+    const weekday = new Array(7).fill(0);
+    for (const r of weekdayRes.rows) weekday[r.dow] = parseInt(r.count);
+
+    // 10. 脚本评分（v4：分离夜间/白天独立分析）
     let score = 0; const reasons = [];
-    if (intervals) {
-      if (intervals.cv < 0.3) { score += 3; reasons.push('间隔变异系数极低'); }
-      else if (intervals.cv < 0.6) { score += 1; reasons.push('间隔变异系数较低'); }
-      const sub3pct = intervals.sub3 / intervals.count;
-      if (sub3pct > 0.5) { score += 3; reasons.push('>50%间隔≤3s'); }
-      else if (sub3pct > 0.2) { score += 2; reasons.push('>20%间隔≤3s'); }
-      else if (sub3pct > 0.05) { score += 1; reasons.push(`${(sub3pct*100).toFixed(1)}%间隔≤3s`); }
-      if (intervals.median <= 5) { score += 2; reasons.push(`中位数间隔仅${intervals.median}s`); }
-    }
-    if (basic.total_calls > 10000) { score += 2; reasons.push('调用量极高'); }
-    else if (basic.total_calls > 3000) { score += 1; reasons.push('调用量较高'); }
+
+    // 先把 hourly 按时段分类
+    const nightHourly = hourly.filter(h => h.hour >= 0 && h.hour <= 6);
+    const dayHourly = hourly.filter(h => h.hour >= 7 && h.hour <= 23);
+    const nightActiveHours = nightHourly.length; // 0-6 点中有几个小时有调用
+    const dayActiveHours = dayHourly.length;
+    const nightCallsFromHourly = nightHourly.reduce((s, h) => s + h.count, 0);
+    const dayCallsFromHourly = dayHourly.reduce((s, h) => s + h.count, 0);
+    const activeHours = hourly.length;
+
+    // ===== 维度1：夜间活跃模式（0-6点，最强信号）=====
+    // 正常人凌晨不会持续多个小时都有调用
+    if (nightActiveHours >= 5) { score += 5; reasons.push(`凌晨${nightActiveHours}个小时持续活跃（通宵脚本）`); }
+    else if (nightActiveHours >= 3) { score += 3; reasons.push(`凌晨${nightActiveHours}个小时活跃`); }
+    else if (nightActiveHours === 0 && basic.total_calls > 50) { score -= 2; reasons.push('凌晨无活动（正常作息）'); }
+
+    // ===== 维度2：夜间调用量占比 =====
     const nightPct = basic.total_calls > 0 ? nightCalls / basic.total_calls : 0;
-    if (nightPct > 0.25) { score += 1; reasons.push('深夜活跃比例高'); }
-    if (concurrentPoints > 10) { score += 2; reasons.push('大量并发请求'); }
-    else if (concurrentPoints > 0) { score += 1; reasons.push('有并发请求'); }
-    if (streaks.length > 0) { score += 2; reasons.push(`${streaks.length}段连续快速调用`); }
+    if (nightPct > 0.4) { score += 3; reasons.push(`深夜占比${(nightPct*100).toFixed(1)}%`); }
+    else if (nightPct > 0.2) { score += 2; reasons.push(`深夜占比${(nightPct*100).toFixed(1)}%`); }
+
+    // ===== 维度3：白天+夜间全覆盖 =====
+    // 如果白天和夜间都在活跃，说明 7x24 运行
+    if (nightActiveHours >= 3 && dayActiveHours >= 5) {
+      score += 3; reasons.push(`昼夜全覆盖（夜${nightActiveHours}h+日${dayActiveHours}h）`);
+    }
+
+    // ===== 维度4：总活跃时间跨度 =====
+    if (activeHours >= 16) { score += 2; reasons.push(`横跨${activeHours}小时`); }
+    else if (activeHours <= 3) { score -= 2; reasons.push(`仅活跃${activeHours}小时（短时使用）`); }
+
+    // ===== 维度5：间隔规律性 =====
+    if (intervals) {
+      if (intervals.cv < 0.3) { score += 2; reasons.push(`间隔极度规律(CV=${intervals.cv})`); }
+      else if (intervals.cv < 0.5) { score += 1; reasons.push(`间隔较规律`); }
+    }
+
+    // ===== 维度6：并发 =====
+    if (concurrentPoints > 20) { score += 2; reasons.push(`${concurrentPoints}个并发时间点`); }
+    else if (concurrentPoints > 5) { score += 1; reasons.push(`${concurrentPoints}个并发时间点`); }
+
+    // ===== 维度7：连续快速调用 =====
+    if (streaks.length >= 5) { score += 2; reasons.push(`${streaks.length}段机器式连续调用`); }
+    else if (streaks.length >= 2) { score += 1; reasons.push(`${streaks.length}段连续调用`); }
+    else if (streaks.length === 0 && basic.total_calls > 100) { score -= 1; reasons.push('无连续爆发'); }
+
+    // ===== 维度8：星期分布 =====
+    const weekdaySum = weekday[1]+weekday[2]+weekday[3]+weekday[4]+weekday[5];
+    const weekendSum = weekday[0]+weekday[6];
+    if (weekdaySum > 0 && weekendSum > 0) {
+      const weekdayAvg = weekdaySum / 5;
+      const weekendAvg = weekendSum / 2;
+      if (weekendAvg >= weekdayAvg * 0.8) { score += 1; reasons.push('周末与工作日无差异'); }
+    }
+
+    // 兜底
+    score = Math.max(0, score);
+    const maxScore = 20;
+
+    // 调用密度（仅展示，不影响评分）
+    const density = activeHours > 0 ? Math.round(basic.total_calls / activeHours) : 0;
 
     res.json({ success: true, data: {
-      username, basic, hourly, intervals, models, concurrentPoints, streaks,
+      username: username || token_name || token_id, basic, hourly, intervals, intervalTimeline,
+      models, concurrentPoints, streaks, sessions, weekday,
       nightCalls, nightPct: +(nightPct * 100).toFixed(1),
-      score: { value: score, max: 15, reasons },
+      activeHours, nightActiveHours, dayActiveHours, density,
+      score: { value: Math.min(score, maxScore), max: maxScore, reasons },
     }});
   } catch (err) {
     console.error('用户分析错误:', err.message);

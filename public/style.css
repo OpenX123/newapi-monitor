@@ -302,6 +302,9 @@ tr.over-limit:hover { background: rgba(255,77,79,0.12); }
   padding: 3px 10px; border-radius: 12px; font-size: 12px;
   background: rgba(231,76,60,0.15); color: #e74c3c; border: 1px solid rgba(231,76,60,0.25);
 }
+.score-reasons .reason-good {
+  background: rgba(46,204,113,0.15); color: #2ecc71; border: 1px solid rgba(46,204,113,0.25);
+}
 
 /* 分析模块 */
 .analysis-grid {
@@ -349,7 +352,10 @@ tr.over-limit:hover { background: rgba(255,77,79,0.12); }
 .btn-analyze {
   background: rgba(74,158,255,0.12); color: #4a9eff; border: 1px solid rgba(74,158,255,0.25);
   padding: 3px 10px; border-radius: 6px; font-size: 12px; cursor: pointer;
-  transition: all 0.2s;
+  transition: all 0.2s; margin-bottom: 6px; display: inline-block;
 }
 .btn-analyze:hover { background: rgba(74,158,255,0.25); }
 
+/* 分析图表容器 */
+.analysis-chart-wrap { position: relative; width: 100%; max-height: 260px; }
+.analysis-chart-wrap canvas { width: 100% !important; max-height: 260px; }

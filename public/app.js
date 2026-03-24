@@ -207,15 +207,12 @@ function renderTokenRow(t, i, limit) {
       <td>${formatQuota(t.quota)}</td>
       <td><div class="model-tags">${models}</div></td>
       <td>
-        <button class="toggle-btn ${isEnabled ? 'on' : 'off'}" 
-          onclick="handleToggle(${t.token_id}, ${t.user_id}, ${isEnabled})">
-          ${isEnabled ? '<svg class="icon-sm" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="6"/></svg> 启用中' : '<svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="6"/></svg> 已禁用'}
-        </button>
+        <button class="btn-analyze" onclick="analyzeItem('token', ${t.token_id}, '${(t.token_name || t.token_id).toString().replace(/'/g, "\\'")}')">分析</button>
       </td>
     </tr>`;
 }
 function renderUserRow(r, i) {
-  return `<tr><td>${i+1}</td><td><strong>${r.username || '-'}</strong></td><td>${r.token_count || '-'}</td><td>${r.count}</td><td>${formatQuota(r.quota)}</td><td><button class="btn-analyze" onclick="analyzeUser('${r.username}')">分析</button></td></tr>`;
+  return `<tr><td>${i+1}</td><td><strong>${r.username || '-'}</strong></td><td>${r.token_count || '-'}</td><td>${r.count}</td><td>${formatQuota(r.quota)}</td><td><button class="btn-analyze" onclick="analyzeItem('user', '${r.username}', '${r.username}')">分析</button></td></tr>`;
 }
 function renderModelRow(r, i) {
   return `<tr><td>${i+1}</td><td><span class="model-tag">${r.model_name || '-'}</span></td><td>${r.count}</td><td>${formatQuota(r.quota)}</td></tr>`;
@@ -597,13 +594,17 @@ const analysisModal = document.getElementById('analysisModal');
 document.getElementById('btnCloseModal').addEventListener('click', () => analysisModal.classList.remove('active'));
 analysisModal.addEventListener('click', e => { if (e.target === analysisModal) analysisModal.classList.remove('active'); });
 
-let analysisChart = null;
-async function analyzeUser(username) {
-  document.getElementById('modalTitle').textContent = `用户分析：${username}`;
+let analysisCharts = [];
+function destroyAnalysisCharts() { analysisCharts.forEach(c => c.destroy()); analysisCharts = []; }
+
+async function analyzeItem(type, value, displayName) {
+  document.getElementById('modalTitle').textContent = `${type === 'user' ? '用户' : 'Token'}分析：${displayName}`;
   document.getElementById('modalBody').innerHTML = '<div class="loading">正在分析...</div>';
   analysisModal.classList.add('active');
+  destroyAnalysisCharts();
 
-  const res = await api(`/api/user-analysis?username=${encodeURIComponent(username)}&range=${currentRange}`);
+  const query = type === 'user' ? `username=${encodeURIComponent(value)}` : `token_id=${value}&token_name=${encodeURIComponent(displayName)}`;
+  const res = await api(`/api/user-analysis?${query}&range=${currentRange}`);
   if (!res.success || !res.data) {
     document.getElementById('modalBody').innerHTML = '<div class="loading">该时间段无该用户数据</div>';
     return;
@@ -611,8 +612,8 @@ async function analyzeUser(username) {
   const d = res.data;
   const b = d.basic;
   const sc = d.score;
-  const level = sc.value >= 8 ? 'high' : sc.value >= 5 ? 'mid' : 'low';
-  const verdict = sc.value >= 8 ? '⛔ 极大概率是脚本' : sc.value >= 5 ? '⚠️ 较大可能是脚本' : sc.value >= 3 ? '🟡 有部分脚本特征' : '✅ 看起来像正常用户';
+  const level = sc.value >= 14 ? 'high' : sc.value >= 8 ? 'mid' : 'low';
+  const verdict = sc.value >= 14 ? '⛔ 极大概率是脚本' : sc.value >= 8 ? '⚠️ 较大可能是脚本' : sc.value >= 4 ? '🟡 有部分脚本特征' : '✅ 看起来像正常用户';
 
   let html = '';
 
@@ -623,7 +624,10 @@ async function analyzeUser(username) {
       <div class="score-label ${level}">${sc.value}/${sc.max}</div>
     </div>
     <div class="score-verdict">${verdict}</div>
-    <div class="score-reasons">${sc.reasons.map(r => `<span>${r}</span>`).join('')}</div>
+    <div class="score-reasons">${sc.reasons.map(r => {
+      const isGood = r.includes('人类') || r.includes('正常') || r.includes('休息') || r.includes('集中');
+      return isGood ? `<span class="reason-good">${r}</span>` : `<span>${r}</span>`;
+    }).join('')}</div>
   </div>`;
 
   html += '<div class="analysis-grid">';
@@ -635,10 +639,29 @@ async function analyzeUser(username) {
     <div class="sub-num">总调用次数</div>
     <div style="margin-top:10px;font-size:13px;color:var(--text-dim);line-height:1.8">
       Token数: ${b.token_count} · 模型数: ${b.model_count}<br>
+      活跃: ${d.activeHours || '-'}h（夜${d.nightActiveHours || 0}+日${d.dayActiveHours || 0}） · 密度: ${d.density || '-'}次/h<br>
       额度: ${formatQuota(b.total_quota)}<br>
       Prompt: ${formatNumber(b.total_prompt)} · Completion: ${formatNumber(b.total_completion)}
     </div>
   </div>`;
+
+  // 会话分析
+  if (d.sessions) {
+    const ss = d.sessions;
+    const fmtDur = s => s >= 3600 ? (s/3600).toFixed(1)+'h' : s >= 60 ? Math.round(s/60)+'m' : s+'s';
+    html += `<div class="analysis-card">
+      <h4>🧩 会话分析</h4>
+      <div class="interval-stats">
+        <div class="interval-stat"><div class="val">${ss.count}</div><div class="lbl">会话数</div></div>
+        <div class="interval-stat"><div class="val">${fmtDur(ss.avgDuration)}</div><div class="lbl">平均时长</div></div>
+        <div class="interval-stat"><div class="val">${ss.avgCalls}</div><div class="lbl">均次数</div></div>
+        <div class="interval-stat"><div class="val">${fmtDur(ss.maxDuration)}</div><div class="lbl">最长会话</div></div>
+      </div>
+      <div style="font-size:12px;color:var(--text-dim);line-height:1.6">
+        ${ss.count <= 2 && b.total_calls > 100 ? '⚠️ 会话极少，几乎无休息间隔' : ss.count >= 10 ? '✅ 有明显的工作-休息周期' : '会话模式正常'}
+      </div>
+    </div>`;
+  }
 
   // 间隔核心指标
   if (d.intervals) {
@@ -660,45 +683,6 @@ async function analyzeUser(username) {
     </div>`;
   }
 
-  // 每小时分布（文字柱状图）
-  if (d.hourly.length > 0) {
-    const maxH = Math.max(...d.hourly.map(h => h.count));
-    html += `<div class="analysis-card full">
-      <h4>🕐 每小时分布</h4>
-      <div class="text-bar-chart">
-        ${d.hourly.map(h => {
-          const pct = Math.round(h.count / maxH * 100);
-          return `<div class="row"><span class="lbl">${String(h.hour).padStart(2,'0')}:00</span><div class="bar" style="width:${pct}%"></div><span class="cnt">${h.count}</span></div>`;
-        }).join('')}
-      </div>
-    </div>`;
-  }
-
-  // 间隔直方图
-  if (d.intervals) {
-    const labels = ['0-1s','1-2s','2-3s','3-5s','5-10s','10-30s','30-60s','1-5m','5-10m','10-60m','>1h'];
-    const maxB = Math.max(...d.intervals.hist);
-    html += `<div class="analysis-card full">
-      <h4>📊 间隔分布</h4>
-      <div class="text-bar-chart">
-        ${d.intervals.hist.map((v, i) => {
-          const pct = maxB > 0 ? Math.round(v / maxB * 100) : 0;
-          return `<div class="row"><span class="lbl">${labels[i]}</span><div class="bar" style="width:${pct}%"></div><span class="cnt">${v}</span></div>`;
-        }).join('')}
-      </div>
-    </div>`;
-  }
-
-  // 模型分布
-  if (d.models.length > 0) {
-    html += `<div class="analysis-card">
-      <h4>🤖 模型分布</h4>
-      <ul class="model-list">
-        ${d.models.map(m => `<li><span class="mname">${m.model_name || '(空)'}</span><span class="mcount">${m.count}次 · ${formatQuota(m.quota)}</span></li>`).join('')}
-      </ul>
-    </div>`;
-  }
-
   // 并发 & 快速调用
   html += `<div class="analysis-card">
     <h4>🔥 异常行为</h4>
@@ -709,8 +693,124 @@ async function analyzeUser(username) {
     </div>
   </div>`;
 
+  // === Chart.js 图表区 ===
+  // 每小时分布 (Chart.js bar)
+  if (d.hourly.length > 0) {
+    html += `<div class="analysis-card full">
+      <h4>🕐 每小时分布</h4>
+      <div class="analysis-chart-wrap"><canvas id="chartHourly"></canvas></div>
+    </div>`;
+  }
+
+  // 调用节奏散点图
+  if (d.intervalTimeline && d.intervalTimeline.length > 0) {
+    html += `<div class="analysis-card full">
+      <h4>💫 调用节奏（时间 vs 间隔）</h4>
+      <div class="analysis-chart-wrap"><canvas id="chartRhythm"></canvas></div>
+    </div>`;
+  }
+
+  // 间隔分布 (Chart.js bar)
+  if (d.intervals) {
+    html += `<div class="analysis-card full">
+      <h4>📊 间隔分布</h4>
+      <div class="analysis-chart-wrap"><canvas id="chartIntervals"></canvas></div>
+    </div>`;
+  }
+
+  // 星期分布
+  if (d.weekday) {
+    html += `<div class="analysis-card">
+      <h4>📅 星期分布</h4>
+      <div class="analysis-chart-wrap"><canvas id="chartWeekday"></canvas></div>
+    </div>`;
+  }
+
+  // 模型分布 (Chart.js doughnut)
+  if (d.models.length > 0) {
+    html += `<div class="analysis-card">
+      <h4>🤖 模型分布</h4>
+      <div class="analysis-chart-wrap"><canvas id="chartModels"></canvas></div>
+    </div>`;
+  }
+
   html += '</div>'; // close analysis-grid
   document.getElementById('modalBody').innerHTML = html;
+
+  // === 渲染 Chart.js 图表 ===
+  const chartColors = ['#4a9eff','#ff6b6b','#feca57','#48dbfb','#ff9ff3','#54a0ff','#5f27cd','#01a3a4','#f368e0','#ff9f43'];
+  const chartScale = { x: { ticks: { color: '#888' }, grid: { color: 'rgba(255,255,255,0.05)' } }, y: { ticks: { color: '#888' }, grid: { color: 'rgba(255,255,255,0.05)' } } };
+
+  function safeChart(id, fn) { try { const el = document.getElementById(id); if (el) analysisCharts.push(fn(el.getContext('2d'))); } catch(e) { console.warn('Chart error:', id, e); } }
+
+  // 每小时分布
+  if (d.hourly.length > 0) {
+    safeChart('chartHourly', ctx => new Chart(ctx, {
+      type: 'bar',
+      data: { labels: Array.from({length:24}, (_,i) => String(i).padStart(2,'0')+':00'), datasets: [{
+        label: '调用次数',
+        data: (() => { const m = {}; d.hourly.forEach(h => m[h.hour] = h.count); return Array.from({length:24}, (_,i) => m[i] || 0); })(),
+        backgroundColor: Array.from({length:24}, (_,h) => (h >= 0 && h <= 6) ? 'rgba(255,107,107,0.7)' : 'rgba(74,158,255,0.6)'),
+        borderRadius: 3,
+      }] },
+      options: { responsive: true, plugins: { legend: { display: false } }, scales: { ...chartScale, y: { ...chartScale.y, beginAtZero: true } } },
+    }));
+  }
+
+  // 调用节奏散点图（使用线性轴，避免 date adapter 依赖）
+  if (d.intervalTimeline && d.intervalTimeline.length > 0) {
+    const maxGap = 300;
+    const tl = d.intervalTimeline;
+    const labels = tl.map(p => new Date(p.t * 1000).toLocaleString('zh-CN', {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}));
+    safeChart('chartRhythm', ctx => new Chart(ctx, {
+      type: 'scatter',
+      data: { datasets: [{
+        label: '调用间隔(s)',
+        data: tl.map((p, i) => ({ x: i, y: Math.min(p.gap, maxGap) })),
+        pointBackgroundColor: tl.map(p => p.gap <= 3 ? '#ff6b6b' : p.gap <= 10 ? '#feca57' : '#4a9eff'),
+        pointRadius: 3, pointHoverRadius: 5,
+      }] },
+      options: {
+        responsive: true,
+        plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => `间隔: ${ctx.parsed.y}s\n时间: ${labels[ctx.parsed.x] || ''}` } } },
+        scales: {
+          x: { ticks: { color: '#888', maxTicksLimit: 8, callback: (v) => labels[v] || '' }, grid: { color: 'rgba(255,255,255,0.05)' } },
+          y: { ticks: { color: '#888', callback: v => v >= maxGap ? '≥5m' : v + 's' }, grid: { color: 'rgba(255,255,255,0.05)' }, beginAtZero: true, suggestedMax: maxGap },
+        },
+      },
+    }));
+  }
+
+  // 间隔分布
+  if (d.intervals) {
+    const labels = ['0-1s','1-2s','2-3s','3-5s','5-10s','10-30s','30-60s','1-5m','5-10m','10-60m','>1h'];
+    const barColors = ['#e74c3c','#e74c3c','#f39c12','#f39c12','#f1c40f','#2ecc71','#27ae60','#4a9eff','#4a9eff','#4a9eff','#4a9eff'];
+    safeChart('chartIntervals', ctx => new Chart(ctx, {
+      type: 'bar',
+      data: { labels, datasets: [{ label: '次数', data: d.intervals.hist, backgroundColor: barColors.map(c => c + 'cc'), borderRadius: 3 }] },
+      options: { responsive: true, plugins: { legend: { display: false } }, scales: { ...chartScale, y: { ...chartScale.y, beginAtZero: true } } },
+    }));
+  }
+
+  // 星期分布
+  if (d.weekday) {
+    const dayLabels = ['周日','周一','周二','周三','周四','周五','周六'];
+    const weekendColors = d.weekday.map((_,i) => (i === 0 || i === 6) ? 'rgba(255,107,107,0.7)' : 'rgba(74,158,255,0.6)');
+    safeChart('chartWeekday', ctx => new Chart(ctx, {
+      type: 'bar',
+      data: { labels: dayLabels, datasets: [{ label: '调用次数', data: d.weekday, backgroundColor: weekendColors, borderRadius: 3 }] },
+      options: { responsive: true, plugins: { legend: { display: false } }, scales: { ...chartScale, y: { ...chartScale.y, beginAtZero: true } } },
+    }));
+  }
+
+  // 模型分布环形图
+  if (d.models.length > 0) {
+    safeChart('chartModels', ctx => new Chart(ctx, {
+      type: 'doughnut',
+      data: { labels: d.models.map(m => m.model_name || '(空)'), datasets: [{ data: d.models.map(m => m.count), backgroundColor: chartColors }] },
+      options: { responsive: true, plugins: { legend: { position: 'right', labels: { color: '#e0e0e0', font: { size: 11 }, padding: 6, usePointStyle: true, boxWidth: 8 } }, tooltip: { callbacks: { label: ctx => `${ctx.label}: ${ctx.parsed.toLocaleString()}次` } } } },
+    }));
+  }
 }
 
 // ==================== 初始化 ====================
