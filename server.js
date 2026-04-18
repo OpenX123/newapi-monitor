@@ -4,6 +4,7 @@ const path = require('path');
 const https = require('https');
 const http = require('http');
 const { Pool } = require('pg');
+const { createClient } = require('redis');
 const nodemailer = require('nodemailer');
 const express = require('express');
 const app = express();
@@ -19,8 +20,16 @@ const CONFIG = {
   pollInterval: parseInt(process.env.POLL_INTERVAL) || 300000,
   port: parseInt(process.env.PORT) || 3456,
   notifyEmail: process.env.SMTP_USER || '',
+  redisHost: process.env.REDIS_HOST || '',
+  redisPort: parseInt(process.env.REDIS_PORT) || 6379,
+  redisPassword: process.env.REDIS_PASSWORD || '',
+  redisDb: parseInt(process.env.REDIS_DB) || 0,
+  redisKeyPrefix: process.env.REDIS_KEY_PREFIX || 'newapi-monitor',
+  cacheTtlSeconds: parseInt(process.env.CACHE_TTL_SECONDS) || 120,
 };
 let pollTimer = null;
+let redis = null;
+let redisReady = false;
 
 // ==================== 邮件配置 ====================
 const transporter = nodemailer.createTransport({
@@ -46,6 +55,7 @@ async function initDB() {
       username TEXT,
       action TEXT,
       reason TEXT,
+      action_meta JSONB,
       daily_count INTEGER,
       created_at INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())::INTEGER
     );
@@ -62,6 +72,7 @@ async function initDB() {
       value TEXT
     );
   `);
+  await pool.query('ALTER TABLE monitor_actions ADD COLUMN IF NOT EXISTS action_meta JSONB');
 }
 
 // kv 存储
@@ -80,6 +91,108 @@ async function loadSavedConfig() {
     if (row.key === 'dailyLimit') CONFIG.dailyLimit = parseInt(row.value);
     if (row.key === 'pollInterval') CONFIG.pollInterval = parseInt(row.value);
     if (row.key === 'notifyEmail') CONFIG.notifyEmail = row.value;
+  }
+}
+
+// ==================== Redis 缓存 ====================
+function cacheKey(key) {
+  return `${CONFIG.redisKeyPrefix}:${key}`;
+}
+
+async function initRedis() {
+  if (!CONFIG.redisHost) return;
+  redis = createClient({
+    socket: {
+      host: CONFIG.redisHost,
+      port: CONFIG.redisPort,
+      reconnectStrategy: (retries) => Math.min(retries * 250, 3000),
+    },
+    password: CONFIG.redisPassword || undefined,
+    database: CONFIG.redisDb,
+  });
+  redis.on('error', (err) => {
+    redisReady = false;
+    console.error('Redis 错误:', err.message);
+  });
+  redis.on('ready', () => {
+    redisReady = true;
+    console.log(`🧠 Redis 已连接: ${CONFIG.redisHost}:${CONFIG.redisPort}/${CONFIG.redisDb}`);
+  });
+  try {
+    await redis.connect();
+  } catch (err) {
+    redisReady = false;
+    console.error('Redis 初始化失败，将回退为直查数据库:', err.message);
+  }
+}
+
+async function cacheGet(key) {
+  if (!redisReady) return null;
+  try {
+    return await redis.get(cacheKey(key));
+  } catch (err) {
+    redisReady = false;
+    console.error('Redis 读取失败:', err.message);
+    return null;
+  }
+}
+
+async function cacheGetJson(key) {
+  const raw = await cacheGet(key);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function cacheSetJson(key, value, ttlSeconds = CONFIG.cacheTtlSeconds) {
+  if (!redisReady) return;
+  try {
+    await redis.set(cacheKey(key), JSON.stringify(value), { EX: ttlSeconds });
+  } catch (err) {
+    redisReady = false;
+    console.error('Redis 写入失败:', err.message);
+  }
+}
+
+async function cacheDeleteByPrefix(prefix) {
+  if (!redisReady) return;
+  try {
+    const keys = [];
+    for await (const key of redis.scanIterator({ MATCH: `${cacheKey(prefix)}*`, COUNT: 100 })) {
+      keys.push(key);
+    }
+    if (keys.length) await redis.del(keys);
+  } catch (err) {
+    redisReady = false;
+    console.error('Redis 删除失败:', err.message);
+  }
+}
+
+async function withCacheLock(lockName, fn) {
+  if (!redisReady) return fn();
+  const lock = cacheKey(`lock:${lockName}`);
+  try {
+    const acquired = await redis.set(lock, String(Date.now()), { NX: true, EX: 10 });
+    if (acquired) {
+      try {
+        return await fn();
+      } finally {
+        await redis.del(lock).catch(() => {});
+      }
+    }
+    for (let i = 0; i < 20; i++) {
+      await sleep(100);
+      const exists = await redis.exists(lock).catch(() => 0);
+      if (!exists) break;
+    }
+    return await fn();
+  } catch (err) {
+    redisReady = false;
+    console.error('Redis 锁失败:', err.message);
+    return await fn();
   }
 }
 
@@ -129,6 +242,353 @@ function getRangeTs(range) {
   return todayStart;
 }
 
+function getRangeAnchor(range) {
+  const now = new Date();
+  const cnStr = now.toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' });
+  return `${range}:${cnStr}`;
+}
+
+function parseOtherJson(text) {
+  if (!text || typeof text !== 'string' || text[0] !== '{') return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    return {};
+  }
+}
+
+const NORMALIZATION_RULES = [
+  { pattern: /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, replacement: '<UUID>' },
+  { pattern: /\(cch_session_id:\s*[0-9a-zA-Z-]+\)/gi, replacement: '(cch_session_id: <ID>)' },
+  { pattern: /\b(session|request|trace|log|span)_id[=:]\s*[a-zA-Z0-9_-]+/gi, replacement: '$1_id=<ID>' },
+  { pattern: /\(\d+\)/g, replacement: '(<NUM>)' },
+  { pattern: /\b\d{7,}\b/g, replacement: '<ID>' },
+  { pattern: /\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?/g, replacement: '<TIME>' },
+  { pattern: /\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?\b/g, replacement: '<IP>' },
+  { pattern: /\b[0-9a-f]{16,32}\b/gi, replacement: '<HEX>' },
+  { pattern: /https?:\/\/[^\s]+/gi, replacement: '<URL>' },
+];
+
+function normalizeErrorContent(content) {
+  if (!content || content === '') return '(空)';
+  let normalized = content;
+  for (const rule of NORMALIZATION_RULES) {
+    normalized = normalized.replace(rule.pattern, rule.replacement);
+  }
+  return normalized.length > 200 ? normalized.slice(0, 200) + '...' : normalized;
+}
+
+function compactErrorText(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function includesAny(text, keywords) {
+  return keywords.some(keyword => text.includes(keyword));
+}
+
+function classifyMainFailure(row) {
+  const statusCode = String(row.status_code || 'unknown').toLowerCase();
+  const errorType = compactErrorText(row.error_type);
+  const content = compactErrorText(row.content);
+  const haystack = `${statusCode} ${errorType} ${content}`;
+
+  if (includesAny(haystack, [
+    'insufficient_quota', 'quota exceeded', 'quota exhausted', 'out of quota',
+    'billing', 'balance', 'credit', '余额不足', '额度不足', '配额不足',
+  ])) {
+    return { category_code: 'quota', category_label: '配额/余额不足' };
+  }
+
+  if (includesAny(haystack, [
+    'rate limit', 'too many requests', 'rate_limit', 'request limit',
+    'requests per min', '频率限制', '限流', '请求过多',
+  ])) {
+    return { category_code: 'rate_limit', category_label: '限流/请求过多' };
+  }
+
+  if (includesAny(haystack, [
+    'invalid_api_key', 'invalid api key', 'unauthorized', 'authentication',
+    'auth', 'forbidden', 'permission', 'access token', 'api key',
+    '令牌无效', '鉴权失败', '认证失败', '权限不足', '未授权',
+  ])) {
+    return { category_code: 'auth', category_label: '鉴权/权限问题' };
+  }
+
+  if (includesAny(haystack, [
+    'model_not_found', 'no such model', 'model does not exist', 'unsupported model',
+    '模型不存在', '模型不可用', '不支持该模型',
+  ])) {
+    return { category_code: 'model', category_label: '模型不存在/不可用' };
+  }
+
+  if (includesAny(haystack, [
+    'context_length', 'maximum context length', 'max context length', 'token limit',
+    'too many tokens', 'context window', '上下文长度', '超出上下文', 'token 超限',
+  ])) {
+    return { category_code: 'context_length', category_label: '上下文/Token 超限' };
+  }
+
+  if (includesAny(haystack, [
+    'content_filter', 'content filter', 'safety', 'moderation', 'policy',
+    '内容审核', '安全策略', '内容过滤', '策略拦截',
+  ])) {
+    return { category_code: 'policy', category_label: '内容审核/策略拦截' };
+  }
+
+  if (includesAny(haystack, [
+    'timeout', 'timed out', 'deadline exceeded', 'connection timeout',
+    'read timeout', 'connect timeout', '超时', '请求超时', '连接超时',
+  ])) {
+    return { category_code: 'timeout', category_label: '超时/响应过慢' };
+  }
+
+  if (includesAny(haystack, [
+    'connection reset', 'connection aborted', 'connection refused', 'broken pipe',
+    'econnreset', 'econnrefused', 'socket hang up', 'network', 'upstream connect',
+    '断开连接', '连接重置', '网络错误', '上游连接失败',
+  ])) {
+    return { category_code: 'network', category_label: '网络/连接异常' };
+  }
+
+  if (statusCode.startsWith('5') || includesAny(haystack, [
+    'internal server error', 'bad gateway', 'gateway error', 'service unavailable',
+    'server error', 'overloaded', 'upstream', '服务器错误', '服务不可用', '网关错误',
+  ])) {
+    return { category_code: 'upstream_5xx', category_label: '上游服务异常' };
+  }
+
+  if (statusCode.startsWith('4') || includesAny(haystack, [
+    'invalid request', 'bad request', 'unprocessable', 'parameter',
+    '参数错误', '请求参数', '请求格式错误',
+  ])) {
+    return { category_code: 'invalid_request', category_label: '请求参数/格式错误' };
+  }
+
+  if (errorType && errorType !== 'unknown') {
+    return { category_code: `error_type:${errorType}`, category_label: row.error_type };
+  }
+
+  if (statusCode && statusCode !== 'unknown') {
+    return { category_code: `status:${statusCode}`, category_label: `HTTP ${row.status_code}` };
+  }
+
+  return { category_code: 'unknown', category_label: '未知主失败' };
+}
+
+function classifyStreamFailure(row) {
+  const endReason = compactErrorText(row.stream_end_reason);
+  const content = compactErrorText(row.content);
+  const haystack = `${endReason} ${content}`;
+
+  if (includesAny(haystack, [
+    'timeout', 'timed out', 'deadline exceeded', '超时', '等待超时',
+  ])) {
+    return { category_code: 'stream_timeout', category_label: '流式超时' };
+  }
+
+  if (includesAny(haystack, [
+    'client_disconnect', 'disconnect', 'connection reset', 'socket closed',
+    'broken pipe', 'econnreset', '连接断开', '连接重置', '客户端断开',
+  ])) {
+    return { category_code: 'stream_disconnect', category_label: '流式连接断开' };
+  }
+
+  if (includesAny(haystack, [
+    'cancel', 'aborted', 'abort', '取消', '中止',
+  ])) {
+    return { category_code: 'stream_cancelled', category_label: '流式被取消/中止' };
+  }
+
+  if (includesAny(haystack, [
+    'upstream', 'provider', 'server error', 'internal error', '服务异常', '上游异常',
+  ])) {
+    return { category_code: 'stream_upstream', category_label: '流式上游异常' };
+  }
+
+  if (endReason && endReason !== 'unknown') {
+    return { category_code: `stream:${endReason}`, category_label: `流式中断/${row.stream_end_reason}` };
+  }
+
+  return { category_code: 'stream:unknown', category_label: '未知流式中断' };
+}
+
+function classifyErrorGroup(row) {
+  return row.type === 5 ? classifyMainFailure(row) : classifyStreamFailure(row);
+}
+
+function extractScriptSignals(otherText) {
+  const other = parseOtherJson(otherText);
+  const affinity = other.admin_info && other.admin_info.channel_affinity ? other.admin_info.channel_affinity : {};
+  const reason = String(affinity.reason || '').toLowerCase();
+  const ruleName = String((affinity.override_template && affinity.override_template.rule_name) || '').toLowerCase();
+  const keyPath = String(affinity.key_path || '');
+  const signals = [];
+  const traceTypes = new Set();
+
+  if (reason.includes('claude cli trace') || ruleName.includes('claude cli trace')) {
+    signals.push('命中 claude cli trace');
+    traceTypes.add('claude cli trace');
+  }
+  if (reason.includes('codex cli trace') || ruleName.includes('codex cli trace')) {
+    signals.push('命中 codex cli trace');
+    traceTypes.add('codex cli trace');
+  }
+  if (keyPath === 'metadata.user_id') {
+    signals.push('命中 metadata.user_id 链路');
+    traceTypes.add('key_path:metadata.user_id');
+  }
+  if (keyPath === 'prompt_cache_key') {
+    signals.push('命中 prompt_cache_key 链路');
+    traceTypes.add('key_path:prompt_cache_key');
+  }
+
+  return {
+    matched: signals.length > 0,
+    reason,
+    ruleName,
+    keyPath,
+    signals,
+    traceTypes: Array.from(traceTypes),
+  };
+}
+
+function buildScriptDisableDecision(flaggedCalls, totalCalls) {
+  const ratio = totalCalls > 0 ? flaggedCalls / totalCalls : 0;
+  return {
+    flagged_calls: flaggedCalls,
+    total_calls: totalCalls,
+    flagged_ratio: +ratio.toFixed(4),
+    ratio_pct: +(ratio * 100).toFixed(1),
+    eligible: false,
+  };
+}
+
+async function getLatestLogCursor() {
+  const { rows } = await pool.query(`
+    SELECT
+      COALESCE(MAX(id), 0) AS max_id,
+      COALESCE(MAX(created_at), 0) AS max_created_at
+    FROM logs
+    WHERE created_at IS NOT NULL
+  `);
+  return {
+    maxId: parseInt(rows[0].max_id) || 0,
+    maxCreatedAt: parseInt(rows[0].max_created_at) || 0,
+    anchor: getRangeAnchor('today'),
+  };
+}
+
+async function readCacheEnvelope(key) {
+  return await cacheGetJson(key);
+}
+
+async function writeCacheEnvelope(key, value, meta = {}, ttlSeconds = CONFIG.cacheTtlSeconds) {
+  await cacheSetJson(key, { meta, value }, ttlSeconds);
+}
+
+async function getOrBuildCached(key, range, builder, ttlSeconds = CONFIG.cacheTtlSeconds) {
+  const anchor = getRangeAnchor(range);
+  const cursor = await getLatestLogCursor();
+  const cached = await readCacheEnvelope(key);
+  if (cached && cached.meta && cached.meta.anchor === anchor && cached.meta.lastLogId === cursor.maxId) {
+    return cached.value;
+  }
+  return await withCacheLock(key, async () => {
+    const secondRead = await readCacheEnvelope(key);
+    if (secondRead && secondRead.meta && secondRead.meta.anchor === anchor && secondRead.meta.lastLogId === cursor.maxId) {
+      return secondRead.value;
+    }
+    const value = await builder();
+    await writeCacheEnvelope(key, value, { anchor, lastLogId: cursor.maxId }, ttlSeconds);
+    return value;
+  });
+}
+
+async function fetchLogsSinceId(lastLogId, minCreatedAt = 0) {
+  const { rows } = await pool.query(`
+    SELECT id, created_at, username, token_name, token_id, user_id, model_name,
+      quota, prompt_tokens, completion_tokens, channel_name, "group" as grp, other
+    FROM logs
+    WHERE id > $1 AND created_at >= $2
+    ORDER BY id ASC
+  `, [lastLogId, minCreatedAt]);
+  return rows.map(r => ({
+    ...r,
+    id: parseInt(r.id) || 0,
+    created_at: parseInt(r.created_at) || 0,
+    token_id: parseInt(r.token_id) || 0,
+    user_id: parseInt(r.user_id) || 0,
+    quota: parseInt(r.quota) || 0,
+    prompt_tokens: parseInt(r.prompt_tokens) || 0,
+    completion_tokens: parseInt(r.completion_tokens) || 0,
+  }));
+}
+
+function upsertRecentLogs(existing, rows, limit = 100) {
+  const seen = new Set();
+  const merged = [...rows, ...(existing || [])].filter(item => {
+    if (!item || seen.has(item.id)) return false;
+    seen.add(item.id);
+    return true;
+  });
+  merged.sort((a, b) => b.created_at - a.created_at || b.id - a.id);
+  return merged.slice(0, limit);
+}
+
+function mergeTodaySnapshot(snapshot, rows) {
+  const tokensMap = new Map((snapshot.tokens || []).map(t => [String(t.token_id), {
+    ...t,
+    count: parseInt(t.count) || 0,
+    quota: parseInt(t.quota) || 0,
+    prompt_tokens: parseInt(t.prompt_tokens) || 0,
+    completion_tokens: parseInt(t.completion_tokens) || 0,
+    models: t.models || {},
+  }]));
+
+  for (const row of rows) {
+    const key = String(row.token_id);
+    if (!tokensMap.has(key)) {
+      tokensMap.set(key, {
+        token_id: row.token_id,
+        token_name: row.token_name,
+        username: row.username,
+        user_id: row.user_id,
+        count: 0,
+        quota: 0,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        models: {},
+      });
+    }
+    const token = tokensMap.get(key);
+    token.count += 1;
+    token.quota += row.quota || 0;
+    token.prompt_tokens += row.prompt_tokens || 0;
+    token.completion_tokens += row.completion_tokens || 0;
+    if (row.model_name) token.models[row.model_name] = (token.models[row.model_name] || 0) + 1;
+  }
+
+  const tokens = Array.from(tokensMap.values()).map(t => {
+    const topModels = Object.entries(t.models || {})
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3);
+    return {
+      ...t,
+      models: Object.fromEntries(topModels),
+    };
+  }).sort((a, b) => b.count - a.count);
+
+  return {
+    ...snapshot,
+    totalLogs: (snapshot.totalLogs || 0) + rows.length,
+    dbTotal: (snapshot.dbTotal || 0) + rows.length,
+    tokens,
+  };
+}
+
 async function getTodayAggregation() {
   const ts = getRangeTs('today');
   const totalRes = await pool.query('SELECT COUNT(*) as cnt FROM logs WHERE created_at >= $1', [ts]);
@@ -156,6 +616,116 @@ async function getTodayAggregation() {
     for (const m of modelRes.rows) t.models[m.model_name] = parseInt(m.cnt);
   }
   return { tokens, total };
+}
+
+async function getScriptTraceStatsForFilter(filterCol, filterVal, ts) {
+  const filterSql = filterCol === 'username' ? 'username = $1' : 'token_id = $1';
+  const { rows } = await pool.query(`
+    WITH filtered AS (
+      SELECT
+        CASE
+          WHEN other IS NOT NULL AND other <> '' AND LEFT(other, 1) = '{' THEN other::jsonb
+          ELSE '{}'::jsonb
+        END AS other_json
+      FROM logs
+      WHERE ${filterSql} AND created_at >= $2
+    ),
+    expanded AS (
+      SELECT
+        COALESCE(NULLIF(LOWER(other_json->'admin_info'->'channel_affinity'->>'reason'), ''), '') AS reason,
+        COALESCE(NULLIF(LOWER(other_json->'admin_info'->'channel_affinity'->'override_template'->>'rule_name'), ''), '') AS rule_name,
+        COALESCE(NULLIF(other_json->'admin_info'->'channel_affinity'->>'key_path', ''), '') AS key_path
+      FROM filtered
+    ),
+    labeled AS (
+      SELECT
+        CASE
+          WHEN reason LIKE '%claude cli trace%' OR rule_name LIKE '%claude cli trace%' THEN 'claude cli trace'
+          WHEN reason LIKE '%codex cli trace%' OR rule_name LIKE '%codex cli trace%' THEN 'codex cli trace'
+          WHEN key_path = 'metadata.user_id' THEN 'key_path:metadata.user_id'
+          WHEN key_path = 'prompt_cache_key' THEN 'key_path:prompt_cache_key'
+          ELSE NULL
+        END AS trace_type
+      FROM expanded
+    )
+    SELECT
+      (SELECT COUNT(*) FROM labeled) AS total_calls,
+      (SELECT COUNT(*) FROM labeled WHERE trace_type IS NOT NULL) AS flagged_calls,
+      COALESCE((
+        SELECT JSON_AGG(JSON_BUILD_OBJECT('type', trace_type, 'count', cnt) ORDER BY cnt DESC)
+        FROM (
+          SELECT trace_type, COUNT(*) AS cnt
+          FROM labeled
+          WHERE trace_type IS NOT NULL
+          GROUP BY trace_type
+        ) grouped
+      ), '[]'::json) AS breakdown
+  `, [filterVal, ts]);
+
+  const row = rows[0] || {};
+  const totalCalls = parseInt(row.total_calls) || 0;
+  const flaggedCalls = parseInt(row.flagged_calls) || 0;
+  const breakdown = Array.isArray(row.breakdown) ? row.breakdown : [];
+  const decision = buildScriptDisableDecision(flaggedCalls, totalCalls);
+  return {
+    ...decision,
+    trace_types: breakdown.map(item => item.type),
+    breakdown: breakdown.map(item => ({
+      type: item.type,
+      count: parseInt(item.count) || 0,
+    })),
+  };
+}
+
+async function getScriptDisableCandidates(ts) {
+  const { rows } = await pool.query(`
+    WITH filtered AS (
+      SELECT
+        token_id, token_name, username, user_id,
+        CASE
+          WHEN other IS NOT NULL AND other <> '' AND LEFT(other, 1) = '{' THEN other::jsonb
+          ELSE '{}'::jsonb
+        END AS other_json
+      FROM logs
+      WHERE created_at >= $1
+    ),
+    labeled AS (
+      SELECT
+        token_id, token_name, username, user_id,
+        CASE
+          WHEN LOWER(COALESCE(other_json->'admin_info'->'channel_affinity'->>'reason', '')) LIKE '%claude cli trace%'
+            OR LOWER(COALESCE(other_json->'admin_info'->'channel_affinity'->'override_template'->>'rule_name', '')) LIKE '%claude cli trace%' THEN 'claude cli trace'
+          WHEN LOWER(COALESCE(other_json->'admin_info'->'channel_affinity'->>'reason', '')) LIKE '%codex cli trace%'
+            OR LOWER(COALESCE(other_json->'admin_info'->'channel_affinity'->'override_template'->>'rule_name', '')) LIKE '%codex cli trace%' THEN 'codex cli trace'
+          WHEN COALESCE(other_json->'admin_info'->'channel_affinity'->>'key_path', '') = 'metadata.user_id' THEN 'key_path:metadata.user_id'
+          WHEN COALESCE(other_json->'admin_info'->'channel_affinity'->>'key_path', '') = 'prompt_cache_key' THEN 'key_path:prompt_cache_key'
+          ELSE NULL
+        END AS trace_type
+      FROM filtered
+    )
+    SELECT
+      token_id, token_name, username, user_id,
+      COUNT(*) AS total_calls,
+      COUNT(*) FILTER (WHERE trace_type IS NOT NULL) AS flagged_calls,
+      COALESCE(JSON_AGG(DISTINCT trace_type) FILTER (WHERE trace_type IS NOT NULL), '[]'::json) AS trace_types
+    FROM labeled
+    GROUP BY token_id, token_name, username, user_id
+    HAVING COUNT(*) FILTER (WHERE trace_type IS NOT NULL) >= $2
+    ORDER BY flagged_calls DESC, total_calls DESC
+  `, [ts, 30]);
+
+  return rows.map(r => {
+    const totalCalls = parseInt(r.total_calls) || 0;
+    const flaggedCalls = parseInt(r.flagged_calls) || 0;
+    return {
+      token_id: parseInt(r.token_id) || 0,
+      token_name: r.token_name,
+      username: r.username,
+      user_id: parseInt(r.user_id) || 0,
+      trace_types: Array.isArray(r.trace_types) ? r.trace_types : [],
+      ...buildScriptDisableDecision(flaggedCalls, totalCalls),
+    };
+  }).filter(r => r.eligible);
 }
 
 async function getAggregation(range, dimension) {
@@ -227,6 +797,312 @@ async function getDistribution(range) {
   return { models: modelRes.rows.map(parse), users: userRes.rows.map(parse), tokens: tokenRes.rows.map(parse) };
 }
 
+async function fetchStatData() {
+  let statData = { quota: 0, rpm: 0, tpm: 0 };
+  try {
+    const stat = await apiRequest('/api/log/stat');
+    if (stat.success) statData = stat.data;
+  } catch {}
+  return statData;
+}
+
+async function getSnapshotTodayCached() {
+  const key = 'snapshot:today';
+  const cached = await readCacheEnvelope(key);
+  const todayAnchor = getRangeAnchor('today');
+  if (cached && cached.meta && cached.meta.anchor === todayAnchor) {
+    latestSnapshot = cached.value;
+    return cached.value;
+  }
+  return await withCacheLock(key, async () => {
+    const secondRead = await readCacheEnvelope(key);
+    if (secondRead && secondRead.meta && secondRead.meta.anchor === todayAnchor) {
+      latestSnapshot = secondRead.value;
+      return secondRead.value;
+    }
+    const { tokens, total } = await getTodayAggregation();
+    const statData = await fetchStatData();
+    latestSnapshot = {
+      time: Date.now(),
+      totalLogs: total,
+      dbTotal: total,
+      stat: statData,
+      tokens,
+    };
+    const cursor = await getLatestLogCursor();
+    await writeCacheEnvelope(key, latestSnapshot, { anchor: todayAnchor, lastLogId: cursor.maxId }, CONFIG.cacheTtlSeconds);
+    return latestSnapshot;
+  });
+}
+
+async function getErrorAnalysis(range) {
+  return await getOrBuildCached(`error-analysis:v3:${range}`, range, async () => {
+    const ts = getRangeTs(range);
+
+    const [countRes, channelCountRes, errorRes] = await Promise.all([
+      pool.query('SELECT COUNT(*) as cnt FROM logs WHERE created_at >= $1', [ts]),
+      pool.query(`
+        SELECT
+          COALESCE(NULLIF(channel_id::text, ''), 'unknown') AS channel_key,
+          COALESCE(NULLIF(channel_name, ''), 'unknown') AS channel_name,
+          COUNT(*) AS total_requests
+        FROM logs
+        WHERE created_at >= $1
+        GROUP BY COALESCE(NULLIF(channel_id::text, ''), 'unknown'), COALESCE(NULLIF(channel_name, ''), 'unknown')
+      `, [ts]),
+      pool.query(`
+        SELECT id, created_at, type, content, username, token_name, token_id, model_name,
+          channel_id, channel_name, other
+        FROM logs
+        WHERE created_at >= $1
+          AND (type = 5 OR (type = 2 AND other IS NOT NULL AND other <> '' AND LEFT(other, 1) = '{'))
+        ORDER BY created_at DESC
+      `, [ts]),
+    ]);
+
+    const totalRequests = parseInt(countRes.rows[0].cnt) || 0;
+    const channelTotalMap = new Map(channelCountRes.rows.map(r => [r.channel_key, {
+      channel_name: r.channel_name,
+      total_requests: parseInt(r.total_requests) || 0,
+    }]));
+
+    const normalizedRows = errorRes.rows
+      .map(r => {
+        const otherJson = parseOtherJson(r.other);
+        const channelKey = String(r.channel_id || otherJson.channel_id || otherJson.admin_info?.channel_affinity?.channel_id || 'unknown');
+        return {
+          id: r.id,
+          created_at: parseInt(r.created_at) || 0,
+          type: parseInt(r.type) || 0,
+          content: r.content || '',
+          username: r.username || '',
+          token_name: r.token_name || '',
+          token_id: parseInt(r.token_id) || 0,
+          model_name: r.model_name || '',
+          resolved_channel_key: channelKey,
+          resolved_channel: String(r.channel_name || otherJson.channel_name || otherJson.admin_info?.channel_affinity?.channel_id || channelKey),
+          status_code: String(otherJson.status_code || 'unknown'),
+          error_type: String(otherJson.error_type || 'unknown'),
+          stream_status: String(otherJson.stream_status?.status || ''),
+          stream_end_reason: String(otherJson.stream_status?.end_reason || 'unknown'),
+        };
+      })
+      .filter(r => r.type === 5 || (r.type === 2 && r.stream_status === 'error'));
+
+    const mainFailures = normalizedRows.filter(r => r.type === 5);
+    const streamInterrupts = normalizedRows.filter(r => r.type === 2);
+    const totalFailures = normalizedRows.length;
+
+    const affectedChannels = new Set(normalizedRows.map(r => r.resolved_channel_key)).size;
+    const summary = {
+      total_requests: totalRequests,
+      main_failures: mainFailures.length,
+      stream_interrupts: streamInterrupts.length,
+      total_failures: totalFailures,
+      affected_channels: affectedChannels,
+      main_failure_rate: totalRequests ? +(mainFailures.length * 100 / totalRequests).toFixed(2) : 0,
+      stream_interrupt_rate: totalRequests ? +(streamInterrupts.length * 100 / totalRequests).toFixed(2) : 0,
+      total_failure_rate: totalRequests ? +(totalFailures * 100 / totalRequests).toFixed(2) : 0,
+    };
+
+    const channelMap = new Map();
+    for (const r of normalizedRows) {
+      if (!channelMap.has(r.resolved_channel_key)) {
+        channelMap.set(r.resolved_channel_key, {
+          channel_name: r.resolved_channel,
+          total_requests: 0,
+          main_failures: 0,
+          stream_interrupts: 0,
+          total_failures: 0,
+          status_codes: new Map(),
+        });
+      }
+      const ch = channelMap.get(r.resolved_channel_key);
+      ch.main_failures += r.type === 5 ? 1 : 0;
+      ch.stream_interrupts += r.type === 2 ? 1 : 0;
+      ch.total_failures += 1;
+      if (r.type === 5 && r.status_code !== 'unknown') {
+        ch.status_codes.set(r.status_code, (ch.status_codes.get(r.status_code) || 0) + 1);
+      }
+    }
+    for (const [key, ch] of channelMap) {
+      const totalInfo = channelTotalMap.get(key);
+      if (totalInfo) {
+        ch.total_requests = totalInfo.total_requests;
+        ch.channel_name = totalInfo.channel_name !== 'unknown' ? totalInfo.channel_name : ch.channel_name;
+      }
+    }
+    const channels = Array.from(channelMap.entries())
+      .map(([, ch]) => {
+        const topStatusCodes = Array.from(ch.status_codes.entries())
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 3)
+          .map(([status_code, count]) => ({ status_code, count }));
+        return {
+          channel_name: ch.channel_name,
+          total_requests: ch.total_requests,
+          main_failures: ch.main_failures,
+          stream_interrupts: ch.stream_interrupts,
+          total_failures: ch.total_failures,
+          main_failure_rate: ch.total_requests ? +(ch.main_failures * 100 / ch.total_requests).toFixed(2) : 0,
+          stream_interrupt_rate: ch.total_requests ? +(ch.stream_interrupts * 100 / ch.total_requests).toFixed(2) : 0,
+          total_failure_rate: ch.total_requests ? +(ch.total_failures * 100 / ch.total_requests).toFixed(2) : 0,
+          top_status_codes: topStatusCodes,
+        };
+      })
+      .sort((a, b) => b.total_failure_rate - a.total_failure_rate || b.total_failures - a.total_failures || b.total_requests - a.total_requests)
+      .slice(0, 100);
+
+    const statusCodeMap = new Map();
+    for (const r of mainFailures) {
+      if (r.status_code === 'unknown') continue;
+      statusCodeMap.set(r.status_code, (statusCodeMap.get(r.status_code) || 0) + 1);
+    }
+    const statusCodesChannelMap = new Map();
+    for (const r of mainFailures) {
+      if (r.status_code === 'unknown') continue;
+      if (!statusCodesChannelMap.has(r.status_code)) {
+        statusCodesChannelMap.set(r.status_code, new Set());
+      }
+      statusCodesChannelMap.get(r.status_code).add(r.resolved_channel_key);
+    }
+    const status_codes = Array.from(statusCodeMap.entries())
+      .map(([status_code, count]) => ({
+        status_code,
+        count,
+        channel_count: statusCodesChannelMap.get(status_code)?.size || 0,
+      }))
+      .sort((a, b) => b.count - a.count);
+
+    const streamReasonMap = new Map();
+    for (const r of streamInterrupts) {
+      streamReasonMap.set(r.stream_end_reason, (streamReasonMap.get(r.stream_end_reason) || 0) + 1);
+    }
+    const streamReasonChannelMap = new Map();
+    for (const r of streamInterrupts) {
+      if (!streamReasonChannelMap.has(r.stream_end_reason)) {
+        streamReasonChannelMap.set(r.stream_end_reason, new Set());
+      }
+      streamReasonChannelMap.get(r.stream_end_reason).add(r.resolved_channel_key);
+    }
+    const stream_reasons = Array.from(streamReasonMap.entries())
+      .map(([reason, count]) => ({
+        reason,
+        count,
+        channel_count: streamReasonChannelMap.get(reason)?.size || 0,
+      }))
+      .sort((a, b) => b.count - a.count);
+
+    const recent_errors = normalizedRows.slice(0, 50).map(r => ({
+      ...r,
+      label: r.type === 5 ? (r.status_code || 'unknown') : `stream:${r.stream_end_reason || 'unknown'}`,
+    }));
+
+    const groupMap = new Map();
+    for (const r of normalizedRows) {
+      const category = classifyErrorGroup(r);
+      const normalizedContent = normalizeErrorContent(r.content);
+      const groupKey = `${r.type}|${category.category_code}`;
+      const channelName = r.resolved_channel || 'unknown';
+      if (!groupMap.has(groupKey)) {
+        groupMap.set(groupKey, {
+          type: r.type,
+          category_code: category.category_code,
+          category_label: category.category_label,
+          status_code: r.status_code,
+          stream_end_reason: r.stream_end_reason,
+          count: 0,
+          channel_set: new Set(),
+          channel_counts: new Map(),
+          variants: new Map(),
+          first_at: r.created_at,
+          last_at: r.created_at,
+        });
+      }
+      const g = groupMap.get(groupKey);
+      g.count++;
+      g.channel_set.add(r.resolved_channel_key);
+      if (!g.channel_counts.has(r.resolved_channel_key)) {
+        g.channel_counts.set(r.resolved_channel_key, {
+          channel_key: r.resolved_channel_key,
+          channel_name: channelName,
+          count: 0,
+        });
+      }
+      const channelStat = g.channel_counts.get(r.resolved_channel_key);
+      channelStat.count++;
+      if (!channelStat.channel_name || channelStat.channel_name === 'unknown') {
+        channelStat.channel_name = channelName;
+      }
+      if (!g.variants.has(normalizedContent)) {
+        g.variants.set(normalizedContent, {
+          normalized_content: normalizedContent,
+          content: r.content,
+          count: 0,
+          last_at: r.created_at,
+          channel_name: channelName,
+        });
+      }
+      const variant = g.variants.get(normalizedContent);
+      variant.count++;
+      if (r.created_at >= variant.last_at) {
+        variant.last_at = r.created_at;
+        variant.content = r.content;
+        variant.channel_name = channelName;
+      }
+      if (r.created_at < g.first_at) g.first_at = r.created_at;
+      if (r.created_at > g.last_at) g.last_at = r.created_at;
+    }
+    const error_groups = Array.from(groupMap.values())
+      .map(g => {
+        const sortedExamples = Array.from(g.variants.values())
+          .sort((a, b) => b.count - a.count || b.last_at - a.last_at)[0];
+        const examples = Array.from(g.variants.values())
+          .sort((a, b) => b.count - a.count || b.last_at - a.last_at)
+          .slice(0, 5)
+          .map(example => ({
+            content: example.content || '',
+            normalized_content: example.normalized_content || '(空)',
+            count: example.count,
+            last_at: example.last_at,
+            channel_name: example.channel_name || 'unknown',
+          }));
+        const top_channels = Array.from(g.channel_counts.values())
+          .sort((a, b) => b.count - a.count || a.channel_name.localeCompare(b.channel_name))
+          .slice(0, 3);
+        return {
+          content: sortedExamples?.content || '',
+          normalized_content: sortedExamples?.normalized_content || '(空)',
+          type: g.type,
+          category_code: g.category_code,
+          category_label: g.category_label,
+          status_code: g.status_code,
+          stream_end_reason: g.stream_end_reason,
+          count: g.count,
+          channel_count: g.channel_set.size,
+          channels: Array.from(g.channel_set).slice(0, 10),
+          top_channels,
+          examples,
+          example_count: g.variants.size,
+          variant_count: g.variants.size,
+          first_at: g.first_at,
+          last_at: g.last_at,
+        };
+      })
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 100);
+
+    return {
+      summary,
+      channels,
+      status_codes,
+      stream_reasons,
+      recent_errors,
+      error_groups,
+    };
+  });
+}
+
 // ==================== token 启用/禁用 ====================
 let whitelistSet = new Set();
 
@@ -260,6 +1136,15 @@ async function getTokenStatuses() {
   return statuses;
 }
 
+async function recordAction({ tokenId, tokenName, username, action, reason, dailyCount = null, meta = null }) {
+  await pool.query(
+    `INSERT INTO monitor_actions (token_id, token_name, username, action, reason, action_meta, daily_count)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [tokenId, tokenName || null, username || null, action, reason || null, meta ? JSON.stringify(meta) : null, dailyCount]
+  );
+  await cacheDeleteByPrefix('actions:recent');
+}
+
 // ==================== 定时监控 ====================
 let latestSnapshot = null;
 let isPolling = false;
@@ -269,27 +1154,42 @@ async function pollAndCheck() {
   isPolling = true;
   try {
     console.log(`[${new Date().toLocaleString()}] 开始查询数据库...`);
-    const { tokens, total } = await getTodayAggregation();
+    const startOfDayUnix = getRangeTs('today');
+    const prevCursor = await cacheGetJson('state:cursor');
+    const nowCursor = await getLatestLogCursor();
+    const todaySnapshotEnvelope = await readCacheEnvelope('snapshot:today');
 
-    let statData = { quota: 0, rpm: 0, tpm: 0 };
-    try {
-      const stat = await apiRequest('/api/log/stat');
-      if (stat.success) statData = stat.data;
-    } catch {}
+    if (todaySnapshotEnvelope && prevCursor && prevCursor.maxId && prevCursor.anchor === nowCursor.anchor && prevCursor.maxId < nowCursor.maxId) {
+      const rows = await fetchLogsSinceId(prevCursor.maxId, startOfDayUnix);
+      if (rows.length > 0 && todaySnapshotEnvelope.value) {
+        const statData = await fetchStatData();
+        latestSnapshot = mergeTodaySnapshot(todaySnapshotEnvelope.value, rows.filter(r => r.created_at >= startOfDayUnix));
+        latestSnapshot.time = Date.now();
+        latestSnapshot.stat = statData;
+        await writeCacheEnvelope('snapshot:today', latestSnapshot, { anchor: nowCursor.anchor, lastLogId: nowCursor.maxId }, CONFIG.cacheTtlSeconds);
+      }
+    }
 
-    latestSnapshot = {
-      time: Date.now(),
-      totalLogs: total,
-      dbTotal: total,
-      stat: statData,
-      tokens,
-    };
+    if (!latestSnapshot || !todaySnapshotEnvelope || !todaySnapshotEnvelope.meta || todaySnapshotEnvelope.meta.anchor !== nowCursor.anchor) {
+      latestSnapshot = await getSnapshotTodayCached();
+    } else if (!latestSnapshot) {
+      latestSnapshot = todaySnapshotEnvelope.value;
+    }
+
+    const { tokens, totalLogs: total } = latestSnapshot;
+    await cacheSetJson('state:cursor', nowCursor, 86400);
+    await Promise.all([
+      cacheDeleteByPrefix('stats:'),
+      cacheDeleteByPrefix('trend:'),
+      cacheDeleteByPrefix('distribution:'),
+      cacheDeleteByPrefix('recent-logs:'),
+      cacheDeleteByPrefix('dashboard:'),
+      cacheDeleteByPrefix('token-statuses'),
+    ]);
 
     console.log(`[${new Date().toLocaleString()}] 今日共 ${total} 条日志，${tokens.length} 个 token`);
 
     // 自动通知并尝试禁用超标 token
-    const startOfDayUnix = getRangeTs('today');
-
     for (const t of tokens) {
       if (t.count > CONFIG.dailyLimit && !whitelistSet.has(t.token_id)) {
         console.log(`⚠️ token ${t.token_name}(${t.token_id}) 今日 ${t.count} 次，超标！`);
@@ -304,23 +1204,30 @@ async function pollAndCheck() {
               from: `"NewAPI Monitor" <${process.env.SMTP_USER}>`,
               to: mailTo,
               subject: `🚨 [超限警告] Token: ${t.token_name} (用户: ${t.username})`,
-              text: `用户 ${t.username} 的 Token "${t.token_name}" (ID: ${t.token_id})\n今日调用量已达到 ${t.count} 次，超过了设定的限制 ${CONFIG.dailyLimit} 次。\n\n系统已请求禁用该 Token。\n\n时间: ${new Date().toLocaleString()}`,
+              text: `用户 ${t.username} 的 Token "${t.token_name}" (ID: ${t.token_id})\n今日调用量已达到 ${t.count} 次，超过了设定的限制 ${CONFIG.dailyLimit} 次。\n\n请留意该 Token 的使用情况。\n\n时间: ${new Date().toLocaleString()}`,
             });
             console.log(`  📧 邮件通知成功 (Token #${t.token_id})`);
-            await pool.query(
-              'INSERT INTO monitor_actions (token_id, token_name, username, action, reason, daily_count) VALUES ($1, $2, $3, $4, $5, $6)',
-              [t.token_id, t.token_name, t.username, 'notify', `日调用 ${t.count} 次超限`, t.count]
-            );
+            await recordAction({
+              tokenId: t.token_id,
+              tokenName: t.token_name,
+              username: t.username,
+              action: 'notify',
+              reason: `日调用 ${t.count} 次超限`,
+              dailyCount: t.count,
+              meta: { policy: 'daily_limit', limit: CONFIG.dailyLimit },
+            });
           } catch(e) {
             console.error(`  📧 发送邮件错误 (Token #${t.token_id}): ${e.message}`);
           }
         }
 
-        try {
-          const r = await setTokenStatus(t.token_id, t.user_id, 2);
-          if (r.success) console.log(`  成功自动禁用 (Token #${t.token_id})`);
-        } catch (e) { }
       }
+    }
+
+    const candidates = await getScriptDisableCandidates(Math.floor(Date.now() / 1000) - 86400);
+    for (const item of candidates) {
+      if (!item.token_id || whitelistSet.has(item.token_id)) continue;
+      console.log(`⚠️ token ${item.token_name}(${item.token_id}) 命中脚本 trace，比例 ${item.ratio_pct}% / 次数 ${item.flagged_calls}`);
     }
   } catch (err) {
     console.error('轮询出错:', err.message);
@@ -330,8 +1237,9 @@ async function pollAndCheck() {
 }
 
 // ==================== API 路由 ====================
-app.get('/api/snapshot', (req, res) => {
-  res.json({ success: true, data: latestSnapshot });
+app.get('/api/snapshot', async (req, res) => {
+  const data = latestSnapshot || await getSnapshotTodayCached();
+  res.json({ success: true, data });
 });
 
 app.post('/api/poll', async (req, res) => {
@@ -342,20 +1250,59 @@ app.post('/api/poll', async (req, res) => {
 app.get('/api/stats', async (req, res) => {
   const range = req.query.range || 'today';
   const dim = req.query.dim || 'token';
-  const data = await getAggregation(range, dim);
+  const data = await getOrBuildCached(`stats:${range}:${dim}`, range, () => getAggregation(range, dim));
   res.json({ success: true, data });
 });
 
 app.get('/api/trend', async (req, res) => {
   const range = req.query.range || 'today';
-  const data = await getHourlyTrend(range);
+  const data = await getOrBuildCached(`trend:${range}`, range, () => getHourlyTrend(range));
   res.json({ success: true, data });
 });
 
 app.get('/api/distribution', async (req, res) => {
   const range = req.query.range || 'today';
-  const data = await getDistribution(range);
+  const data = await getOrBuildCached(`distribution:${range}`, range, () => getDistribution(range));
   res.json({ success: true, data });
+});
+
+app.get('/api/dashboard', async (req, res) => {
+  const range = req.query.range || 'today';
+  const dim = req.query.dim || 'token';
+  const data = await getOrBuildCached(`dashboard:${range}:${dim}`, range, async () => {
+    const [snapshot, stats, statuses, actions, whitelist] = await Promise.all([
+      range === 'today' ? getSnapshotTodayCached() : null,
+      getAggregation(range, dim),
+      getTokenStatuses(),
+      pool.query('SELECT * FROM monitor_actions ORDER BY id DESC LIMIT 50').then(r => r.rows),
+      pool.query('SELECT * FROM monitor_whitelist').then(r => r.rows),
+    ]);
+    return {
+      config: {
+        dailyLimit: CONFIG.dailyLimit,
+        pollInterval: CONFIG.pollInterval,
+        notifyEmail: CONFIG.notifyEmail,
+        baseUrl: CONFIG.baseUrl,
+      },
+      whitelist,
+      snapshot,
+      stats,
+      tokenStatuses: statuses,
+      actions,
+    };
+  });
+  res.json({ success: true, data });
+});
+
+app.get('/api/error-analysis', async (req, res) => {
+  const range = req.query.range || 'today';
+  try {
+    const data = await getErrorAnalysis(range);
+    res.json({ success: true, data });
+  } catch (err) {
+    console.error('报错分析错误:', err.message);
+    res.json({ success: false, message: err.message });
+  }
 });
 
 app.get('/api/user-analysis', async (req, res) => {
@@ -382,6 +1329,11 @@ app.get('/api/user-analysis', async (req, res) => {
     basic.total_quota = parseInt(basic.total_quota) || 0;
     basic.total_prompt = parseInt(basic.total_prompt) || 0;
     basic.total_completion = parseInt(basic.total_completion) || 0;
+    const scriptTraceStats = await getScriptTraceStatsForFilter(filterCol, filterVal, ts);
+    const autoDisableWindowStats = filterCol === 'token_id'
+      ? await getScriptTraceStatsForFilter(filterCol, filterVal, Math.floor(Date.now() / 1000) - 86400)
+      : scriptTraceStats;
+    const scriptSignals = scriptTraceStats.breakdown.map(item => `${item.type} × ${item.count}`);
 
     // 2. 每小时分布
     const hourlyRes = await pool.query(`
@@ -577,6 +1529,10 @@ app.get('/api/user-analysis', async (req, res) => {
       models, concurrentPoints, streaks, sessions, weekday,
       nightCalls, nightPct: +(nightPct * 100).toFixed(1),
       activeHours, nightActiveHours, dayActiveHours, density,
+      scriptSignals,
+      scriptTraceStats,
+      autoDisableEligible: !!(filterCol === 'token_id' && autoDisableWindowStats.eligible),
+      autoDisableWindowStats,
       score: { value: Math.min(score, maxScore), max: maxScore, reasons },
     }});
   } catch (err) {
@@ -589,27 +1545,33 @@ app.get('/api/recent-logs', async (req, res) => {
   const page = Math.max(1, parseInt(req.query.p) || 1);
   const pageSize = Math.min(100, parseInt(req.query.page_size) || 20);
   const range = req.query.range || 'today';
-  const ts = getRangeTs(range);
-  const offset = (page - 1) * pageSize;
-  const [countRes, dataRes] = await Promise.all([
-    pool.query('SELECT COUNT(*) as cnt FROM logs WHERE created_at >= $1', [ts]),
-    pool.query(`
-      SELECT id, created_at, username, token_name, token_id, model_name, quota,
-        prompt_tokens, completion_tokens, channel_name, "group" as grp
-      FROM logs WHERE created_at >= $1
-      ORDER BY created_at DESC LIMIT $2 OFFSET $3
-    `, [ts, pageSize, offset]),
-  ]);
+  const data = await getOrBuildCached(`recent-logs:${range}:${page}:${pageSize}`, range, async () => {
+    const ts = getRangeTs(range);
+    const offset = (page - 1) * pageSize;
+    const [countRes, dataRes] = await Promise.all([
+      pool.query('SELECT COUNT(*) as cnt FROM logs WHERE created_at >= $1', [ts]),
+      pool.query(`
+        SELECT id, created_at, username, token_name, token_id, model_name, quota,
+          prompt_tokens, completion_tokens, channel_name, "group" as grp
+        FROM logs WHERE created_at >= $1
+        ORDER BY created_at DESC LIMIT $2 OFFSET $3
+      `, [ts, pageSize, offset]),
+    ]);
+    return { items: dataRes.rows, total: parseInt(countRes.rows[0].cnt), page, pageSize };
+  });
   res.json({
     success: true,
-    data: { items: dataRes.rows, total: parseInt(countRes.rows[0].cnt), page, pageSize },
+    data,
   });
 });
 
 app.get('/api/actions', async (req, res) => {
   const limit = parseInt(req.query.limit) || 50;
-  const { rows } = await pool.query('SELECT * FROM monitor_actions ORDER BY id DESC LIMIT $1', [limit]);
-  res.json({ success: true, data: rows });
+  const data = await getOrBuildCached(`actions:recent:${limit}`, 'today', async () => {
+    const { rows } = await pool.query('SELECT * FROM monitor_actions ORDER BY id DESC LIMIT $1', [limit]);
+    return rows;
+  }, 30);
+  res.json({ success: true, data });
 });
 
 app.post('/api/token/:id/disable', async (req, res) => {
@@ -618,7 +1580,7 @@ app.post('/api/token/:id/disable', async (req, res) => {
   if (!userId) return res.json({ success: false, message: '缺少 user_id' });
   const result = await setTokenStatus(tokenId, userId, 2);
   if (result.success) {
-    await pool.query('INSERT INTO monitor_actions (token_id, action, reason) VALUES ($1, $2, $3)', [tokenId, 'manual_disable', '手动禁用']);
+    await recordAction({ tokenId, action: 'manual_disable', reason: '手动禁用' });
   }
   res.json(result);
 });
@@ -629,13 +1591,13 @@ app.post('/api/token/:id/enable', async (req, res) => {
   if (!userId) return res.json({ success: false, message: '缺少 user_id' });
   const result = await setTokenStatus(tokenId, userId, 1);
   if (result.success) {
-    await pool.query('INSERT INTO monitor_actions (token_id, action, reason) VALUES ($1, $2, $3)', [tokenId, 'manual_enable', '手动启用']);
+    await recordAction({ tokenId, action: 'manual_enable', reason: '手动启用' });
   }
   res.json(result);
 });
 
 app.get('/api/token-status', async (req, res) => {
-  const statuses = await getTokenStatuses();
+  const statuses = await getOrBuildCached('token-statuses', 'today', () => getTokenStatuses(), 30);
   res.json({ success: true, data: statuses });
 });
 
@@ -651,6 +1613,7 @@ app.post('/api/whitelist', async (req, res) => {
     [token_id, token_name || '', note || '']
   );
   whitelistSet.add(token_id);
+  await cacheDeleteByPrefix('dashboard:');
   res.json({ success: true });
 });
 
@@ -658,6 +1621,7 @@ app.delete('/api/whitelist/:id', async (req, res) => {
   const tokenId = parseInt(req.params.id);
   await pool.query('DELETE FROM monitor_whitelist WHERE token_id = $1', [tokenId]);
   whitelistSet.delete(tokenId);
+  await cacheDeleteByPrefix('dashboard:');
   res.json({ success: true });
 });
 
@@ -682,6 +1646,7 @@ app.put('/api/config', async (req, res) => {
     await setKV('notifyEmail', CONFIG.notifyEmail);
   }
   console.log(`⚙️ 配置已更新: dailyLimit=${CONFIG.dailyLimit}, pollInterval=${CONFIG.pollInterval}, notifyEmail=${CONFIG.notifyEmail}`);
+  await cacheDeleteByPrefix('dashboard:');
   res.json({ success: true, data: { dailyLimit: CONFIG.dailyLimit, pollInterval: CONFIG.pollInterval, notifyEmail: CONFIG.notifyEmail } });
 });
 
@@ -690,6 +1655,7 @@ async function main() {
   await initDB();
   await loadSavedConfig();
   await loadWhitelist();
+  await initRedis();
 
   app.listen(CONFIG.port, () => {
     console.log(`🚀 NewAPI Monitor http://localhost:${CONFIG.port}`);
