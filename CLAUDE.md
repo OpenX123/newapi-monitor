@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-NewAPI 令牌用量监控面板，直连 NewAPI 的 PostgreSQL 数据库 `logs` 表进行只读聚合，并通过 NewAPI REST API 管理 Token 状态（禁用/启用）。支持自动超限告警（邮件）和手动操作。
+NewAPI 令牌用量监控面板，直连 NewAPI 的 PostgreSQL 数据库 `logs` 表进行只读聚合，并通过 NewAPI REST API 管理 Token 状态（禁用/启用）。支持自动超限告警（邮件）、**单用户行为分析（脚本/自动化检测）**、**报错分析**、以及 **Redis 缓存加速**。
 
 ## 常用命令
 
@@ -17,18 +17,19 @@ npm start      # 生产启动
 
 ## 架构
 
-**单进程 Express 应用**，所有后端逻辑在 `server.js` 一个文件中（~480 行），前端静态文件在 `public/` 目录。
+**单进程 Express 应用**，所有后端逻辑在 `server.js` 一个文件中（~1450 行），前端静态文件在 `public/` 目录。
 
 ### 数据流
 
 1. **PostgreSQL 直连** — 通过 `pg.Pool` 连接 NewAPI 的数据库，只读查询 `logs` 表做聚合统计
 2. **NewAPI REST API** — 通过 `apiRequest()` 封装调用 NewAPI 的 `/api/token/*` 端点来禁用/启用 Token
 3. **定时轮询** — `pollAndCheck()` 按 `POLL_INTERVAL` 间隔执行，聚合当日数据、检查超限、发送邮件、尝试禁用 Token
-4. **前端** — 原生 HTML/CSS/JS + Chart.js，通过 fetch 调用后端 API，SPA 风格的标签页切换（排行榜/趋势/日志/告警/设置）
+4. **Redis 缓存层**（可选）— 通过 `redis` 客户端缓存查询结果，带缓存失效锁 `withCacheLock`，基于日志 cursor 的增量缓存策略
+5. **前端** — 原生 HTML/CSS/JS + Chart.js，通过 fetch 调用后端 API，SPA 风格的标签页切换（排行榜/趋势/报错分析/调用记录/通知记录/白名单/设置）
 
 ### 自建数据库表（与 NewAPI 共用数据库）
 
-- `monitor_actions` — 操作记录（禁用/启用/通知）
+- `monitor_actions` — 操作记录（禁用/启用/通知），含 `action_meta JSONB` 扩展字段
 - `monitor_whitelist` — 白名单 Token（不受自动禁用影响）
 - `monitor_kv` — 持久化配置（dailyLimit、pollInterval、notifyEmail）
 
@@ -36,15 +37,24 @@ npm start      # 生产启动
 
 | 路由 | 用途 |
 |------|------|
-| `GET /api/snapshot` | 最新轮询快照 |
+| `GET /api/snapshot` | 最新轮询快照（带 Redis 缓存） |
+| `GET /api/dashboard?range=&dim=` | 聚合仪表板（快照+统计+状态+操作记录+白名单） |
 | `POST /api/poll` | 手动触发轮询 |
 | `GET /api/stats?range=&dim=` | 多维聚合（token/user/model/group/channel） |
 | `GET /api/trend?range=` | 按小时趋势 |
 | `GET /api/distribution?range=` | TOP 10 分布 |
+| `GET /api/error-analysis?range=` | 报错分析（状态码/流式中断/渠道排行/报错分类/最近错误） |
+| `GET /api/user-analysis?username=&token_id=&range=` | 单用户行为分析（脚本信号检测、昼夜分离评分） |
 | `GET /api/recent-logs?range=&p=` | 调用日志分页 |
 | `POST /api/token/:id/disable\|enable` | 手动禁用/启用 |
 | `GET\|POST\|DELETE /api/whitelist` | 白名单管理 |
 | `GET\|PUT /api/config` | 运行时配置 |
+
+### 缓存策略
+
+- `getOrBuildCached(key, range, builder)` — 基于 `logs` 表最新 `max(id)` 和 `max(created_at)` 作为 cursor，当 cursor 未变化时直接返回缓存
+- `withCacheLock` — Redis 分布式锁，防止缓存穿透
+- 缓存前缀可通过 `REDIS_KEY_PREFIX` 配置，默认 `newapi-monitor`
 
 ### 部署
 
@@ -56,3 +66,5 @@ Docker 镜像通过 GitHub Actions 构建（`.github/workflows/docker.yml`），
 - `apiRequest()` 使用原生 `http/https` 模块而非 fetch/node-fetch，根据 `NEWAPI_BASE_URL` 协议自动选择
 - `created_at` 时间戳为 Unix 秒级整数，前端格式化时需 `* 1000`
 - 前端 `app.js` 中 `COLUMNS` 定义了各维度的表头配置，新增维度需同步修改
+- **脚本检测**通过解析 `logs.other` 字段中的 `admin_info.channel_affinity` 信息，识别 `claude cli trace`、`codex cli trace`、`metadata.user_id`、`prompt_cache_key` 等信号
+- Redis 为可选依赖，未配置时自动降级为直连数据库
