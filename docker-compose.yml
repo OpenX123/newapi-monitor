@@ -14,6 +14,13 @@ services:
       - DAILY_LIMIT=2000
       - POLL_INTERVAL=300000
       - PORT=3456
+      # Redis（可选，推荐）
+      # - REDIS_HOST=127.0.0.1
+      # - REDIS_PORT=6379
+      # - REDIS_PASSWORD=
+      # - REDIS_DB=0
+      # - REDIS_KEY_PREFIX=newapi-monitor
+      # - CACHE_TTL_SECONDS=120
       # SMTP（可选）
       # - SMTP_HOST=smtp.qq.com
       # - SMTP_PORT=587

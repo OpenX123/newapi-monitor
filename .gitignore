@@ -36,3 +36,4 @@ npm-debug.log*
 # 非项目核心文件
 docs/
 client/
+.gstack/
