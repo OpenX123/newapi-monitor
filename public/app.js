@@ -8,6 +8,10 @@ let currentData = [];
 let currentPage = 1;
 const pageSize = 20;
 let tokenStatuses = {};
+let errorCharts = [];
+let errorGroupData = [];
+let errorGroupSearch = '';
+let errorGroupSort = { key: 'count', dir: 'desc' };
 
 // ==================== API 调用 ====================
 async function api(path, method = 'GET', body = null) {
@@ -238,6 +242,7 @@ function renderActions(actions) {
       <td><span class="action-badge ${a.action}">${
         a.action === 'notify' ? '<svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></svg> 邮件通知' :
         a.action === 'auto_disable' ? '<svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><path d="M12 7v4"/><path d="M8 16h.01"/><path d="M16 16h.01"/></svg> 自动禁用' :
+        a.action === 'auto_disable_script' ? '<svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 3h6l1 5-4 2v2.5l3.5 2v3L12 21l-3.5-3.5v-3L12 12.5V10L8 8l1-5z"/></svg> 脚本禁用' :
         a.action === 'manual_disable' ? '<svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="7.86 2 16.14 2 22 7.86 22 16.14 16.14 22 7.86 22 2 16.14 2 7.86 7.86 2"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg> 手动禁用' :
         a.action === 'manual_enable' ? '<svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg> 手动启用' : a.action
       }</span></td>
@@ -288,6 +293,7 @@ const pieOpts = () => ({
 
 let charts = [];
 function destroyCharts() { charts.forEach(c => c.destroy()); charts = []; }
+function destroyErrorCharts() { errorCharts.forEach(c => c.destroy()); errorCharts = []; }
 
 function renderTrend(trendData, distData) {
   destroyCharts();
@@ -372,6 +378,37 @@ async function loadConfig() {
   if (res.success) config = res.data;
 }
 
+function applyDashboardData(payload) {
+  if (!payload) return;
+  config = payload.config || config;
+  whitelistIds = new Set((payload.whitelist || []).map(w => w.token_id));
+  tokenStatuses = payload.tokenStatuses || {};
+  renderWhitelist(payload.whitelist || []);
+  renderActions(payload.actions || []);
+
+  currentData = (payload.stats && payload.stats.rows) ? payload.stats.rows : [];
+  if (currentDim === 'token' && payload.snapshot && payload.snapshot.tokens) {
+    const modelMap = {};
+    for (const t of payload.snapshot.tokens) modelMap[t.token_id] = t.models;
+    for (const row of currentData) {
+      if (modelMap[row.token_id]) row.models = modelMap[row.token_id];
+    }
+  }
+
+  renderTableHead();
+  renderTableBody();
+  const statPayload = payload.snapshot
+    ? { ...payload.snapshot, totalLogs: payload.stats ? payload.stats.total : payload.snapshot.totalLogs }
+    : { total: payload.stats ? payload.stats.total : 0, rows: currentData, time: Date.now() };
+  renderStats(statPayload);
+}
+
+async function loadDashboard() {
+  const res = await api(`/api/dashboard?range=${currentRange}&dim=${currentDim}`);
+  if (!res.success) return;
+  applyDashboardData(res.data);
+}
+
 async function loadWhitelist() {
   const res = await api('/api/whitelist');
   if (res.success) {
@@ -425,6 +462,217 @@ async function loadActions() {
   if (actRes.success) renderActions(actRes.data);
 }
 
+function renderErrorSummary(summary) {
+  document.getElementById('errTotalRequests').textContent = formatNumber(summary.total_requests || 0);
+  document.getElementById('errMainFailures').textContent = formatNumber(summary.main_failures || 0);
+  document.getElementById('errStreamInterrupts').textContent = formatNumber(summary.stream_interrupts || 0);
+  document.getElementById('errTotalRate').textContent = (summary.total_failure_rate || 0).toFixed(2) + '%';
+  document.getElementById('errAffectedChannels').textContent = formatNumber(summary.affected_channels || 0);
+}
+
+function renderErrorCharts(statusCodes, streamReasons) {
+  destroyErrorCharts();
+
+  const statusCtx = document.getElementById('errorStatusChart');
+  const streamCtx = document.getElementById('streamReasonChart');
+
+  if (statusCtx && statusCodes.length > 0) {
+    errorCharts.push(new Chart(statusCtx.getContext('2d'), {
+      type: 'bar',
+      data: {
+        labels: statusCodes.slice(0, 10).map(x => x.status_code),
+        datasets: [{
+          label: '主失败次数',
+          data: statusCodes.slice(0, 10).map(x => x.count),
+          backgroundColor: 'rgba(255, 107, 107, 0.65)',
+          borderColor: '#ff6b6b',
+          borderWidth: 1,
+          borderRadius: 4,
+        }],
+      },
+      options: { responsive: true, plugins: { legend: { labels: { color: '#e0e0e0' } } }, scales: darkTheme },
+    }));
+  }
+
+  if (streamCtx && streamReasons.length > 0) {
+    errorCharts.push(new Chart(streamCtx.getContext('2d'), {
+      type: 'bar',
+      data: {
+        labels: streamReasons.slice(0, 8).map(x => x.reason),
+        datasets: [{
+          label: '流式中断次数',
+          data: streamReasons.slice(0, 8).map(x => x.count),
+          backgroundColor: 'rgba(250, 173, 20, 0.65)',
+          borderColor: '#faad14',
+          borderWidth: 1,
+          borderRadius: 4,
+        }],
+      },
+      options: barOpts('y'),
+    }));
+  }
+}
+
+function renderErrorChannels(channels) {
+  const tbody = document.querySelector('#errorChannelsTable tbody');
+  if (!channels || channels.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" class="loading">暂无异常渠道</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = channels.map((r, i) => {
+    const badges = (r.top_status_codes || []).map(s => `<span class="error-code-badge">${s.status_code} x ${formatNumber(s.count)}</span>`).join('');
+    return `<tr>
+      <td>${i + 1}</td>
+      <td><strong>${r.channel_name || '-'}</strong></td>
+      <td>${formatNumber(r.total_requests)}</td>
+      <td><span class="error-num danger">${formatNumber(r.main_failures)}</span></td>
+      <td><span class="error-num warn">${formatNumber(r.stream_interrupts)}</span></td>
+      <td>
+        <div class="count-bar">
+          <span>${r.total_failure_rate.toFixed(2)}%</span>
+          <div class="count-bar-bg"><div class="count-bar-fill danger" style="width:${Math.min(r.total_failure_rate, 100)}%"></div></div>
+        </div>
+        <div class="dim">主失败 ${r.main_failure_rate.toFixed(2)}% · 中断 ${r.stream_interrupt_rate.toFixed(2)}%</div>
+      </td>
+      <td><div class="error-code-list">${badges || '<span class="dim">-</span>'}</div></td>
+    </tr>`;
+  }).join('');
+}
+
+function renderRecentErrors(items) {
+  const tbody = document.querySelector('#recentErrorsTable tbody');
+  if (!items || items.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" class="loading">暂无错误明细</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = items.map(r => {
+    const typeLabel = r.type === 5
+      ? `<span class="error-type main">${r.status_code || 'unknown'}</span>`
+      : `<span class="error-type stream">${r.stream_end_reason || 'stream'}</span>`;
+    const summary = (r.content || '').trim() || (r.type === 5 ? (r.error_type || '主失败') : '流式中断');
+    return `<tr>
+      <td>${formatTime(r.created_at)}</td>
+      <td>${typeLabel}</td>
+      <td>${r.channel_name || '-'}</td>
+      <td><span class="model-tag">${r.model_name || '-'}</span></td>
+      <td>${r.username || '-'}</td>
+      <td><span class="dim">#${r.token_id || '-'}</span> ${r.token_name || ''}</td>
+      <td class="error-summary-cell" title="${summary.replace(/"/g, '&quot;')}">${summary}</td>
+    </tr>`;
+  }).join('');
+}
+
+function renderErrorGroups() {
+  const tbody = document.querySelector('#errorGroupsTable tbody');
+  let rows = errorGroupData;
+
+  if (errorGroupSearch) {
+    const f = errorGroupSearch.toLowerCase();
+    rows = rows.filter(g =>
+      (g.category_label || '').toLowerCase().includes(f) ||
+      (g.category_code || '').toLowerCase().includes(f) ||
+      (g.top_channels || []).some(ch =>
+        (ch.channel_name || '').toLowerCase().includes(f) ||
+        (ch.channel_key || '').toLowerCase().includes(f)
+      ) ||
+      (g.examples || []).some(example =>
+        (example.content || '').toLowerCase().includes(f) ||
+        (example.normalized_content || '').toLowerCase().includes(f) ||
+        (example.channel_name || '').toLowerCase().includes(f)
+      ) ||
+      (g.normalized_content || '').toLowerCase().includes(f) ||
+      (g.content || '').toLowerCase().includes(f) ||
+      (g.status_code || '').toLowerCase().includes(f) ||
+      (g.stream_end_reason || '').toLowerCase().includes(f)
+    );
+  }
+
+  rows = [...rows].sort((a, b) => {
+    let va = a[errorGroupSort.key];
+    let vb = b[errorGroupSort.key];
+    if (typeof va === 'string') { va = va.toLowerCase(); vb = (vb || '').toLowerCase(); }
+    if (va < vb) return errorGroupSort.dir === 'asc' ? -1 : 1;
+    if (va > vb) return errorGroupSort.dir === 'asc' ? 1 : -1;
+    return 0;
+  });
+
+  if (rows.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="8" class="loading">${errorGroupSearch ? '无匹配结果' : '暂无报错分类数据'}</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = rows.map((g, i) => {
+    const typeLabel = g.type === 5 ? '<span class="error-type main">主失败</span>' : '<span class="error-type stream">流式中断</span>';
+    const codeLabel = g.category_label || (g.type === 5 ? (g.status_code || 'unknown') : (g.stream_end_reason || 'stream'));
+    const mergedCount = g.example_count || g.variant_count || 0;
+    const sampleNote = mergedCount > 1 ? `<div class="dim">已合并 ${mergedCount} 种相似文案</div>` : '';
+    const channelHtml = renderErrorGroupChannels(g.top_channels || [], g.channel_count || 0);
+    const examplesHtml = renderErrorGroupExamples(g.examples || [], g.normalized_content || g.content);
+    return `<tr>
+      <td>${i + 1}</td>
+      <td><strong>${g.count.toLocaleString()}</strong></td>
+      <td>${typeLabel}</td>
+      <td>${codeLabel}</td>
+      <td>${channelHtml}</td>
+      <td>${formatTime(g.first_at)}</td>
+      <td>${formatTime(g.last_at)}</td>
+      <td>${sampleNote}${examplesHtml}</td>
+    </tr>`;
+  }).join('');
+}
+
+function renderErrorGroupChannels(items, totalCount) {
+  if (!items || items.length === 0) {
+    return `<div class="dim">共 ${totalCount || 0} 个渠道</div><div class="dim">-</div>`;
+  }
+
+  const list = items.map(ch => `
+    <div class="error-group-channel-item">
+      <span class="error-group-channel-name">${escapeHtml(ch.channel_name || ch.channel_key || 'unknown')}</span>
+      <span class="error-group-channel-count">x ${formatNumber(ch.count || 0)}</span>
+    </div>
+  `).join('');
+
+  return `<div class="error-group-channel-list">${list}</div><div class="dim">共 ${totalCount || items.length} 个渠道</div>`;
+}
+
+function renderErrorGroupExamples(items, fallbackText) {
+  if (!items || items.length === 0) {
+    return `<pre class="error-content-pre">${escapeHtml(fallbackText || '(空)')}</pre>`;
+  }
+
+  return `<div class="error-group-example-list">${items.map(example => `
+    <div class="error-group-example-item">
+      <div class="error-group-example-meta">
+        <span>${escapeHtml(example.channel_name || 'unknown')}</span>
+        <span>x ${formatNumber(example.count || 0)}</span>
+        <span>${formatTime(example.last_at)}</span>
+      </div>
+      <pre class="error-content-pre">${escapeHtml(example.content || example.normalized_content || '(空)')}</pre>
+    </div>
+  `).join('')}</div>`;
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+async function loadErrorAnalysis() {
+  const res = await api(`/api/error-analysis?range=${currentRange}`);
+  if (!res.success) return;
+  const d = res.data || {};
+  errorGroupData = d.error_groups || [];
+  renderErrorSummary(d.summary || {});
+  renderErrorCharts(d.status_codes || [], d.stream_reasons || []);
+  renderErrorChannels(d.channels || []);
+  renderErrorGroups();
+  renderRecentErrors(d.recent_errors || []);
+}
+
 let logsPage = 1;
 async function loadLogs(page) {
   if (page !== undefined) logsPage = page;
@@ -464,8 +712,9 @@ async function refreshAll() {
   btn.disabled = true; btn.innerHTML = refreshSvg + ' 加载中...';
   try {
     await api('/api/poll', 'POST');
-    await Promise.all([loadStats(), loadTrend(), loadActions()]);
+    await Promise.all([loadDashboard(), loadTrend()]);
     if (document.getElementById('panel-logs').classList.contains('active')) loadLogs(1);
+    if (document.getElementById('panel-errors').classList.contains('active')) loadErrorAnalysis();
   } catch (e) { console.error('刷新失败:', e); }
   finally { btn.disabled = false; btn.innerHTML = refreshSvg + ' 刷新'; }
 }
@@ -490,7 +739,7 @@ async function handleToggle(tokenId, userId, currentlyEnabled) {
 async function handleRemoveWhitelist(tokenId) {
   if (!confirm(`确认移除白名单 #${tokenId}？`)) return;
   await api(`/api/whitelist/${tokenId}`, 'DELETE');
-  loadWhitelist();
+  loadDashboard();
 }
 
 // ==================== 事件绑定 ====================
@@ -503,8 +752,8 @@ document.querySelectorAll('.tab').forEach(tab => {
     const panel = document.getElementById('panel-' + tab.dataset.tab);
     panel.classList.add('active');
     if (tab.dataset.tab === 'trend') loadTrend();
+    if (tab.dataset.tab === 'errors') loadErrorAnalysis();
     if (tab.dataset.tab === 'logs') loadLogs(1);
-    if (tab.dataset.tab === 'actions') loadActions();
   });
 });
 
@@ -515,9 +764,10 @@ document.querySelectorAll('.range-btn').forEach(btn => {
     btn.classList.add('active');
     currentRange = btn.dataset.range;
     currentPage = 1;
-    loadStats();
+    loadDashboard();
     // 如果趋势面板可见就刷新趋势
     if (document.getElementById('panel-trend').classList.contains('active')) loadTrend();
+    if (document.getElementById('panel-errors').classList.contains('active')) loadErrorAnalysis();
     if (document.getElementById('panel-logs').classList.contains('active')) loadLogs(1);
   });
 });
@@ -530,7 +780,7 @@ document.querySelectorAll('.sub-tab').forEach(tab => {
     currentDim = tab.dataset.dim;
     currentSort = { key: 'count', dir: 'desc' };
     currentPage = 1;
-    loadStats();
+    loadDashboard();
   });
 });
 
@@ -539,6 +789,29 @@ document.getElementById('searchInput').addEventListener('input', () => { current
 
 // 刷新
 document.getElementById('btnRefresh').addEventListener('click', refreshAll);
+
+// 报错分类搜索
+document.getElementById('errorGroupSearch').addEventListener('input', (e) => {
+  errorGroupSearch = e.target.value;
+  renderErrorGroups();
+});
+
+// 报错分类排序
+document.querySelectorAll('#errorGroupsTable thead .sortable').forEach(th => {
+  th.addEventListener('click', () => {
+    const key = th.dataset.sort;
+    if (errorGroupSort.key === key) {
+      errorGroupSort.dir = errorGroupSort.dir === 'desc' ? 'asc' : 'desc';
+    } else {
+      errorGroupSort = { key, dir: 'desc' };
+    }
+    document.querySelectorAll('#errorGroupsTable thead .sortable').forEach(t => {
+      t.classList.remove('asc', 'desc');
+    });
+    th.classList.add(errorGroupSort.dir);
+    renderErrorGroups();
+  });
+});
 
 // 白名单添加
 document.getElementById('btnAddWhitelist').addEventListener('click', async () => {
@@ -552,7 +825,7 @@ document.getElementById('btnAddWhitelist').addEventListener('click', async () =>
   document.getElementById('wlTokenId').value = '';
   document.getElementById('wlTokenName').value = '';
   document.getElementById('wlNote').value = '';
-  loadWhitelist();
+  loadDashboard();
 });
 
 // 设置面板
@@ -629,6 +902,19 @@ async function analyzeItem(type, value, displayName) {
       return isGood ? `<span class="reason-good">${r}</span>` : `<span>${r}</span>`;
     }).join('')}</div>
   </div>`;
+
+  if (d.scriptTraceStats && d.scriptTraceStats.flagged_calls > 0) {
+    const st = d.scriptTraceStats;
+    html += `<div class="analysis-card full">
+      <h4>🧪 强规则脚本证据</h4>
+      <div style="font-size:13px;line-height:1.9;color:var(--text)">
+        <div>命中次数: <strong>${st.flagged_calls}</strong> / ${st.total_calls} (${(st.ratio_pct || 0).toFixed ? st.ratio_pct.toFixed(1) : st.ratio_pct}%)</div>
+        <div>Trace 类型: <strong>${(st.trace_types || []).join('、') || '未知'}</strong></div>
+        <div>脚本检测已关闭，仅作提醒</div>
+      </div>
+      <div class="score-reasons">${(d.scriptSignals || []).map(s => `<span>${s}</span>`).join('')}</div>
+    </div>`;
+  }
 
   html += '<div class="analysis-grid">';
 
@@ -815,9 +1101,6 @@ async function analyzeItem(type, value, displayName) {
 
 // ==================== 初始化 ====================
 (async () => {
-  await loadConfig();
+  await loadDashboard();
   loadSettingsUI();
-  await loadWhitelist();
-  await loadStats();
-  await loadActions();
 })();

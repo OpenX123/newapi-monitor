@@ -54,6 +54,7 @@
     <nav class="tabs">
       <button class="tab active" data-tab="ranking"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 20V10M12 20V4M6 20v-6"/></svg> 排行</button>
       <button class="tab" data-tab="trend"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg> 趋势</button>
+      <button class="tab" data-tab="errors"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg> 报错分析</button>
       <button class="tab" data-tab="logs"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg> 调用记录</button>
       <button class="tab" data-tab="actions"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg> 通知记录</button>
       <button class="tab" data-tab="whitelist"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg> 白名单</button>
@@ -111,6 +112,89 @@
           <h3 class="chart-title"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.21 15.89A10 10 0 1 1 8 2.83"/><path d="M22 12A10 10 0 0 0 12 2v10z"/></svg> 模型调用分布</h3>
           <canvas id="modelPieChart"></canvas>
         </div>
+      </div>
+    </section>
+
+    <!-- 报错分析面板 -->
+    <section class="tab-panel" id="panel-errors">
+      <div class="stats-row error-stats-row">
+        <div class="stat-card">
+          <div class="stat-value" id="errTotalRequests">-</div>
+          <div class="stat-label">总请求</div>
+        </div>
+        <div class="stat-card warn">
+          <div class="stat-value" id="errMainFailures">-</div>
+          <div class="stat-label">主失败</div>
+        </div>
+        <div class="stat-card warn">
+          <div class="stat-value" id="errStreamInterrupts">-</div>
+          <div class="stat-label">流式中断</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" id="errTotalRate">-</div>
+          <div class="stat-label">综合失败率</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" id="errAffectedChannels">-</div>
+          <div class="stat-label">异常渠道数</div>
+        </div>
+      </div>
+
+      <div class="chart-row chart-row-half">
+        <div class="chart-container">
+          <h3 class="chart-title"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 16l4-4 3 3 5-7"/></svg> HTTP 状态码分布</h3>
+          <div class="analysis-chart-wrap"><canvas id="errorStatusChart"></canvas></div>
+        </div>
+        <div class="chart-container">
+          <h3 class="chart-title"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20V10"/><path d="M18 20V4"/><path d="M6 20v-6"/></svg> 流式中断原因</h3>
+          <div class="analysis-chart-wrap"><canvas id="streamReasonChart"></canvas></div>
+        </div>
+      </div>
+
+      <div class="chart-container" style="margin-bottom:16px;">
+        <h3 class="chart-title"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3h18v18H3z"/><path d="M3 9h18"/><path d="M9 21V9"/></svg> 渠道失败排行</h3>
+        <table id="errorChannelsTable">
+          <thead>
+            <tr>
+              <th>#</th><th>渠道</th><th>总请求</th><th>主失败</th><th>流式中断</th><th>综合失败率</th><th>主要状态码</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <div class="chart-container" style="margin-bottom:16px;">
+        <h3 class="chart-title"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16"/><path d="M4 10h16"/><path d="M4 14h16"/><path d="M4 18h16"/></svg> 报错分类统计（按大类聚合）</h3>
+        <div class="toolbar" style="margin-bottom: 12px;">
+          <input type="text" class="search-input" id="errorGroupSearch" placeholder="搜索分类、示例内容、状态码...">
+        </div>
+        <table id="errorGroupsTable">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th class="sortable" data-sort="count">出现次数</th>
+              <th>类型</th>
+              <th class="sortable" data-sort="category_label">错误类型</th>
+              <th class="sortable" data-sort="channel_count">渠道</th>
+              <th class="sortable" data-sort="first_at">首次</th>
+              <th class="sortable" data-sort="last_at">最近</th>
+              <th style="min-width:300px">报错示例</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <div class="chart-container">
+        <h3 class="chart-title"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/></svg> 最近错误明细</h3>
+        <table id="recentErrorsTable">
+          <thead>
+            <tr>
+              <th>时间</th><th>类型</th><th>渠道</th><th>模型</th><th>用户</th><th>Token</th><th>摘要</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
       </div>
     </section>
 
