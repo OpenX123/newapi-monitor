@@ -21,6 +21,9 @@ services:
       # - REDIS_DB=0
       # - REDIS_KEY_PREFIX=newapi-monitor
       # - CACHE_TTL_SECONDS=120
+
+      # 面板访问密钥（建议改成一个足够长的随机字符串）
+      # - DASHBOARD_ACCESS_KEY=change_to_a_long_random_secret
       # SMTP（可选）
       # - SMTP_HOST=smtp.qq.com
       # - SMTP_PORT=587

@@ -70,9 +70,10 @@
         <button class="sub-tab" data-dim="model">按模型</button>
         <button class="sub-tab" data-dim="group">按分组</button>
         <button class="sub-tab" data-dim="channel">按渠道</button>
+        <button class="sub-tab" data-dim="ip">按 IP</button>
       </div>
       <div class="toolbar">
-        <input type="text" class="search-input" id="searchInput" placeholder="搜索 Token / 用户...">
+        <input type="text" class="search-input" id="searchInput" placeholder="搜索 Token / 用户 / IP...">
       </div>
       <table id="rankingTable">
         <thead><tr id="rankingHead"></tr></thead>
@@ -200,10 +201,14 @@
 
     <!-- 调用记录面板 -->
     <section class="tab-panel" id="panel-logs">
+      <div class="toolbar">
+        <input type="text" class="search-input" id="logIpFilter" placeholder="按完整客户端 IP 筛选，例如 203.0.113.10">
+        <button class="btn btn-primary" id="btnFilterLogs">筛选</button>
+      </div>
       <table id="logsTable">
         <thead>
           <tr>
-            <th>时间</th><th>用户</th><th>Token</th><th>模型</th><th>额度</th><th>Prompt</th><th>Completion</th><th>渠道</th>
+            <th>时间</th><th>客户端 IP</th><th>用户</th><th>Token</th><th>模型</th><th>额度</th><th>Prompt</th><th>Completion</th><th>渠道</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -258,6 +263,11 @@
           <label>通知邮箱</label>
           <input type="email" id="cfgNotifyEmail" placeholder="接收告警通知的邮箱">
           <span class="setting-hint">留空则默认使用 SMTP 发件人邮箱</span>
+        </div>
+        <div class="setting-item">
+          <label>时区（IANA）</label>
+          <input type="text" id="cfgTimezone" placeholder="Asia/Shanghai">
+          <span class="setting-hint">默认 Asia/Shanghai；用于日统计边界、趋势和所有时间展示</span>
         </div>
         <button class="btn btn-primary" id="btnSaveConfig"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg> 保存设置</button>
         <span id="cfgSaveStatus" class="save-status"></span>

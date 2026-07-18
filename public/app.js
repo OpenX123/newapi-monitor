@@ -18,13 +18,14 @@ async function api(path, method = 'GET', body = null) {
   const opts = { method, headers: { 'Content-Type': 'application/json' } };
   if (body) opts.body = JSON.stringify(body);
   const res = await fetch(path, opts);
+  if (res.status === 401) { window.location.replace('/login.html'); throw new Error('未登录或登录已过期'); }
   return res.json();
 }
 
 // ==================== 工具函数 ====================
 function formatTime(ts) {
   if (!ts) return '-';
-  return new Date(ts * 1000).toLocaleString('zh-CN', { hour12: false });
+  return new Date(ts * 1000).toLocaleString('zh-CN', { hour12: false, timeZone: config.timezone || 'Asia/Shanghai' });
 }
 function formatQuota(q) {
   if (!q) return '0';
@@ -76,6 +77,15 @@ const COLUMNS = {
     { key: 'count', label: '调用次数', sortable: true },
     { key: 'quota', label: '额度消耗', sortable: true },
   ],
+  ip: [
+    { key: '#', label: '#' },
+    { key: 'ip', label: '客户端 IP', sortable: true },
+    { key: 'count', label: '调用次数', sortable: true },
+    { key: 'user_count', label: '活跃用户', sortable: true },
+    { key: 'token_count', label: '活跃 Token', sortable: true },
+    { key: 'first_at', label: '首次调用', sortable: true },
+    { key: 'last_at', label: '最近调用', sortable: true },
+  ],
 };
 
 // ==================== 渲染逻辑 ====================
@@ -88,7 +98,7 @@ function renderStats(data) {
   const overLimit = data.tokens ? data.tokens.filter(t => t.count > config.dailyLimit).length : 0;
   document.getElementById('statOverLimit').textContent = overLimit;
   document.getElementById('updateTime').textContent =
-    '更新于 ' + new Date(data.time || Date.now()).toLocaleTimeString('zh-CN', { hour12: false });
+    '更新于 ' + new Date(data.time || Date.now()).toLocaleTimeString('zh-CN', { hour12: false, timeZone: config.timezone || 'Asia/Shanghai' });
 }
 
 function renderTableHead() {
@@ -127,7 +137,8 @@ function renderTableBody() {
       (r.username || '').toLowerCase().includes(filter) ||
       (r.model_name || '').toLowerCase().includes(filter) ||
       (r.grp || '').toLowerCase().includes(filter) ||
-      (r.channel_name || '').toLowerCase().includes(filter)
+      (r.channel_name || '').toLowerCase().includes(filter) ||
+      (r.ip || '').toLowerCase().includes(filter)
     );
   }
 
@@ -160,6 +171,7 @@ function renderTableBody() {
     if (currentDim === 'model') return renderModelRow(r, idx);
     if (currentDim === 'group') return renderGroupRow(r, idx);
     if (currentDim === 'channel') return renderChannelRow(r, idx);
+    if (currentDim === 'ip') return renderIpRow(r, idx);
   }).join('');
 
   renderPagination(rows.length);
@@ -226,6 +238,11 @@ function renderGroupRow(r, i) {
 }
 function renderChannelRow(r, i) {
   return `<tr><td>${i+1}</td><td>${r.channel_name || r.channel || '-'}</td><td>${r.count}</td><td>${formatQuota(r.quota)}</td></tr>`;
+}
+function renderIpRow(r, i) {
+  const isMissing = r.ip === '(未记录)';
+  const action = isMissing ? '-' : `<button class="btn-analyze" onclick="showIpLogs('${r.ip.replace(/'/g, "\\'")}')">查看调用</button>`;
+  return `<tr><td>${i + 1}</td><td><strong>${r.ip}</strong></td><td>${formatNumber(r.count)}</td><td>${r.user_count}</td><td>${r.token_count}</td><td>${formatTime(r.first_at)}</td><td>${formatTime(r.last_at)} ${action}</td></tr>`;
 }
 
 function renderActions(actions) {
@@ -676,16 +693,17 @@ async function loadErrorAnalysis() {
 let logsPage = 1;
 async function loadLogs(page) {
   if (page !== undefined) logsPage = page;
-  const res = await api(`/api/recent-logs?range=${currentRange}&p=${logsPage}`);
+  const ip = document.getElementById('logIpFilter').value.trim();
+  const query = new URLSearchParams({ range: currentRange, p: logsPage });
+  if (ip) query.set('ip', ip);
+  const res = await api(`/api/recent-logs?${query}`);
   if (!res.success) return;
   const { items, total, pageSize } = res.data;
   const tbody = document.querySelector('#logsTable tbody');
   tbody.innerHTML = items.map(r => {
-    const t = new Date(r.created_at * 1000);
-    const ts = `${String(t.getMonth()+1).padStart(2,'0')}-${String(t.getDate()).padStart(2,'0')} ${String(t.getHours()).padStart(2,'0')}:${String(t.getMinutes()).padStart(2,'0')}:${String(t.getSeconds()).padStart(2,'0')}`;
     const q = r.quota >= 10000 ? (r.quota / 10000).toFixed(1) + '万' : (r.quota || 0);
     return `<tr>
-      <td>${ts}</td><td>${r.username}</td><td><span class="dim">#${r.token_id}</span> ${r.token_name || ''}</td>
+      <td>${formatTime(r.created_at)}</td><td>${r.ip || '-'}</td><td>${r.username}</td><td><span class="dim">#${r.token_id}</span> ${r.token_name || ''}</td>
       <td><span class="model-tag">${r.model_name}</span></td><td>${q}</td>
       <td>${(r.prompt_tokens||0).toLocaleString()}</td><td>${(r.completion_tokens||0).toLocaleString()}</td>
       <td>${r.channel_name || '-'}</td>
@@ -717,6 +735,11 @@ async function refreshAll() {
     if (document.getElementById('panel-errors').classList.contains('active')) loadErrorAnalysis();
   } catch (e) { console.error('刷新失败:', e); }
   finally { btn.disabled = false; btn.innerHTML = refreshSvg + ' 刷新'; }
+}
+
+function showIpLogs(ip) {
+  document.getElementById('logIpFilter').value = ip;
+  document.querySelector('.tab[data-tab="logs"]').click();
 }
 
 // ==================== 交互 ====================
@@ -786,6 +809,8 @@ document.querySelectorAll('.sub-tab').forEach(tab => {
 
 // 搜索
 document.getElementById('searchInput').addEventListener('input', () => { currentPage = 1; renderTableBody(); });
+document.getElementById('btnFilterLogs').addEventListener('click', () => loadLogs(1));
+document.getElementById('logIpFilter').addEventListener('keydown', event => { if (event.key === 'Enter') loadLogs(1); });
 
 // 刷新
 document.getElementById('btnRefresh').addEventListener('click', refreshAll);
@@ -833,6 +858,7 @@ function loadSettingsUI() {
   document.getElementById('cfgPollInterval').value = Math.round((config.pollInterval || 300000) / 1000);
   document.getElementById('cfgDailyLimit').value = config.dailyLimit || 2000;
   document.getElementById('cfgNotifyEmail').value = config.notifyEmail || '';
+  document.getElementById('cfgTimezone').value = config.timezone || 'Asia/Shanghai';
 }
 
 document.getElementById('btnSaveConfig').addEventListener('click', async () => {
@@ -843,11 +869,14 @@ document.getElementById('btnSaveConfig').addEventListener('click', async () => {
     pollInterval: parseInt(document.getElementById('cfgPollInterval').value) * 1000,
     dailyLimit: parseInt(document.getElementById('cfgDailyLimit').value),
     notifyEmail: document.getElementById('cfgNotifyEmail').value.trim(),
+    timezone: document.getElementById('cfgTimezone').value.trim(),
   };
   try {
     const res = await api('/api/config', 'PUT', body);
     if (res.success) {
       config = { ...config, ...res.data };
+      await Promise.all([loadStats(), loadTrend()]);
+      if (document.getElementById('panel-logs').classList.contains('active')) loadLogs(1);
       status.innerHTML = '<svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg> 已保存';
       status.className = 'save-status success';
     } else {
@@ -1047,7 +1076,7 @@ async function analyzeItem(type, value, displayName) {
   if (d.intervalTimeline && d.intervalTimeline.length > 0) {
     const maxGap = 300;
     const tl = d.intervalTimeline;
-    const labels = tl.map(p => new Date(p.t * 1000).toLocaleString('zh-CN', {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}));
+    const labels = tl.map(p => new Date(p.t * 1000).toLocaleString('zh-CN', {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false,timeZone:config.timezone || 'Asia/Shanghai'}));
     safeChart('chartRhythm', ctx => new Chart(ctx, {
       type: 'scatter',
       data: { datasets: [{

@@ -59,12 +59,17 @@ npm start
 | `DAILY_LIMIT` | 日调用量限制 (超限自动禁用) | `2000` |
 | `POLL_INTERVAL` | 轮询间隔 (毫秒) | `300000` |
 | `PORT` | 服务端口 | `3456` |
+| `DASHBOARD_ACCESS_KEY` | 面板访问密钥；设置后必须登录才能访问页面和 API | 不启用鉴权 |
 | `SMTP_HOST` | 邮件服务器 | `smtp.qq.com` |
 | `SMTP_PORT` | 邮件端口 | `587` |
 | `SMTP_USER` | 发件邮箱 | — |
 | `SMTP_PASS` | 邮箱授权码 | — |
 
 > 本项目直连 NewAPI 的 PostgreSQL 数据库 `logs` 表，不会写入或修改任何 NewAPI 数据。
+
+### 面板访问鉴权
+
+设置 `DASHBOARD_ACCESS_KEY` 后，打开面板会先要求输入访问密钥。登录状态通过仅 HTTP 的 Cookie 保存 24 小时；服务重启后需要重新登录。请使用足够长的随机字符串，并在公网部署时通过 HTTPS 访问。
 
 ## 预览
 <img width="2176" height="1378" alt="image" src="https://github.com/user-attachments/assets/ffed3141-eb3d-4be0-a660-d41358d6f917" />

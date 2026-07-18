@@ -3,12 +3,13 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const http = require('http');
+const crypto = require('crypto');
 const { Pool } = require('pg');
 const { createClient } = require('redis');
 const nodemailer = require('nodemailer');
 const express = require('express');
 const app = express();
-app.use(express.static(path.join(__dirname, 'public')));
+app.set('trust proxy', 1);
 app.use(express.json());
 
 // ==================== 环境变量配置 ====================
@@ -26,10 +27,26 @@ const CONFIG = {
   redisDb: parseInt(process.env.REDIS_DB) || 0,
   redisKeyPrefix: process.env.REDIS_KEY_PREFIX || 'newapi-monitor',
   cacheTtlSeconds: parseInt(process.env.CACHE_TTL_SECONDS) || 120,
-};
+  timezone: 'Asia/Shanghai',
+  dashboardAccessKey: process.env.DASHBOARD_ACCESS_KEY,};
 let pollTimer = null;
 let redis = null;
 let redisReady = false;
+
+// ==================== 面板访问鉴权 ====================
+// 未设置 DASHBOARD_ACCESS_KEY 时保持兼容旧部署，不启用登录。
+const AUTH_COOKIE = 'newapi_monitor_session';
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+const sessions = new Map();
+function parseCookies(header = '') { return Object.fromEntries(header.split(';').map(item => { const index = item.indexOf('='); return index === -1 ? [] : [item.slice(0,index).trim(), decodeURIComponent(item.slice(index + 1).trim())]; }).filter(([key]) => key)); }
+function accessKeyMatches(key) { const expected = Buffer.from(CONFIG.dashboardAccessKey || ''); const supplied = Buffer.from(String(key || '')); return expected.length > 0 && expected.length === supplied.length && crypto.timingSafeEqual(expected, supplied); }
+function isAuthenticated(req) { if (!CONFIG.dashboardAccessKey) return true; const session = sessions.get(parseCookies(req.headers.cookie)[AUTH_COOKIE]); return Boolean(session && session.expiresAt > Date.now()); }
+function setSessionCookie(req,res,token,maxAge=SESSION_TTL_MS) { const attributes = [AUTH_COOKIE + '=' + encodeURIComponent(token),'Path=/','HttpOnly','SameSite=Strict','Max-Age=' + Math.floor(maxAge / 1000)]; if (req.secure) attributes.push('Secure'); res.setHeader('Set-Cookie',attributes.join('; ')); }
+app.post('/api/auth/login',(req,res) => { if (!CONFIG.dashboardAccessKey) return res.json({success:true,authEnabled:false}); if (!accessKeyMatches(req.body?.accessKey)) return res.status(401).json({success:false,message:'访问密钥错误'}); const token=crypto.randomBytes(32).toString('base64url'); sessions.set(token,{expiresAt:Date.now()+SESSION_TTL_MS}); setSessionCookie(req,res,token); res.json({success:true}); });
+app.post('/api/auth/logout',(req,res) => { sessions.delete(parseCookies(req.headers.cookie)[AUTH_COOKIE]); setSessionCookie(req,res,'',0); res.json({success:true}); });
+app.use((req,res,next) => { if (req.path === '/login.html' || req.path === '/favicon.ico' || isAuthenticated(req)) return next(); if (req.path.startsWith('/api/')) return res.status(401).json({success:false,message:'未登录或登录已过期'}); res.redirect('/login.html'); });
+app.use(express.static(path.join(__dirname,'public')));
+
 
 // ==================== 邮件配置 ====================
 const transporter = nodemailer.createTransport({
@@ -86,11 +103,12 @@ async function setKV(key, value) {
 
 // 启动时从 kv 加载持久化配置
 async function loadSavedConfig() {
-  const { rows } = await pool.query("SELECT key, value FROM monitor_kv WHERE key IN ('dailyLimit', 'pollInterval', 'notifyEmail')");
+  const { rows } = await pool.query("SELECT key, value FROM monitor_kv WHERE key IN ('dailyLimit', 'pollInterval', 'notifyEmail', 'timezone')");
   for (const row of rows) {
     if (row.key === 'dailyLimit') CONFIG.dailyLimit = parseInt(row.value);
     if (row.key === 'pollInterval') CONFIG.pollInterval = parseInt(row.value);
     if (row.key === 'notifyEmail') CONFIG.notifyEmail = row.value;
+    if (row.key === 'timezone' && isValidTimeZone(row.value)) CONFIG.timezone = row.value;
   }
 }
 
@@ -231,11 +249,37 @@ function apiRequest(urlPath, method = 'GET', body = null, userId = null) {
 }
 
 // ==================== 直接从 PostgreSQL logs 表聚合 ====================
+function isValidTimeZone(timeZone) {
+  try {
+    Intl.DateTimeFormat('en-US', { timeZone }).format();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getTimeZoneDateParts(timestamp, timeZone) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(new Date(timestamp));
+  return Object.fromEntries(parts.filter(p => p.type !== 'literal').map(p => [p.type, Number(p.value)]));
+}
+
+function getTimeZoneOffsetMs(timestamp, timeZone) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+  }).formatToParts(new Date(timestamp));
+  const value = Object.fromEntries(parts.filter(p => p.type !== 'literal').map(p => [p.type, Number(p.value)]));
+  return Date.UTC(value.year, value.month - 1, value.day, value.hour, value.minute, value.second) - timestamp;
+}
+
 function getRangeTs(range) {
-  // 用 Asia/Shanghai 时区计算"今天 0 点"，避免 Docker UTC 时区导致偏移
-  const now = new Date();
-  const cnStr = now.toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' }); // YYYY-MM-DD
-  const todayStart = Math.floor(new Date(cnStr + 'T00:00:00+08:00').getTime() / 1000);
+  // 数据库存 UTC 秒；所有日界线按面板配置的 IANA 时区计算。
+  const timeZone = CONFIG.timezone;
+  const { year, month, day } = getTimeZoneDateParts(Date.now(), timeZone);
+  const localMidnightAsUtc = Date.UTC(year, month - 1, day);
+  const todayStart = Math.floor((localMidnightAsUtc - getTimeZoneOffsetMs(localMidnightAsUtc, timeZone)) / 1000);
   if (range === '3d') return todayStart - 2 * 86400;
   if (range === '7d') return todayStart - 6 * 86400;
   if (range === '30d') return todayStart - 29 * 86400;
@@ -736,6 +780,7 @@ async function getAggregation(range, dimension) {
     model: { group: 'model_name', select: 'model_name' },
     group: { group: '"group"', select: '"group" as grp' },
     channel: { group: 'channel_id, channel_name', select: 'channel_id as channel, channel_name' },
+    ip: { group: "COALESCE(NULLIF(ip, ''), '(未记录)')", select: "COALESCE(NULLIF(ip, ''), '(未记录)') as ip, COUNT(DISTINCT username) as user_count, COUNT(DISTINCT token_id) as token_count, MIN(created_at) as first_at, MAX(created_at) as last_at" },
   };
   const d = dims[dimension] || dims.token;
   const result = await pool.query(`
@@ -758,15 +803,15 @@ async function getAggregation(range, dimension) {
 async function getHourlyTrend(range) {
   const ts = getRangeTs(range);
   const labelExpr = range === 'today'
-    ? "LPAD(EXTRACT(HOUR FROM TO_TIMESTAMP(created_at) AT TIME ZONE 'Asia/Shanghai')::TEXT, 2, '0') || ':00'"
-    : "TO_CHAR(TO_TIMESTAMP(created_at) AT TIME ZONE 'Asia/Shanghai', 'MM-DD HH24') || 'h'";
+    ? "LPAD(EXTRACT(HOUR FROM TO_TIMESTAMP(created_at) AT TIME ZONE $2)::TEXT, 2, '0') || ':00'"
+    : "TO_CHAR(TO_TIMESTAMP(created_at) AT TIME ZONE $2, 'MM-DD HH24') || 'h'";
   const res = await pool.query(`
     SELECT ${labelExpr} as label,
       COUNT(*) as count, SUM(quota) as quota,
       COUNT(DISTINCT token_id) as active_tokens,
       COUNT(DISTINCT username) as active_users
     FROM logs WHERE created_at >= $1 GROUP BY label ORDER BY label
-  `, [ts]);
+  `, [ts, CONFIG.timezone]);
   return res.rows.map(r => ({
     label: r.label,
     count: parseInt(r.count),
@@ -1337,10 +1382,10 @@ app.get('/api/user-analysis', async (req, res) => {
 
     // 2. 每小时分布
     const hourlyRes = await pool.query(`
-      SELECT EXTRACT(HOUR FROM TO_TIMESTAMP(created_at) AT TIME ZONE 'Asia/Shanghai')::INT as hour,
+      SELECT EXTRACT(HOUR FROM TO_TIMESTAMP(created_at) AT TIME ZONE $3)::INT as hour,
         COUNT(*) as count
       FROM logs WHERE ${filterCol} = $1 AND created_at >= $2 GROUP BY hour ORDER BY hour
-    `, [filterVal, ts]);
+    `, [filterVal, ts, CONFIG.timezone]);
     const hourly = hourlyRes.rows.map(r => ({ hour: r.hour, count: parseInt(r.count) }));
 
     // 3. 调用间隔分析（最近5000条，含时间序列用于散点图）
@@ -1416,9 +1461,9 @@ app.get('/api/user-analysis', async (req, res) => {
 
     // 7. 深夜活跃
     const nightRes = await pool.query(`
-      SELECT COUNT(*) FILTER (WHERE EXTRACT(HOUR FROM TO_TIMESTAMP(created_at) AT TIME ZONE 'Asia/Shanghai') BETWEEN 0 AND 5) as n
+      SELECT COUNT(*) FILTER (WHERE EXTRACT(HOUR FROM TO_TIMESTAMP(created_at) AT TIME ZONE $3) BETWEEN 0 AND 5) as n
       FROM logs WHERE ${filterCol} = $1 AND created_at >= $2
-    `, [filterVal, ts]);
+    `, [filterVal, ts, CONFIG.timezone]);
     const nightCalls = parseInt(nightRes.rows[0].n);
 
     // 8. 会话检测（间隔 > 300s 即视为新会话）
@@ -1453,10 +1498,10 @@ app.get('/api/user-analysis', async (req, res) => {
 
     // 9. 星期分布
     const weekdayRes = await pool.query(`
-      SELECT EXTRACT(DOW FROM TO_TIMESTAMP(created_at) AT TIME ZONE 'Asia/Shanghai')::INT as dow,
+      SELECT EXTRACT(DOW FROM TO_TIMESTAMP(created_at) AT TIME ZONE $3)::INT as dow,
         COUNT(*) as count
       FROM logs WHERE ${filterCol} = $1 AND created_at >= $2 GROUP BY dow ORDER BY dow
-    `, [filterVal, ts]);
+    `, [filterVal, ts, CONFIG.timezone]);
     const weekday = new Array(7).fill(0);
     for (const r of weekdayRes.rows) weekday[r.dow] = parseInt(r.count);
 
@@ -1545,21 +1590,23 @@ app.get('/api/recent-logs', async (req, res) => {
   const page = Math.max(1, parseInt(req.query.p) || 1);
   const pageSize = Math.min(100, parseInt(req.query.page_size) || 20);
   const range = req.query.range || 'today';
-  const data = await getOrBuildCached(`recent-logs:${range}:${page}:${pageSize}`, range, async () => {
+  const ip = String(req.query.ip || '').trim();
+  const data = await getOrBuildCached(`recent-logs:${range}:${page}:${pageSize}:ip:${ip || '-'}`, range, async () => {
     const ts = getRangeTs(range);
     const offset = (page - 1) * pageSize;
+    const where = ip ? 'WHERE created_at >= $1 AND ip = $2' : 'WHERE created_at >= $1';
+    const values = ip ? [ts, ip] : [ts];
     const [countRes, dataRes] = await Promise.all([
-      pool.query('SELECT COUNT(*) as cnt FROM logs WHERE created_at >= $1', [ts]),
+      pool.query(`SELECT COUNT(*) as cnt FROM logs ${where}`, values),
       pool.query(`
         SELECT id, created_at, username, token_name, token_id, model_name, quota,
-          prompt_tokens, completion_tokens, channel_name, "group" as grp
-        FROM logs WHERE created_at >= $1
-        ORDER BY created_at DESC LIMIT $2 OFFSET $3
-      `, [ts, pageSize, offset]),
+          prompt_tokens, completion_tokens, channel_name, "group" as grp, ip
+        FROM logs ${where}
+        ORDER BY created_at DESC LIMIT $${values.length + 1} OFFSET $${values.length + 2}
+      `, [...values, pageSize, offset]),
     ]);
     return { items: dataRes.rows, total: parseInt(countRes.rows[0].cnt), page, pageSize };
-  });
-  res.json({
+  });  res.json({
     success: true,
     data,
   });
@@ -1626,11 +1673,15 @@ app.delete('/api/whitelist/:id', async (req, res) => {
 });
 
 app.get('/api/config', (req, res) => {
-  res.json({ success: true, data: { dailyLimit: CONFIG.dailyLimit, pollInterval: CONFIG.pollInterval, notifyEmail: CONFIG.notifyEmail, baseUrl: CONFIG.baseUrl } });
+  res.json({ success: true, data: { dailyLimit: CONFIG.dailyLimit, pollInterval: CONFIG.pollInterval, notifyEmail: CONFIG.notifyEmail, timezone: CONFIG.timezone, baseUrl: CONFIG.baseUrl } });
 });
 
 app.put('/api/config', async (req, res) => {
-  const { dailyLimit, pollInterval, notifyEmail } = req.body;
+  const { dailyLimit, pollInterval, notifyEmail, timezone } = req.body;
+  const normalizedTimeZone = timezone == null ? null : String(timezone).trim();
+  if (normalizedTimeZone != null && !isValidTimeZone(normalizedTimeZone)) {
+    return res.status(400).json({ success: false, message: '无效时区，请使用 IANA 时区名称，例如 Asia/Shanghai' });
+  }
   if (dailyLimit != null) {
     CONFIG.dailyLimit = parseInt(dailyLimit);
     await setKV('dailyLimit', CONFIG.dailyLimit);
@@ -1645,10 +1696,19 @@ app.put('/api/config', async (req, res) => {
     CONFIG.notifyEmail = notifyEmail;
     await setKV('notifyEmail', CONFIG.notifyEmail);
   }
-  console.log(`⚙️ 配置已更新: dailyLimit=${CONFIG.dailyLimit}, pollInterval=${CONFIG.pollInterval}, notifyEmail=${CONFIG.notifyEmail}`);
-  await cacheDeleteByPrefix('dashboard:');
-  res.json({ success: true, data: { dailyLimit: CONFIG.dailyLimit, pollInterval: CONFIG.pollInterval, notifyEmail: CONFIG.notifyEmail } });
-});
+  if (timezone != null) {
+    CONFIG.timezone = normalizedTimeZone;
+    await setKV('timezone', CONFIG.timezone);
+  }
+  console.log(`⚙️ 配置已更新: dailyLimit=${CONFIG.dailyLimit}, pollInterval=${CONFIG.pollInterval}, notifyEmail=${CONFIG.notifyEmail}, timezone=${CONFIG.timezone}`);
+  await Promise.all([
+    cacheDeleteByPrefix('dashboard:'),
+    cacheDeleteByPrefix('stats:'),
+    cacheDeleteByPrefix('trend:'),
+    cacheDeleteByPrefix('distribution:'),
+    cacheDeleteByPrefix('recent-logs:'),
+  ]);
+  res.json({ success: true, data: { dailyLimit: CONFIG.dailyLimit, pollInterval: CONFIG.pollInterval, notifyEmail: CONFIG.notifyEmail, timezone: CONFIG.timezone } });});
 
 // ==================== 启动 ====================
 async function main() {
