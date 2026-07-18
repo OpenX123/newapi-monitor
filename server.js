@@ -28,7 +28,8 @@ const CONFIG = {
   redisKeyPrefix: process.env.REDIS_KEY_PREFIX || 'newapi-monitor',
   cacheTtlSeconds: parseInt(process.env.CACHE_TTL_SECONDS) || 120,
   timezone: 'Asia/Shanghai',
-  dashboardAccessKey: process.env.DASHBOARD_ACCESS_KEY,};
+  dashboardAccessKey: process.env.DASHBOARD_ACCESS_KEY,
+};
 let pollTimer = null;
 let redis = null;
 let redisReady = false;
