@@ -990,6 +990,12 @@ function loadSettingsUI() {
   set('cfgNotifyEmail', config.notifyEmail || '');
   set('cfgTimezone', config.timezone || 'Asia/Shanghai');
   check('cfgNotifyScript', config.notifyScript !== false);
+  check('cfgAlertDailyLimit', config.alertDailyLimit);
+  check('cfgAlertUsageAnomaly', config.alertUsageAnomaly);
+  check('cfgAlertIpUsers', config.alertIpUsers);
+  check('cfgAlertSubscription', config.alertSubscription);
+  set('cfgScriptClaudeAlertCalls', config.scriptClaudeAlertCalls ?? 1500);
+  set('cfgScriptGptAlertCalls', config.scriptGptAlertCalls ?? 800);
   set('cfgDisablePolicy', config.disablePolicy || 'notify_only');
   check('cfgDisableOnScript', config.disableOnScript);
   check('cfgRuleEnabled', config.ruleEnabled !== false);
@@ -999,7 +1005,7 @@ function loadSettingsUI() {
   set('cfgSurgeRatio', config.surgeRatio ?? 5);
   set('cfgSurgeMinCalls', config.surgeMinCalls ?? 30);
   set('cfgSurgeCostUsd', config.surgeCostUsd ?? 5);
-  set('cfgShareIpPerToken', config.shareIpPerToken ?? 4);
+  set('cfgShareIpPerToken', config.shareIpPerToken ?? 2);
   set('cfgShareUsersPerIp', config.shareUsersPerIp ?? 2);
   set('cfgSubscriptionAlertPct', config.subscriptionAlertPct ?? 20);
   set('cfgSmtpHost', config.smtpHost || '');
@@ -1082,6 +1088,12 @@ document.getElementById('btnSaveConfig').addEventListener('click', async () => {
     notifyEmail: val('cfgNotifyEmail'),
     timezone: val('cfgTimezone'),
     notifyScript: document.getElementById('cfgNotifyScript').checked,
+    alertDailyLimit: document.getElementById('cfgAlertDailyLimit').checked,
+    alertUsageAnomaly: document.getElementById('cfgAlertUsageAnomaly').checked,
+    alertIpUsers: document.getElementById('cfgAlertIpUsers').checked,
+    alertSubscription: document.getElementById('cfgAlertSubscription').checked,
+    scriptClaudeAlertCalls: parseInt(val('cfgScriptClaudeAlertCalls')) || 1500,
+    scriptGptAlertCalls: parseInt(val('cfgScriptGptAlertCalls')) || 800,
     disablePolicy: document.getElementById('cfgDisablePolicy').value,
     disableOnScript: document.getElementById('cfgDisableOnScript').checked,
     smtpHost: val('cfgSmtpHost'),
@@ -1096,7 +1108,7 @@ document.getElementById('btnSaveConfig').addEventListener('click', async () => {
     surgeRatio: parseFloat(val('cfgSurgeRatio')) || 5,
     surgeMinCalls: parseInt(val('cfgSurgeMinCalls')) || 30,
     surgeCostUsd: parseFloat(val('cfgSurgeCostUsd')) || 0,
-    shareIpPerToken: parseInt(val('cfgShareIpPerToken')) || 4,
+    shareIpPerToken: parseInt(val('cfgShareIpPerToken')) || 2,
     shareUsersPerIp: parseInt(val('cfgShareUsersPerIp')) || 2,
     subscriptionAlertPct: parseFloat(val('cfgSubscriptionAlertPct')) || 0,
   };

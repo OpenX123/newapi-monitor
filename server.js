@@ -42,6 +42,14 @@ const CONFIG = {
   feishuWebhook: process.env.FEISHU_WEBHOOK || '',
   feishuSecret: process.env.FEISHU_SECRET || '',
   notifyScript: String(process.env.NOTIFY_SCRIPT || 'true').toLowerCase() !== 'false',
+  // 聚焦模式默认只保留「脚本阈值」与「多 IP」告警；其余类别可在面板按需启用。
+  alertDailyLimit: String(process.env.ALERT_DAILY_LIMIT || 'false').toLowerCase() === 'true',
+  alertUsageAnomaly: String(process.env.ALERT_USAGE_ANOMALY || 'false').toLowerCase() === 'true',
+  alertIpUsers: String(process.env.ALERT_IP_USERS || 'false').toLowerCase() === 'true',
+  alertSubscription: String(process.env.ALERT_SUBSCRIPTION || 'false').toLowerCase() === 'true',
+  // 脚本 trace 告警只在达到对应客户端的日调用量后触发，避免少量正常调用产生噪音。
+  scriptClaudeAlertCalls: parseInt(process.env.SCRIPT_CLAUDE_ALERT_CALLS) || 1500,
+  scriptGptAlertCalls: parseInt(process.env.SCRIPT_GPT_ALERT_CALLS) || 800,
   // 自动禁用策略：notify_only（只告警，默认）| auto（告警并禁用 Token）
   // 默认保持「只告警」，避免升级后突然把正在跑任务的客户断掉
   disablePolicy: process.env.DISABLE_POLICY === 'auto' ? 'auto' : 'notify_only',
@@ -56,7 +64,7 @@ const CONFIG = {
   surgeRatio: parseFloat(process.env.SURGE_RATIO) || 5,             // 相对上一窗口的倍数
   surgeMinCalls: parseInt(process.env.SURGE_MIN_CALLS) || 30,       // 倍数规则的最低调用数，避免 1→5 误报
   surgeCostUsd: parseFloat(process.env.SURGE_COST_USD) || 5,        // 窗口内费用阈值（美元）
-  shareIpPerToken: parseInt(process.env.SHARE_IP_PER_TOKEN) || 4,   // 单 Token 窗口内 IP 数
+  shareIpPerToken: parseInt(process.env.SHARE_IP_PER_TOKEN) || 2,   // 单 Token 窗口内 IP 数
   shareUsersPerIp: parseInt(process.env.SHARE_USERS_PER_IP) || 2,   // 单 IP 窗口内用户数
   alertCooldownMin: parseInt(process.env.ALERT_COOLDOWN_MIN) || 30, // 同一对象同类告警的冷却时间
   // 订阅余量低于此百分比时提醒续费，设为 0 关闭
@@ -358,6 +366,12 @@ const KV_CONFIG_KEYS = {
   feishuWebhook: v => v,
   feishuSecret: v => v,
   notifyScript: v => v === 'true',
+  alertDailyLimit: v => v === 'true',
+  alertUsageAnomaly: v => v === 'true',
+  alertIpUsers: v => v === 'true',
+  alertSubscription: v => v === 'true',
+  scriptClaudeAlertCalls: v => parseInt(v) || 1500,
+  scriptGptAlertCalls: v => parseInt(v) || 800,
   disablePolicy: v => (v === 'auto' ? 'auto' : 'notify_only'),
   disableOnScript: v => v === 'true',
   ruleEnabled: v => v === 'true',
@@ -366,7 +380,7 @@ const KV_CONFIG_KEYS = {
   surgeRatio: v => parseFloat(v) || 5,
   surgeMinCalls: v => parseInt(v) || 30,
   surgeCostUsd: v => parseFloat(v) || 5,
-  shareIpPerToken: v => parseInt(v) || 4,
+  shareIpPerToken: v => parseInt(v) || 2,
   shareUsersPerIp: v => parseInt(v) || 2,
   alertCooldownMin: v => parseInt(v) || 30,
   subscriptionAlertPct: v => (v === '' ? 0 : parseFloat(v) || 0),
@@ -1047,7 +1061,7 @@ async function getScriptDisableCandidates(ts) {
   const { rows } = await pool.query(`
     WITH filtered AS (
       SELECT
-        token_id, token_name, username, user_id,
+        token_id, token_name, username, user_id, model_name,
         CASE
           WHEN other IS NOT NULL AND other <> '' AND LEFT(other, 1) = '{' THEN other::jsonb
           ELSE '{}'::jsonb
@@ -1057,7 +1071,7 @@ async function getScriptDisableCandidates(ts) {
     ),
     labeled AS (
       SELECT
-        token_id, token_name, username, user_id,
+        token_id, token_name, username, user_id, model_name,
         CASE
           WHEN LOWER(COALESCE(other_json->'admin_info'->'channel_affinity'->>'reason', '')) LIKE '%claude cli trace%'
             OR LOWER(COALESCE(other_json->'admin_info'->'channel_affinity'->'override_template'->>'rule_name', '')) LIKE '%claude cli trace%' THEN 'claude cli trace'
@@ -1073,23 +1087,35 @@ async function getScriptDisableCandidates(ts) {
       token_id, token_name, username, user_id,
       COUNT(*) AS total_calls,
       COUNT(*) FILTER (WHERE trace_type IS NOT NULL) AS flagged_calls,
+      COUNT(*) FILTER (WHERE trace_type = 'claude cli trace' OR LOWER(COALESCE(model_name, '')) LIKE '%claude%') AS claude_calls,
+      COUNT(*) FILTER (WHERE trace_type = 'codex cli trace' OR LOWER(COALESCE(model_name, '')) ~ '(gpt|codex)') AS gpt_calls,
       COALESCE(JSON_AGG(DISTINCT trace_type) FILTER (WHERE trace_type IS NOT NULL), '[]'::json) AS trace_types
     FROM labeled
     GROUP BY token_id, token_name, username, user_id
-    HAVING COUNT(*) FILTER (WHERE trace_type IS NOT NULL) >= $2
+    HAVING COUNT(*) FILTER (WHERE trace_type = 'claude cli trace' OR LOWER(COALESCE(model_name, '')) LIKE '%claude%') >= $2
+        OR COUNT(*) FILTER (WHERE trace_type = 'codex cli trace' OR LOWER(COALESCE(model_name, '')) ~ '(gpt|codex)') >= $3
     ORDER BY flagged_calls DESC, total_calls DESC
-  `, [ts, 30]);
+  `, [ts, CONFIG.scriptClaudeAlertCalls, CONFIG.scriptGptAlertCalls]);
 
   return rows.map(r => {
     const totalCalls = parseInt(r.total_calls) || 0;
     const flaggedCalls = parseInt(r.flagged_calls) || 0;
+    const claudeCalls = parseInt(r.claude_calls) || 0;
+    const gptCalls = parseInt(r.gpt_calls) || 0;
+    const alertReasons = [];
+    if (claudeCalls >= CONFIG.scriptClaudeAlertCalls) alertReasons.push(`Claude ${claudeCalls} 次 ≥ ${CONFIG.scriptClaudeAlertCalls}`);
+    if (gptCalls >= CONFIG.scriptGptAlertCalls) alertReasons.push(`GPT ${gptCalls} 次 ≥ ${CONFIG.scriptGptAlertCalls}`);
     return {
       token_id: parseInt(r.token_id) || 0,
       token_name: r.token_name,
       username: r.username,
       user_id: parseInt(r.user_id) || 0,
       trace_types: Array.isArray(r.trace_types) ? r.trace_types : [],
+      claude_calls: claudeCalls,
+      gpt_calls: gptCalls,
+      alert_reasons: alertReasons,
       ...buildScriptDisableDecision(flaggedCalls, totalCalls),
+      eligible: alertReasons.length > 0,
     };
   }).filter(r => r.eligible);
 }
@@ -1631,7 +1657,7 @@ async function pollAndCheck() {
 
     // 自动通知并尝试禁用超标 token
     for (const t of tokens) {
-      if (t.count > CONFIG.dailyLimit && !whitelistSet.has(t.token_id)) {
+      if (CONFIG.alertDailyLimit && t.count > CONFIG.dailyLimit && !whitelistSet.has(t.token_id)) {
         console.log(`⚠️ token ${t.token_name}(${t.token_id}) 今日 ${t.count} 次，超标！`);
         const checkRes = await pool.query(
           "SELECT 1 FROM monitor_actions WHERE token_id = $1 AND action = 'notify' AND created_at >= $2",
@@ -1694,7 +1720,9 @@ async function pollAndCheck() {
         lines: [
           `**用户**：${item.username}`,
           `**Token**：${item.token_name}（ID: ${item.token_id}）`,
-          `**命中次数**：${item.flagged_calls} / ${item.total_calls}（${item.ratio_pct}%）`,
+          `**触发条件**：${item.alert_reasons.join('；')}`,
+          `**Claude / GPT 调用**：${item.claude_calls} / ${item.gpt_calls}`,
+          `**Trace 命中**：${item.flagged_calls} / ${item.total_calls}（${item.ratio_pct}%）`,
           `**Trace 类型**：${(item.trace_types || []).join('、') || '未知'}`,
         ],
       });
@@ -1705,7 +1733,7 @@ async function pollAndCheck() {
           tokenName: item.token_name,
           username: item.username,
           action: 'notify_script',
-          reason: `脚本 trace 命中 ${item.flagged_calls} 次（${item.ratio_pct}%）`,
+          reason: `脚本告警：${item.alert_reasons.join('；')}`,
           dailyCount: item.total_calls,
           meta: { policy: 'script_trace', trace_types: item.trace_types, channels: okChannels },
         });
@@ -1714,7 +1742,7 @@ async function pollAndCheck() {
         token: { token_id: item.token_id, token_name: item.token_name, username: item.username, user_id: item.user_id, count: item.total_calls },
         enabled: CONFIG.disablePolicy === 'auto' && CONFIG.disableOnScript,
         action: 'auto_disable_script',
-        reason: `脚本 trace 命中 ${item.flagged_calls} 次（${item.ratio_pct}%）`,
+        reason: `脚本告警：${item.alert_reasons.join('；')}`,
         meta: { policy: 'script_trace', trace_types: item.trace_types },
       });
     }
@@ -1765,7 +1793,7 @@ async function getSubscriptions(hours = 168) {
 
 // 余量低于阈值时提醒续费；按用户 + 档位去重，从 20% 掉到 5% 会再提醒一次
 async function checkSubscriptions() {
-  if (!CONFIG.subscriptionAlertPct) return;
+  if (!CONFIG.alertSubscription || !CONFIG.subscriptionAlertPct) return;
   try {
     const subs = await getSubscriptions(168);
     for (const s of subs) {
@@ -1862,7 +1890,7 @@ async function runRealtimeRules() {
       if (hitAbs) triggers.push(`窗口调用数 ${cur} ≥ ${CONFIG.surgeCalls}`);
       if (hitRatio) triggers.push(`较上一窗口放大 ${ratio === Infinity ? '∞' : ratio.toFixed(1)}× ≥ ${CONFIG.surgeRatio}×`);
       if (hitCost) triggers.push(`窗口费用 $${usd.toFixed(2)} ≥ $${CONFIG.surgeCostUsd}`);
-      if (triggers.length) {
+      if (CONFIG.alertUsageAnomaly && triggers.length) {
         const costOnly = hitCost && !hitAbs && !hitRatio;
         await alertOnce({
           kind: 'alert_usage',
@@ -1909,7 +1937,7 @@ async function runRealtimeRules() {
     }
 
     // 规则 4：同一 IP 下出现多个账号
-    if (CONFIG.shareUsersPerIp > 1) {
+    if (CONFIG.alertIpUsers && CONFIG.shareUsersPerIp > 1) {
       const ipRes = await pool.query(`
         SELECT ip, COUNT(DISTINCT username) AS users, COUNT(DISTINCT token_id) AS tokens,
           COUNT(*) AS calls, STRING_AGG(DISTINCT username, ', ') AS usernames
@@ -2375,6 +2403,12 @@ function publicConfig() {
     feishuWebhookSet: Boolean(CONFIG.feishuWebhook),
     feishuSecretSet: Boolean(CONFIG.feishuSecret),
     notifyScript: CONFIG.notifyScript,
+    alertDailyLimit: CONFIG.alertDailyLimit,
+    alertUsageAnomaly: CONFIG.alertUsageAnomaly,
+    alertIpUsers: CONFIG.alertIpUsers,
+    alertSubscription: CONFIG.alertSubscription,
+    scriptClaudeAlertCalls: CONFIG.scriptClaudeAlertCalls,
+    scriptGptAlertCalls: CONFIG.scriptGptAlertCalls,
     disablePolicy: CONFIG.disablePolicy,
     disableOnScript: CONFIG.disableOnScript,
     ruleEnabled: CONFIG.ruleEnabled,
@@ -2428,6 +2462,12 @@ app.put('/api/config', async (req, res) => {
   await apply('smtpUser', body.smtpUser, v => String(v).trim());
   await apply('smtpFrom', body.smtpFrom, v => String(v).trim());
   await apply('notifyScript', body.notifyScript, v => Boolean(v));
+  await apply('alertDailyLimit', body.alertDailyLimit, v => Boolean(v));
+  await apply('alertUsageAnomaly', body.alertUsageAnomaly, v => Boolean(v));
+  await apply('alertIpUsers', body.alertIpUsers, v => Boolean(v));
+  await apply('alertSubscription', body.alertSubscription, v => Boolean(v));
+  await apply('scriptClaudeAlertCalls', body.scriptClaudeAlertCalls, v => Math.max(1, parseInt(v) || 1500));
+  await apply('scriptGptAlertCalls', body.scriptGptAlertCalls, v => Math.max(1, parseInt(v) || 800));
   await apply('disablePolicy', body.disablePolicy, v => (v === 'auto' ? 'auto' : 'notify_only'));
   await apply('disableOnScript', body.disableOnScript, v => Boolean(v));
   await apply('ruleEnabled', body.ruleEnabled, v => Boolean(v));
@@ -2436,7 +2476,7 @@ app.put('/api/config', async (req, res) => {
   await apply('surgeRatio', body.surgeRatio, v => Math.max(1, parseFloat(v) || 5));
   await apply('surgeMinCalls', body.surgeMinCalls, v => Math.max(1, parseInt(v) || 30));
   await apply('surgeCostUsd', body.surgeCostUsd, v => Math.max(0, parseFloat(v) || 0));
-  await apply('shareIpPerToken', body.shareIpPerToken, v => Math.max(1, parseInt(v) || 4));
+  await apply('shareIpPerToken', body.shareIpPerToken, v => Math.max(1, parseInt(v) || 2));
   await apply('shareUsersPerIp', body.shareUsersPerIp, v => Math.max(1, parseInt(v) || 2));
   await apply('alertCooldownMin', body.alertCooldownMin, v => Math.max(1, parseInt(v) || 30));
   await apply('subscriptionAlertPct', body.subscriptionAlertPct, v => Math.min(100, Math.max(0, parseFloat(v) || 0)));

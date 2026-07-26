@@ -304,6 +304,26 @@
           <label>脚本行为告警</label>
           <label class="switch-line"><input type="checkbox" id="cfgNotifyScript"> 检测到脚本/自动化 trace 时推送告警（每个 Token 每天一次）</label>
         </div>
+        <div class="setting-row">
+          <div class="setting-item">
+            <label>Claude 调用告警阈值</label>
+            <input type="number" id="cfgScriptClaudeAlertCalls" min="1">
+            <span class="setting-hint">24 小时内 Claude trace 达到此调用数才告警</span>
+          </div>
+          <div class="setting-item">
+            <label>GPT 调用告警阈值</label>
+            <input type="number" id="cfgScriptGptAlertCalls" min="1">
+            <span class="setting-hint">24 小时内 Codex（GPT）trace 达到此调用数才告警</span>
+          </div>
+        </div>
+        <div class="setting-item">
+          <label>其他告警类别</label>
+          <label class="switch-line"><input type="checkbox" id="cfgAlertDailyLimit"> 启用每日调用超限告警</label>
+          <label class="switch-line"><input type="checkbox" id="cfgAlertUsageAnomaly"> 启用调用突增 / 费用异常告警</label>
+          <label class="switch-line"><input type="checkbox" id="cfgAlertIpUsers"> 启用同 IP 多账号告警</label>
+          <label class="switch-line"><input type="checkbox" id="cfgAlertSubscription"> 启用订阅余量告警</label>
+          <span class="setting-hint">默认关闭；关闭后只保留 Claude/GPT 阈值、单 Token 多 IP 等聚焦告警</span>
+        </div>
 
         <h3 class="settings-section">⚡ 实时风控规则</h3>
         <div class="setting-item">

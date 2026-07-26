@@ -80,7 +80,7 @@ npm run test:db # 集成测试，把面板会发出的每条 SQL 在真实库上
 | `SURGE_RATIO` | 相对上一窗口的突增倍数 | `5` |
 | `SURGE_MIN_CALLS` | 倍数规则的最低调用数 | `30` |
 | `SURGE_COST_USD` | 窗口内费用阈值（美元） | `5` |
-| `SHARE_IP_PER_TOKEN` | 单 Token 窗口内 IP 数阈值 | `4` |
+| `SHARE_IP_PER_TOKEN` | 单 Token 窗口内 IP 数阈值 | `2` |
 | `SHARE_USERS_PER_IP` | 单 IP 窗口内账号数阈值 | `2` |
 | `ALERT_COOLDOWN_MIN` | 同类告警冷却（分钟） | `30` |
 | `DISABLE_POLICY` | 超限处置：`notify_only`（仅告警）/ `auto`（自动禁用） | `notify_only` |
@@ -96,6 +96,12 @@ npm run test:db # 集成测试，把面板会发出的每条 SQL 在真实库上
 | `FEISHU_WEBHOOK` | 飞书自定义机器人 Webhook 地址 | — |
 | `FEISHU_SECRET` | 飞书机器人签名密钥（勾选签名校验时填） | — |
 | `NOTIFY_SCRIPT` | 检测到脚本行为时是否告警 | `true` |
+| `ALERT_DAILY_LIMIT` | 是否启用每日调用超限告警 | `false` |
+| `ALERT_USAGE_ANOMALY` | 是否启用调用突增/费用异常告警 | `false` |
+| `ALERT_IP_USERS` | 是否启用同 IP 多账号告警 | `false` |
+| `ALERT_SUBSCRIPTION` | 是否启用订阅余量告警 | `false` |
+| `SCRIPT_CLAUDE_ALERT_CALLS` | Claude trace 的日调用告警阈值 | `1500` |
+| `SCRIPT_GPT_ALERT_CALLS` | Codex（GPT）trace 的日调用告警阈值 | `800` |
 
 > SMTP 与飞书的所有配置都可以直接在面板「设置」里填写并测试，保存后立即生效、无需重启；环境变量只作为首次启动的默认值。
 

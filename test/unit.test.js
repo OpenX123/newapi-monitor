@@ -161,7 +161,7 @@ function testWiring() {
   const pub = extract('function publicConfig', "app.put('/api/config'");
   const put = extract("app.put('/api/config'", "app.post('/api/notify/test'");
   const keys = ['dailyLimit', 'notifyEmail', 'smtpHost', 'smtpPort', 'smtpUser', 'notifyScript',
-    'disablePolicy', 'disableOnScript', 'ruleEnabled', 'surgeWindowMin', 'surgeCalls', 'surgeRatio',
+    'alertDailyLimit', 'alertUsageAnomaly', 'alertIpUsers', 'alertSubscription', 'scriptClaudeAlertCalls', 'scriptGptAlertCalls', 'disablePolicy', 'disableOnScript', 'ruleEnabled', 'surgeWindowMin', 'surgeCalls', 'surgeRatio',
     'surgeCostUsd', 'shareIpPerToken', 'shareUsersPerIp', 'alertCooldownMin', 'subscriptionAlertPct'];
   const broken = keys.filter(k => !kv.includes(k) || !pub.includes(k) || !put.includes(k));
   check('配置项在持久化/读取/写入三处齐全', broken.length === 0, broken.join('、'));
@@ -182,6 +182,8 @@ function testUsageSemantics() {
   check('报错分析不再把 other 整列传回 Node', !/SELECT id, created_at, type, content[\s\S]{0,200}channel_id, channel_name, other\s*\n\s*FROM logs/.test(src));
   check('报错明细有行数上限兜底', /LIMIT \$2/.test(src) && /ERROR_ROWS_LIMIT/.test(src));
   check('聚合缓存带版本号', /CACHE_SCHEMA_VERSION/.test(src));
+  check('脚本告警同时按模型名统计 Claude/GPT', /model_name[\s\S]{0,180}claude_calls[\s\S]{0,180}gpt_calls/.test(src));
+  check('非聚焦告警可分别关闭', /CONFIG\.alertUsageAnomaly && triggers\.length/.test(src) && /CONFIG\.alertDailyLimit && t\.count/.test(src));
 }
 
 (async () => {
