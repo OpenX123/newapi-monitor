@@ -109,7 +109,7 @@ Docker 镜像通过 GitHub Actions 构建（`.github/workflows/docker.yml`），
 - `logs` 表由 NewAPI 维护，本项目只做只读查询，不写入该表
 - **用量统计口径**（`REQUEST_LOGS` / `USAGE_AGG` 常量）：`logs.type` 中 1=充值 2=消费 3=管理 4=系统 5=错误 7=登录事件。只有 `type = 2` 携带真实用量，其余类型（尤其是登录日志，数量不小）不是 API 调用。因此 **调用次数统计 `type IN (2,5)`，费用与 token 只对 `type = 2` 求和**（`SUM(...) FILTER (WHERE type = 2)`）
 - `logs.quota` 是 NewAPI 内部计费单位，换算由 `QUOTA_PER_UNIT` 决定（默认 500000 = $1）。**面板统一按美元 + token 两个口径展示，不出现「额度」这一概念**，前端 `formatUSD()` 负责换算
-- **`prompt_tokens` 已包含缓存读取 token**（已用真实计费公式核对：`quota = ((prompt - cache) * model_ratio + cache * model_ratio * cache_ratio + completion * model_ratio * completion_ratio) * group_ratio`）。面板按每条请求单独计算缓存读取，采用运营口径：「总 Token」= `prompt_tokens + completion_tokens + cache_tokens × 0.5`；缓存部分通过 `CACHE_TOKENS_EXPR` 从 `other` 里单独提取。
+- **`prompt_tokens` 已包含缓存读取 token**（已用真实计费公式核对：`quota = ((prompt - cache) * model_ratio + cache * model_ratio * cache_ratio + completion * model_ratio * completion_ratio) * group_ratio`）。面板按每条请求单独计算缓存读取，采用运营口径：「总 Token」= `prompt_tokens + completion_tokens + cache_tokens × 0.6`；缓存部分通过 `CACHE_TOKENS_EXPR` 从 `other` 里单独提取。
 - `CACHE_TOKENS_EXPR` 用正则而非 `other::jsonb` 提取，避免个别行 `other` 非法 JSON / 非整数值导致整条聚合查询报错
 - 聚合结果结构变更时需递增 `CACHE_SCHEMA_VERSION`，否则升级后会读到旧口径的 Redis 缓存
 - `apiRequest()` 使用原生 `http/https` 模块而非 fetch/node-fetch，根据 `NEWAPI_BASE_URL` 协议自动选择

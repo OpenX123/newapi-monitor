@@ -46,10 +46,10 @@ function formatTokens(n) {
   if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
   return n.toLocaleString();
 }
-// 每条请求的缓存读取按 50% 权重额外计入总量，同时保留输入/缓存拆分展示。
+// 每条请求的缓存读取按 60% 权重额外计入总量，同时保留输入/缓存拆分展示。
 function tokenUsageCell(r) {
   const cache = r.cache_tokens || 0;
-  const total = r.total_tokens != null ? r.total_tokens : (r.prompt_tokens || 0) + (r.completion_tokens || 0) + cache * 0.5;
+  const total = r.total_tokens != null ? r.total_tokens : (r.prompt_tokens || 0) + (r.completion_tokens || 0) + cache * 0.6;
   const fresh = Math.max(0, (r.prompt_tokens || 0) - cache);
   const detail = cache > 0
     ? `入 ${formatTokens(fresh)} + 缓存 ${formatTokens(cache)} / 出 ${formatTokens(r.completion_tokens)}`
@@ -133,7 +133,7 @@ function renderStats(data) {
   // token 用量 / 费用：按当前区间的聚合行求和（usageRows 优先，快照只覆盖今天）
   const usageRows = data.usageRows || data.tokens || data.rows || [];
   const totals = usageRows.reduce((acc, r) => {
-    acc.tokens += r.total_tokens != null ? r.total_tokens : (r.prompt_tokens || 0) + (r.completion_tokens || 0) + (r.cache_tokens || 0) * 0.5;
+    acc.tokens += r.total_tokens != null ? r.total_tokens : (r.prompt_tokens || 0) + (r.completion_tokens || 0) + (r.cache_tokens || 0) * 0.6;
     acc.quota += r.quota || 0;
     return acc;
   }, { tokens: 0, quota: 0 });
@@ -786,7 +786,7 @@ async function loadLogs(page) {
   const current = new Set(items.map(r => String(r.id)));
   tbody.innerHTML = items.map(r => {
     const failed = r.type === 5;
-    const total = (r.prompt_tokens || 0) + (r.completion_tokens || 0) + (r.cache_tokens || 0) * 0.5;
+    const total = (r.prompt_tokens || 0) + (r.completion_tokens || 0) + (r.cache_tokens || 0) * 0.6;
     const isNew = !isFirstRender && logsPage === 1 && !previous.has(String(r.id));
     return `<tr class="${isNew ? 'row-new' : ''}">
       <td>${formatTime(r.created_at)}</td><td>${r.ip || '-'}</td><td>${r.username}</td><td><span class="dim">#${r.token_id}</span> ${r.token_name || ''}</td>
