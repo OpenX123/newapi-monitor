@@ -27,10 +27,45 @@ const CONFIG = {
   redisDb: parseInt(process.env.REDIS_DB) || 0,
   redisKeyPrefix: process.env.REDIS_KEY_PREFIX || 'newapi-monitor',
   cacheTtlSeconds: parseInt(process.env.CACHE_TTL_SECONDS) || 120,
+  // logs.quota 的计费单位换算（NewAPI 的 QuotaPerUnit），默认 500000 quota = $1，面板一律按美元展示
+  quotaPerUnit: parseFloat(process.env.QUOTA_PER_UNIT) || 500000,
   timezone: 'Asia/Shanghai',
   dashboardAccessKey: process.env.DASHBOARD_ACCESS_KEY,
+  // 通知渠道：环境变量只作为初始默认值，面板保存后以 monitor_kv 为准
+  // 兼容旧部署：只配了 SMTP_USER 没配 SMTP_HOST 时沿用原来的 smtp.qq.com 默认值
+  smtpHost: process.env.SMTP_HOST || (process.env.SMTP_USER ? 'smtp.qq.com' : ''),
+  smtpPort: parseInt(process.env.SMTP_PORT) || 587,
+  smtpSecure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true',
+  smtpUser: process.env.SMTP_USER || '',
+  smtpPass: process.env.SMTP_PASS || '',
+  smtpFrom: process.env.SMTP_FROM || '',
+  feishuWebhook: process.env.FEISHU_WEBHOOK || '',
+  feishuSecret: process.env.FEISHU_SECRET || '',
+  notifyScript: String(process.env.NOTIFY_SCRIPT || 'true').toLowerCase() !== 'false',
+  // 自动禁用策略：notify_only（只告警，默认）| auto（告警并禁用 Token）
+  // 默认保持「只告警」，避免升级后突然把正在跑任务的客户断掉
+  disablePolicy: process.env.DISABLE_POLICY === 'auto' ? 'auto' : 'notify_only',
+  disableOnScript: String(process.env.DISABLE_ON_SCRIPT || '').toLowerCase() === 'true',
+  // 实时推送：SSE 监听 logs 游标的间隔，无人订阅时不查库
+  realtimeIntervalMs: parseInt(process.env.REALTIME_INTERVAL_MS) || 5000,
+  // 实时风控规则：与面板轮询解耦，即使没人看面板也持续跑
+  ruleIntervalMs: parseInt(process.env.RULE_INTERVAL_MS) || 60000,
+  ruleEnabled: String(process.env.RULE_ENABLED || 'true').toLowerCase() !== 'false',
+  surgeWindowMin: parseInt(process.env.SURGE_WINDOW_MIN) || 5,      // 滑动窗口长度（分钟）
+  surgeCalls: parseInt(process.env.SURGE_CALLS) || 300,             // 窗口内调用数绝对阈值
+  surgeRatio: parseFloat(process.env.SURGE_RATIO) || 5,             // 相对上一窗口的倍数
+  surgeMinCalls: parseInt(process.env.SURGE_MIN_CALLS) || 30,       // 倍数规则的最低调用数，避免 1→5 误报
+  surgeCostUsd: parseFloat(process.env.SURGE_COST_USD) || 5,        // 窗口内费用阈值（美元）
+  shareIpPerToken: parseInt(process.env.SHARE_IP_PER_TOKEN) || 4,   // 单 Token 窗口内 IP 数
+  shareUsersPerIp: parseInt(process.env.SHARE_USERS_PER_IP) || 2,   // 单 IP 窗口内用户数
+  alertCooldownMin: parseInt(process.env.ALERT_COOLDOWN_MIN) || 30, // 同一对象同类告警的冷却时间
+  // 订阅余量低于此百分比时提醒续费，设为 0 关闭
+  subscriptionAlertPct: process.env.SUBSCRIPTION_ALERT_PCT != null ? parseFloat(process.env.SUBSCRIPTION_ALERT_PCT) : 20,
 };
 let pollTimer = null;
+let ruleTimer = null;
+let subscriptionTimer = null;
+let httpServer = null;
 let redis = null;
 let redisReady = false;
 
@@ -43,22 +78,196 @@ function parseCookies(header = '') { return Object.fromEntries(header.split(';')
 function accessKeyMatches(key) { const expected = Buffer.from(CONFIG.dashboardAccessKey || ''); const supplied = Buffer.from(String(key || '')); return expected.length > 0 && expected.length === supplied.length && crypto.timingSafeEqual(expected, supplied); }
 function isAuthenticated(req) { if (!CONFIG.dashboardAccessKey) return true; const session = sessions.get(parseCookies(req.headers.cookie)[AUTH_COOKIE]); return Boolean(session && session.expiresAt > Date.now()); }
 function setSessionCookie(req,res,token,maxAge=SESSION_TTL_MS) { const attributes = [AUTH_COOKIE + '=' + encodeURIComponent(token),'Path=/','HttpOnly','SameSite=Strict','Max-Age=' + Math.floor(maxAge / 1000)]; if (req.secure) attributes.push('Secure'); res.setHeader('Set-Cookie',attributes.join('; ')); }
-app.post('/api/auth/login',(req,res) => { if (!CONFIG.dashboardAccessKey) return res.json({success:true,authEnabled:false}); if (!accessKeyMatches(req.body?.accessKey)) return res.status(401).json({success:false,message:'访问密钥错误'}); const token=crypto.randomBytes(32).toString('base64url'); sessions.set(token,{expiresAt:Date.now()+SESSION_TTL_MS}); setSessionCookie(req,res,token); res.json({success:true}); });
+// 登录失败退避：同一 IP 连续失败会被锁定，防止访问密钥被暴力枚举
+const loginFailures = new Map();
+const LOGIN_MAX_FAILURES = 5;
+const LOGIN_LOCK_MS = 5 * 60 * 1000;
+function loginGate(ip) {
+  const rec = loginFailures.get(ip);
+  if (!rec) return { locked: false };
+  if (rec.lockedUntil > Date.now()) return { locked: true, retryAfter: Math.ceil((rec.lockedUntil - Date.now()) / 1000) };
+  if (rec.lockedUntil) loginFailures.delete(ip);
+  return { locked: false };
+}
+function loginFailed(ip) {
+  const rec = loginFailures.get(ip) || { count: 0, lockedUntil: 0 };
+  rec.count += 1;
+  if (rec.count >= LOGIN_MAX_FAILURES) { rec.lockedUntil = Date.now() + LOGIN_LOCK_MS; rec.count = 0; }
+  loginFailures.set(ip, rec);
+}
+app.post('/api/auth/login',(req,res) => {
+  if (!CONFIG.dashboardAccessKey) return res.json({success:true,authEnabled:false});
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  const gate = loginGate(ip);
+  if (gate.locked) return res.status(429).json({ success:false, message:`尝试过于频繁，请 ${gate.retryAfter} 秒后再试` });
+  if (!accessKeyMatches(req.body?.accessKey)) { loginFailed(ip); return res.status(401).json({success:false,message:'访问密钥错误'}); }
+  loginFailures.delete(ip);
+  const token=crypto.randomBytes(32).toString('base64url');
+  sessions.set(token,{expiresAt:Date.now()+SESSION_TTL_MS});
+  setSessionCookie(req,res,token);
+  res.json({success:true});
+});
+// 健康检查：编排层用它判断容器是否还活着，不需要鉴权
+app.get('/healthz', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ ok: true, redis: redisReady, sse: sseClients.size, uptime: Math.round(process.uptime()) });
+  } catch (err) {
+    res.status(503).json({ ok: false, message: err.message });
+  }
+});
 app.post('/api/auth/logout',(req,res) => { sessions.delete(parseCookies(req.headers.cookie)[AUTH_COOKIE]); setSessionCookie(req,res,'',0); res.json({success:true}); });
 app.use((req,res,next) => { if (req.path === '/login.html' || req.path === '/favicon.ico' || isAuthenticated(req)) return next(); if (req.path.startsWith('/api/')) return res.status(401).json({success:false,message:'未登录或登录已过期'}); res.redirect('/login.html'); });
 app.use(express.static(path.join(__dirname,'public')));
 
 
-// ==================== 邮件配置 ====================
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST || 'smtp.qq.com',
-  port: parseInt(process.env.SMTP_PORT) || 587,
-  secure: false,
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-  },
-});
+// ==================== 通知渠道 ====================
+// SMTP 连接按当前配置惰性构建，配置变更后自动重建，无需重启
+let transporter = null;
+let transporterKey = '';
+function getTransporter() {
+  if (!CONFIG.smtpHost || !CONFIG.smtpUser) return null;
+  const key = [CONFIG.smtpHost, CONFIG.smtpPort, CONFIG.smtpSecure, CONFIG.smtpUser, CONFIG.smtpPass].join('|');
+  if (transporter && transporterKey === key) return transporter;
+  transporter = nodemailer.createTransport({
+    host: CONFIG.smtpHost,
+    port: CONFIG.smtpPort,
+    secure: CONFIG.smtpSecure || CONFIG.smtpPort === 465,
+    auth: { user: CONFIG.smtpUser, pass: CONFIG.smtpPass },
+  });
+  transporterKey = key;
+  return transporter;
+}
+
+function postJson(targetUrl, payload) {
+  return new Promise((resolve, reject) => {
+    let parsed;
+    try { parsed = new URL(targetUrl); } catch { return reject(new Error('URL 格式不正确')); }
+    const client = parsed.protocol === 'https:' ? https : http;
+    const body = Buffer.from(JSON.stringify(payload), 'utf8');
+    const req = client.request({
+      hostname: parsed.hostname,
+      port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+      path: parsed.pathname + parsed.search,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': body.length },
+      timeout: 10000,
+    }, res => {
+      let raw = '';
+      res.on('data', chunk => { raw += chunk; });
+      res.on('end', () => {
+        let json = null;
+        try { json = JSON.parse(raw); } catch {}
+        resolve({ status: res.statusCode, json, raw });
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error('请求超时')));
+    req.on('error', reject);
+    req.end(body);
+  });
+}
+
+// 飞书自定义机器人签名：以 "{timestamp}\n{secret}" 为 key 对空串做 HMAC-SHA256
+function feishuSign(timestamp, secret) {
+  return crypto.createHmac('sha256', `${timestamp}\n${secret}`).update('').digest('base64');
+}
+
+async function sendFeishu({ title, level = 'info', lines = [] }) {
+  if (!CONFIG.feishuWebhook) throw new Error('未配置飞书 Webhook');
+  const template = level === 'danger' ? 'red' : level === 'warning' ? 'orange' : 'blue';
+  const payload = {
+    msg_type: 'interactive',
+    card: {
+      config: { wide_screen_mode: true },
+      header: { template, title: { tag: 'plain_text', content: title } },
+      elements: [
+        { tag: 'div', text: { tag: 'lark_md', content: lines.join('\n') } },
+        { tag: 'note', elements: [{ tag: 'plain_text', content: `NewAPI Monitor · ${formatInTimezone(Date.now())}` }] },
+      ],
+    },
+  };
+  if (CONFIG.feishuSecret) {
+    payload.timestamp = String(Math.floor(Date.now() / 1000));
+    payload.sign = feishuSign(payload.timestamp, CONFIG.feishuSecret);
+  }
+  const res = await postJson(CONFIG.feishuWebhook, payload);
+  if (res.status !== 200 || (res.json && res.json.code !== 0)) {
+    throw new Error(`飞书返回 ${res.status} ${res.json ? res.json.msg || res.json.code : res.raw.slice(0, 120)}`);
+  }
+  return true;
+}
+
+async function sendEmail({ title, lines = [] }) {
+  const mailer = getTransporter();
+  if (!mailer) throw new Error('未配置 SMTP');
+  const to = CONFIG.notifyEmail || CONFIG.smtpUser;
+  if (!to) throw new Error('未配置收件邮箱');
+  await mailer.sendMail({
+    from: CONFIG.smtpFrom || `"NewAPI Monitor" <${CONFIG.smtpUser}>`,
+    to,
+    subject: title,
+    text: lines.map(l => l.replace(/\*\*/g, '')).join('\n'),
+  });
+  return true;
+}
+
+// 统一告警出口：任一渠道失败不影响其他渠道，返回每个渠道的结果
+async function notifyAlert(alert) {
+  const results = [];
+  const channels = [];
+  if (getTransporter()) channels.push(['email', sendEmail]);
+  if (CONFIG.feishuWebhook) channels.push(['feishu', sendFeishu]);
+  for (const [name, send] of channels) {
+    try {
+      await send(alert);
+      results.push({ channel: name, ok: true });
+    } catch (err) {
+      results.push({ channel: name, ok: false, message: err.message });
+      console.error(`  通知失败 [${name}]: ${err.message}`);
+    }
+  }
+  if (results.some(r => r.ok)) broadcastEvent({ type: 'alert', title: alert.title, level: alert.level || 'info' });
+  return results;
+}
+
+function formatInTimezone(ms) {
+  return new Date(ms).toLocaleString('zh-CN', { hour12: false, timeZone: CONFIG.timezone });
+}
+
+function maskSecret(value, keep = 6) {
+  if (!value) return '';
+  const text = String(value);
+  return text.length <= keep ? '******' : `******${text.slice(-keep)}`;
+}
+
+// ==================== 实时推送（SSE） ====================
+const sseClients = new Set();
+let realtimeTimer = null;
+let lastBroadcastId = 0;
+
+function broadcastEvent(payload) {
+  if (!sseClients.size) return;
+  const frame = `data: ${JSON.stringify({ ...payload, at: Date.now() })}\n\n`;
+  for (const client of sseClients) {
+    try { client.write(frame); } catch { sseClients.delete(client); }
+  }
+}
+
+// 只在有人订阅时查库；游标查询是单条 MAX 聚合，代价固定
+async function watchRealtime() {
+  if (!sseClients.size) return;
+  try {
+    const cursor = await getLatestLogCursor();
+    if (!lastBroadcastId) { lastBroadcastId = cursor.maxId; return; }
+    if (cursor.maxId > lastBroadcastId) {
+      const added = cursor.maxId - lastBroadcastId;
+      lastBroadcastId = cursor.maxId;
+      broadcastEvent({ type: 'logs', maxId: cursor.maxId, added });
+    }
+  } catch (err) {
+    console.error('实时监听出错:', err.message);
+  }
+}
 
 // ==================== PostgreSQL ====================
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
@@ -91,6 +300,15 @@ async function initDB() {
     );
   `);
   await pool.query('ALTER TABLE monitor_actions ADD COLUMN IF NOT EXISTS action_meta JSONB');
+  // 告警冷却查询（按 action + subject + 时间）每分钟对每个活跃 Token 执行一次，没有索引会全表扫
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_monitor_actions_action_created
+      ON monitor_actions (action, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_monitor_actions_subject
+      ON monitor_actions ((action_meta->>'subject'), created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_monitor_actions_token
+      ON monitor_actions (token_id, created_at DESC);
+  `);
 }
 
 // kv 存储
@@ -103,19 +321,49 @@ async function setKV(key, value) {
 }
 
 // 启动时从 kv 加载持久化配置
+// monitor_kv 中可覆盖环境变量的配置项 → CONFIG 字段与解析方式
+const KV_CONFIG_KEYS = {
+  dailyLimit: v => parseInt(v),
+  pollInterval: v => parseInt(v),
+  notifyEmail: v => v,
+  timezone: v => (isValidTimeZone(v) ? v : CONFIG.timezone),
+  smtpHost: v => v,
+  smtpPort: v => parseInt(v) || 587,
+  smtpSecure: v => v === 'true',
+  smtpUser: v => v,
+  smtpPass: v => v,
+  smtpFrom: v => v,
+  feishuWebhook: v => v,
+  feishuSecret: v => v,
+  notifyScript: v => v === 'true',
+  disablePolicy: v => (v === 'auto' ? 'auto' : 'notify_only'),
+  disableOnScript: v => v === 'true',
+  ruleEnabled: v => v === 'true',
+  surgeWindowMin: v => parseInt(v) || 5,
+  surgeCalls: v => parseInt(v) || 300,
+  surgeRatio: v => parseFloat(v) || 5,
+  surgeMinCalls: v => parseInt(v) || 30,
+  surgeCostUsd: v => parseFloat(v) || 5,
+  shareIpPerToken: v => parseInt(v) || 4,
+  shareUsersPerIp: v => parseInt(v) || 2,
+  alertCooldownMin: v => parseInt(v) || 30,
+  subscriptionAlertPct: v => (v === '' ? 0 : parseFloat(v) || 0),
+};
+
 async function loadSavedConfig() {
-  const { rows } = await pool.query("SELECT key, value FROM monitor_kv WHERE key IN ('dailyLimit', 'pollInterval', 'notifyEmail', 'timezone')");
+  const keys = Object.keys(KV_CONFIG_KEYS);
+  const { rows } = await pool.query('SELECT key, value FROM monitor_kv WHERE key = ANY($1)', [keys]);
   for (const row of rows) {
-    if (row.key === 'dailyLimit') CONFIG.dailyLimit = parseInt(row.value);
-    if (row.key === 'pollInterval') CONFIG.pollInterval = parseInt(row.value);
-    if (row.key === 'notifyEmail') CONFIG.notifyEmail = row.value;
-    if (row.key === 'timezone' && isValidTimeZone(row.value)) CONFIG.timezone = row.value;
+    const parse = KV_CONFIG_KEYS[row.key];
+    if (parse) CONFIG[row.key] = parse(row.value);
   }
 }
 
 // ==================== Redis 缓存 ====================
+// 聚合结果结构变化时递增，避免升级后读到旧口径的缓存（v2：调用次数/费用/token 分类型统计）
+const CACHE_SCHEMA_VERSION = 'v2';
 function cacheKey(key) {
-  return `${CONFIG.redisKeyPrefix}:${key}`;
+  return `${CONFIG.redisKeyPrefix}:${CACHE_SCHEMA_VERSION}:${key}`;
 }
 
 async function initRedis() {
@@ -344,7 +592,7 @@ function classifyMainFailure(row) {
     'insufficient_quota', 'quota exceeded', 'quota exhausted', 'out of quota',
     'billing', 'balance', 'credit', '余额不足', '额度不足', '配额不足',
   ])) {
-    return { category_code: 'quota', category_label: '配额/余额不足' };
+    return { category_code: 'quota', category_label: '余额不足' };
   }
 
   if (includesAny(haystack, [
@@ -552,24 +800,63 @@ async function getOrBuildCached(key, range, builder, ttlSeconds = CONFIG.cacheTt
   });
 }
 
+// NewAPI logs.type：1=充值 2=消费 3=管理 4=系统 5=错误 7=登录
+// 只有 type=2 携带真实用量，其余类型（含登录事件）不是 API 调用，混进来会虚增调用次数。
+// 统计口径：
+//   调用次数 → 真实 API 请求（成功 2 + 失败 5）
+//   费用 / token → 仅消费日志（2）
+const REQUEST_LOGS = 'type IN (2, 5)';
+// logs.prompt_tokens 已经包含缓存读取 token（已用真实计费公式核对：
+// quota = ((prompt - cache) * model_ratio + cache * model_ratio * cache_ratio
+//          + completion * model_ratio * completion_ratio) * group_ratio），
+// 所以「实际使用 token」= prompt + completion，缓存部分单独拆出来展示、不重复累加。
+// 缓存 token 用正则从 other 文本里取，避免 other 非法 JSON 或非整数值导致整条聚合报错。
+const CACHE_TOKENS_EXPR = `COALESCE(NULLIF(SUBSTRING(other FROM '"cache_tokens":([0-9]+)'), '')::bigint, 0)`;
+const USAGE_AGG = `COUNT(*) as count,
+      SUM(quota) FILTER (WHERE type = 2) as quota,
+      SUM(prompt_tokens) FILTER (WHERE type = 2) as prompt_tokens,
+      SUM(completion_tokens) FILTER (WHERE type = 2) as completion_tokens,
+      SUM(COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0)) FILTER (WHERE type = 2) as total_tokens,
+      SUM(${CACHE_TOKENS_EXPR}) FILTER (WHERE type = 2) as cache_tokens`;
+
+function parseUsageRow(r) {
+  return {
+    ...r,
+    count: parseInt(r.count) || 0,
+    quota: parseInt(r.quota) || 0,
+    prompt_tokens: parseInt(r.prompt_tokens) || 0,
+    completion_tokens: parseInt(r.completion_tokens) || 0,
+    total_tokens: parseInt(r.total_tokens) || 0,
+    cache_tokens: parseInt(r.cache_tokens) || 0,
+  };
+}
+
 async function fetchLogsSinceId(lastLogId, minCreatedAt = 0) {
   const { rows } = await pool.query(`
-    SELECT id, created_at, username, token_name, token_id, user_id, model_name,
+    SELECT id, created_at, type, username, token_name, token_id, user_id, model_name,
       quota, prompt_tokens, completion_tokens, channel_name, "group" as grp, other
     FROM logs
-    WHERE id > $1 AND created_at >= $2
+    WHERE id > $1 AND created_at >= $2 AND ${REQUEST_LOGS}
     ORDER BY id ASC
   `, [lastLogId, minCreatedAt]);
   return rows.map(r => ({
     ...r,
     id: parseInt(r.id) || 0,
     created_at: parseInt(r.created_at) || 0,
+    type: parseInt(r.type) || 0,
     token_id: parseInt(r.token_id) || 0,
     user_id: parseInt(r.user_id) || 0,
     quota: parseInt(r.quota) || 0,
     prompt_tokens: parseInt(r.prompt_tokens) || 0,
     completion_tokens: parseInt(r.completion_tokens) || 0,
+    cache_tokens: extractCacheTokens(r.other),
   }));
+}
+
+// 与 SQL 侧 CACHE_TOKENS_EXPR 保持一致的 JS 实现，供增量合并使用
+function extractCacheTokens(other) {
+  const m = /"cache_tokens":([0-9]+)/.exec(other || '');
+  return m ? parseInt(m[1]) || 0 : 0;
 }
 
 function upsertRecentLogs(existing, rows, limit = 100) {
@@ -590,6 +877,8 @@ function mergeTodaySnapshot(snapshot, rows) {
     quota: parseInt(t.quota) || 0,
     prompt_tokens: parseInt(t.prompt_tokens) || 0,
     completion_tokens: parseInt(t.completion_tokens) || 0,
+    total_tokens: parseInt(t.total_tokens) || 0,
+    cache_tokens: parseInt(t.cache_tokens) || 0,
     models: t.models || {},
   }]));
 
@@ -605,14 +894,21 @@ function mergeTodaySnapshot(snapshot, rows) {
         quota: 0,
         prompt_tokens: 0,
         completion_tokens: 0,
+        total_tokens: 0,
+        cache_tokens: 0,
         models: {},
       });
     }
     const token = tokensMap.get(key);
     token.count += 1;
-    token.quota += row.quota || 0;
-    token.prompt_tokens += row.prompt_tokens || 0;
-    token.completion_tokens += row.completion_tokens || 0;
+    // 失败日志（type=5）不产生扣费与 token 用量，只计入调用次数
+    if (row.type === 2) {
+      token.quota += row.quota || 0;
+      token.prompt_tokens += row.prompt_tokens || 0;
+      token.completion_tokens += row.completion_tokens || 0;
+      token.total_tokens += (row.prompt_tokens || 0) + (row.completion_tokens || 0);
+      token.cache_tokens += row.cache_tokens || 0;
+    }
     if (row.model_name) token.models[row.model_name] = (token.models[row.model_name] || 0) + 1;
   }
 
@@ -636,30 +932,33 @@ function mergeTodaySnapshot(snapshot, rows) {
 
 async function getTodayAggregation() {
   const ts = getRangeTs('today');
-  const totalRes = await pool.query('SELECT COUNT(*) as cnt FROM logs WHERE created_at >= $1', [ts]);
+  const totalRes = await pool.query(`SELECT COUNT(*) as cnt FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS}`, [ts]);
   const total = parseInt(totalRes.rows[0].cnt);
   const tokensRes = await pool.query(`
-    SELECT token_id, token_name, username, user_id,
-      COUNT(*) as count, SUM(quota) as quota,
-      SUM(prompt_tokens) as prompt_tokens, SUM(completion_tokens) as completion_tokens
-    FROM logs WHERE created_at >= $1 GROUP BY token_id, token_name, username, user_id ORDER BY count DESC
+    SELECT token_id, token_name, username, user_id, ${USAGE_AGG}
+    FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS}
+    GROUP BY token_id, token_name, username, user_id ORDER BY count DESC
   `, [ts]);
-  const tokens = tokensRes.rows.map(r => ({
-    ...r,
-    count: parseInt(r.count),
-    quota: parseInt(r.quota) || 0,
-    prompt_tokens: parseInt(r.prompt_tokens) || 0,
-    completion_tokens: parseInt(r.completion_tokens) || 0,
-  }));
+  const tokens = tokensRes.rows.map(parseUsageRow);
 
-  for (const t of tokens) {
-    const modelRes = await pool.query(`
-      SELECT model_name, COUNT(*) as cnt FROM logs
-      WHERE created_at >= $1 AND token_id = $2 GROUP BY model_name ORDER BY cnt DESC LIMIT 3
-    `, [ts, t.token_id]);
-    t.models = {};
-    for (const m of modelRes.rows) t.models[m.model_name] = parseInt(m.cnt);
+  // 每个 token 取 TOP3 模型：用窗口函数一次查完。
+  // 原来是每个 token 单独查一次，活跃 token 一多，快照重建时间线性膨胀（实测 16 个 token 要 5.9s，现在 0.35s）
+  const modelRes = await pool.query(`
+    WITH ranked AS (
+      SELECT token_id, model_name, COUNT(*) AS cnt,
+        ROW_NUMBER() OVER (PARTITION BY token_id ORDER BY COUNT(*) DESC) AS rn
+      FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS}
+      GROUP BY token_id, model_name
+    )
+    SELECT token_id, model_name, cnt FROM ranked WHERE rn <= 3
+  `, [ts]);
+  const modelsByToken = new Map();
+  for (const m of modelRes.rows) {
+    const key = String(parseInt(m.token_id) || 0);
+    if (!modelsByToken.has(key)) modelsByToken.set(key, {});
+    modelsByToken.get(key)[m.model_name] = parseInt(m.cnt) || 0;
   }
+  for (const t of tokens) t.models = modelsByToken.get(String(t.token_id)) || {};
   return { tokens, total };
 }
 
@@ -673,7 +972,7 @@ async function getScriptTraceStatsForFilter(filterCol, filterVal, ts) {
           ELSE '{}'::jsonb
         END AS other_json
       FROM logs
-      WHERE ${filterSql} AND created_at >= $2
+      WHERE ${filterSql} AND created_at >= $2 AND ${REQUEST_LOGS}
     ),
     expanded AS (
       SELECT
@@ -732,7 +1031,7 @@ async function getScriptDisableCandidates(ts) {
           ELSE '{}'::jsonb
         END AS other_json
       FROM logs
-      WHERE created_at >= $1
+      WHERE created_at >= $1 AND ${REQUEST_LOGS}
     ),
     labeled AS (
       SELECT
@@ -785,18 +1084,11 @@ async function getAggregation(range, dimension) {
   };
   const d = dims[dimension] || dims.token;
   const result = await pool.query(`
-    SELECT ${d.select}, COUNT(*) as count, SUM(quota) as quota,
-      SUM(prompt_tokens) as prompt_tokens, SUM(completion_tokens) as completion_tokens
-    FROM logs WHERE created_at >= $1 GROUP BY ${d.group} ORDER BY count DESC
+    SELECT ${d.select}, ${USAGE_AGG}
+    FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS} GROUP BY ${d.group} ORDER BY count DESC
   `, [ts]);
-  const rows = result.rows.map(r => ({
-    ...r,
-    count: parseInt(r.count),
-    quota: parseInt(r.quota) || 0,
-    prompt_tokens: parseInt(r.prompt_tokens) || 0,
-    completion_tokens: parseInt(r.completion_tokens) || 0,
-  }));
-  const totalRes = await pool.query('SELECT COUNT(*) as cnt FROM logs WHERE created_at >= $1', [ts]);
+  const rows = result.rows.map(parseUsageRow);
+  const totalRes = await pool.query(`SELECT COUNT(*) as cnt FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS}`, [ts]);
   const total = parseInt(totalRes.rows[0].cnt);
   return { rows, total };
 }
@@ -808,15 +1100,18 @@ async function getHourlyTrend(range) {
     : "TO_CHAR(TO_TIMESTAMP(created_at) AT TIME ZONE $2, 'MM-DD HH24') || 'h'";
   const res = await pool.query(`
     SELECT ${labelExpr} as label,
-      COUNT(*) as count, SUM(quota) as quota,
+      COUNT(*) as count,
+      SUM(quota) FILTER (WHERE type = 2) as quota,
+      SUM(COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0)) FILTER (WHERE type = 2) as total_tokens,
       COUNT(DISTINCT token_id) as active_tokens,
       COUNT(DISTINCT username) as active_users
-    FROM logs WHERE created_at >= $1 GROUP BY label ORDER BY label
+    FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS} GROUP BY label ORDER BY label
   `, [ts, CONFIG.timezone]);
   return res.rows.map(r => ({
     label: r.label,
     count: parseInt(r.count),
     quota: parseInt(r.quota) || 0,
+    total_tokens: parseInt(r.total_tokens) || 0,
     active_tokens: parseInt(r.active_tokens),
     active_users: parseInt(r.active_users),
   }));
@@ -826,21 +1121,30 @@ async function getDistribution(range) {
   const ts = getRangeTs(range);
   // 模型分布 TOP 10
   const modelRes = await pool.query(`
-    SELECT model_name, COUNT(*) as count, SUM(quota) as quota
-    FROM logs WHERE created_at >= $1 GROUP BY model_name ORDER BY count DESC LIMIT 10
+    SELECT model_name, ${USAGE_AGG}
+    FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS} GROUP BY model_name ORDER BY count DESC LIMIT 10
   `, [ts]);
-  // 用户分布 TOP 10
+  // 用户分布 TOP 10（按调用次数）
   const userRes = await pool.query(`
-    SELECT username, COUNT(*) as count, SUM(quota) as quota
-    FROM logs WHERE created_at >= $1 GROUP BY username ORDER BY count DESC LIMIT 10
+    SELECT username, ${USAGE_AGG}
+    FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS} GROUP BY username ORDER BY count DESC LIMIT 10
+  `, [ts]);
+  // 用户 token 用量 TOP 10（调用次数少但吃 token 的用户不会被漏掉）
+  const userTokenRes = await pool.query(`
+    SELECT username, ${USAGE_AGG}
+    FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS} GROUP BY username ORDER BY total_tokens DESC NULLS LAST LIMIT 10
   `, [ts]);
   // Token/Key 分布 TOP 10
   const tokenRes = await pool.query(`
-    SELECT token_id, token_name, username, COUNT(*) as count, SUM(quota) as quota
-    FROM logs WHERE created_at >= $1 GROUP BY token_id, token_name, username ORDER BY count DESC LIMIT 10
+    SELECT token_id, token_name, username, ${USAGE_AGG}
+    FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS} GROUP BY token_id, token_name, username ORDER BY count DESC LIMIT 10
   `, [ts]);
-  const parse = r => ({ ...r, count: parseInt(r.count), quota: parseInt(r.quota) || 0 });
-  return { models: modelRes.rows.map(parse), users: userRes.rows.map(parse), tokens: tokenRes.rows.map(parse) };
+  return {
+    models: modelRes.rows.map(parseUsageRow),
+    users: userRes.rows.map(parseUsageRow),
+    users_by_tokens: userTokenRes.rows.map(parseUsageRow),
+    tokens: tokenRes.rows.map(parseUsageRow),
+  };
 }
 
 async function fetchStatData() {
@@ -881,29 +1185,58 @@ async function getSnapshotTodayCached() {
   });
 }
 
+// 报错明细的行数上限：正常量级（30 天约 4.5 万行）远低于此值，只作为异常膨胀时的兜底
+const ERROR_ROWS_LIMIT = parseInt(process.env.ERROR_ROWS_LIMIT) || 200000;
+
 async function getErrorAnalysis(range) {
-  return await getOrBuildCached(`error-analysis:v3:${range}`, range, async () => {
+  return await getOrBuildCached(`error-analysis:v4:${range}`, range, async () => {
     const ts = getRangeTs(range);
 
     const [countRes, channelCountRes, errorRes] = await Promise.all([
-      pool.query('SELECT COUNT(*) as cnt FROM logs WHERE created_at >= $1', [ts]),
+      pool.query(`SELECT COUNT(*) as cnt FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS}`, [ts]),
       pool.query(`
         SELECT
           COALESCE(NULLIF(channel_id::text, ''), 'unknown') AS channel_key,
           COALESCE(NULLIF(channel_name, ''), 'unknown') AS channel_name,
           COUNT(*) AS total_requests
         FROM logs
-        WHERE created_at >= $1
+        WHERE created_at >= $1 AND ${REQUEST_LOGS}
         GROUP BY COALESCE(NULLIF(channel_id::text, ''), 'unknown'), COALESCE(NULLIF(channel_name, ''), 'unknown')
       `, [ts]),
+      // 关键：字段解析和「是否失败」的判断都下推到 SQL，绝不把 other 整列传回 Node。
+      // 原来这里会把范围内所有带 JSON 的消费日志全查回来再在 JS 里过滤：
+      // 30 天 = 26 万行、238MB 文本进内存；下推后只剩真实失败行（约 4.5 万行、2.7MB）。
       pool.query(`
+        WITH parsed AS (
+          SELECT id, created_at, type, content, username, token_name, token_id, model_name,
+            channel_id, channel_name,
+            CASE WHEN other IS NOT NULL AND other <> '' AND LEFT(other, 1) = '{'
+                 THEN other::jsonb ELSE '{}'::jsonb END AS oj
+          FROM logs
+          WHERE created_at >= $1
+            AND (type = 5 OR (type = 2 AND other IS NOT NULL AND other <> '' AND LEFT(other, 1) = '{'))
+        )
         SELECT id, created_at, type, content, username, token_name, token_id, model_name,
-          channel_id, channel_name, other
-        FROM logs
-        WHERE created_at >= $1
-          AND (type = 5 OR (type = 2 AND other IS NOT NULL AND other <> '' AND LEFT(other, 1) = '{'))
+          COALESCE(
+            NULLIF(NULLIF(channel_id::text, ''), '0'),
+            NULLIF(NULLIF(oj->>'channel_id', ''), '0'),
+            NULLIF(NULLIF(oj->'admin_info'->'channel_affinity'->>'channel_id', ''), '0'),
+            'unknown'
+          ) AS resolved_channel_key,
+          COALESCE(
+            NULLIF(channel_name, ''),
+            NULLIF(oj->>'channel_name', ''),
+            NULLIF(NULLIF(oj->'admin_info'->'channel_affinity'->>'channel_id', ''), '0')
+          ) AS resolved_channel_raw,
+          COALESCE(NULLIF(oj->>'status_code', ''), 'unknown') AS status_code,
+          COALESCE(NULLIF(oj->>'error_type', ''), 'unknown') AS error_type,
+          COALESCE(oj->'stream_status'->>'status', '') AS stream_status,
+          COALESCE(NULLIF(oj->'stream_status'->>'end_reason', ''), 'unknown') AS stream_end_reason
+        FROM parsed
+        WHERE type = 5 OR COALESCE(oj->'stream_status'->>'status', '') = 'error'
         ORDER BY created_at DESC
-      `, [ts]),
+        LIMIT $2
+      `, [ts, ERROR_ROWS_LIMIT]),
     ]);
 
     const totalRequests = parseInt(countRes.rows[0].cnt) || 0;
@@ -912,28 +1245,24 @@ async function getErrorAnalysis(range) {
       total_requests: parseInt(r.total_requests) || 0,
     }]));
 
-    const normalizedRows = errorRes.rows
-      .map(r => {
-        const otherJson = parseOtherJson(r.other);
-        const channelKey = String(r.channel_id || otherJson.channel_id || otherJson.admin_info?.channel_affinity?.channel_id || 'unknown');
-        return {
-          id: r.id,
-          created_at: parseInt(r.created_at) || 0,
-          type: parseInt(r.type) || 0,
-          content: r.content || '',
-          username: r.username || '',
-          token_name: r.token_name || '',
-          token_id: parseInt(r.token_id) || 0,
-          model_name: r.model_name || '',
-          resolved_channel_key: channelKey,
-          resolved_channel: String(r.channel_name || otherJson.channel_name || otherJson.admin_info?.channel_affinity?.channel_id || channelKey),
-          status_code: String(otherJson.status_code || 'unknown'),
-          error_type: String(otherJson.error_type || 'unknown'),
-          stream_status: String(otherJson.stream_status?.status || ''),
-          stream_end_reason: String(otherJson.stream_status?.end_reason || 'unknown'),
-        };
-      })
-      .filter(r => r.type === 5 || (r.type === 2 && r.stream_status === 'error'));
+    // SQL 已经完成解析与过滤，这里只做类型规整
+    const normalizedRows = errorRes.rows.map(r => ({
+      id: r.id,
+      created_at: parseInt(r.created_at) || 0,
+      type: parseInt(r.type) || 0,
+      content: r.content || '',
+      username: r.username || '',
+      token_name: r.token_name || '',
+      token_id: parseInt(r.token_id) || 0,
+      model_name: r.model_name || '',
+      resolved_channel_key: r.resolved_channel_key || 'unknown',
+      resolved_channel: r.resolved_channel_raw || r.resolved_channel_key || 'unknown',
+      status_code: r.status_code || 'unknown',
+      error_type: r.error_type || 'unknown',
+      stream_status: r.stream_status || '',
+      stream_end_reason: r.stream_end_reason || 'unknown',
+    }));
+    const truncated = normalizedRows.length >= ERROR_ROWS_LIMIT;
 
     const mainFailures = normalizedRows.filter(r => r.type === 5);
     const streamInterrupts = normalizedRows.filter(r => r.type === 2);
@@ -949,6 +1278,8 @@ async function getErrorAnalysis(range) {
       main_failure_rate: totalRequests ? +(mainFailures.length * 100 / totalRequests).toFixed(2) : 0,
       stream_interrupt_rate: totalRequests ? +(streamInterrupts.length * 100 / totalRequests).toFixed(2) : 0,
       total_failure_rate: totalRequests ? +(totalFailures * 100 / totalRequests).toFixed(2) : 0,
+      truncated,          // 命中行数上限时为 true，前端需提示统计只覆盖最近 N 条
+      row_limit: ERROR_ROWS_LIMIT,
     };
 
     const channelMap = new Map();
@@ -1195,6 +1526,47 @@ async function recordAction({ tokenId, tokenName, username, action, reason, dail
 let latestSnapshot = null;
 let isPolling = false;
 
+// 真正执行禁用。此前这个能力只在手动 API 里存在，轮询分支从来没调用过 setTokenStatus——
+// 也就是说「自动禁用」一直没有生效。现在按 disablePolicy 决定：
+//   notify_only（默认）→ 只告警，行为与升级前一致
+//   auto              → 调 NewAPI 禁用 Token，并落一条 auto_disable 记录
+async function maybeDisableToken({ token, enabled, action, reason, meta }) {
+  if (!enabled) return false;
+  if (!token.token_id || whitelistSet.has(token.token_id)) return false;
+  if (!token.user_id) {
+    console.warn(`  ⏭️ 缺少 user_id，无法禁用 Token #${token.token_id}`);
+    return false;
+  }
+  // 当天已经禁用过就不重复调用
+  const dup = await pool.query(
+    'SELECT 1 FROM monitor_actions WHERE token_id = $1 AND action = $2 AND created_at >= $3 LIMIT 1',
+    [token.token_id, action, getRangeTs('today')]
+  );
+  if (dup.rows.length > 0) return false;
+
+  const result = await setTokenStatus(token.token_id, token.user_id, 2);
+  await recordAction({
+    tokenId: token.token_id,
+    tokenName: token.token_name,
+    username: token.username,
+    action,
+    reason: result.success ? reason : `${reason}（禁用失败：${result.message || '未知错误'}）`,
+    dailyCount: token.count,
+    meta: { ...meta, disabled: !!result.success, error: result.success ? undefined : result.message },
+  });
+  if (result.success) {
+    console.log(`  🔒 已禁用 Token #${token.token_id}（${reason}）`);
+    await notifyAlert({
+      title: `🔒 [已自动禁用] ${token.username} / ${token.token_name || token.token_id}`,
+      level: 'danger',
+      lines: [`**原因**：${reason}`, `**Token**：${token.token_name}（ID: ${token.token_id}）`, '如需恢复，请在面板中手动启用。'],
+    });
+  } else {
+    console.error(`  ❌ 禁用 Token #${token.token_id} 失败: ${result.message}`);
+  }
+  return !!result.success;
+}
+
 async function pollAndCheck() {
   if (isPolling) return;
   isPolling = true;
@@ -1244,15 +1616,21 @@ async function pollAndCheck() {
           [t.token_id, startOfDayUnix]
         );
         if (checkRes.rows.length === 0) {
-          try {
-            const mailTo = CONFIG.notifyEmail || process.env.SMTP_USER;
-            await transporter.sendMail({
-              from: `"NewAPI Monitor" <${process.env.SMTP_USER}>`,
-              to: mailTo,
-              subject: `🚨 [超限警告] Token: ${t.token_name} (用户: ${t.username})`,
-              text: `用户 ${t.username} 的 Token "${t.token_name}" (ID: ${t.token_id})\n今日调用量已达到 ${t.count} 次，超过了设定的限制 ${CONFIG.dailyLimit} 次。\n\n请留意该 Token 的使用情况。\n\n时间: ${new Date().toLocaleString()}`,
-            });
-            console.log(`  📧 邮件通知成功 (Token #${t.token_id})`);
+          const usd = ((t.quota || 0) / CONFIG.quotaPerUnit).toFixed(2);
+          const results = await notifyAlert({
+            title: `🚨 [超限警告] Token: ${t.token_name} (用户: ${t.username})`,
+            level: 'danger',
+            lines: [
+              `**用户**：${t.username}`,
+              `**Token**：${t.token_name}（ID: ${t.token_id}）`,
+              `**今日调用**：${t.count} 次，已超过阈值 ${CONFIG.dailyLimit} 次`,
+              `**Token 用量**：${(t.total_tokens || 0).toLocaleString()}（缓存读取 ${(t.cache_tokens || 0).toLocaleString()}）`,
+              `**费用**：$${usd}`,
+            ],
+          });
+          const okChannels = results.filter(r => r.ok).map(r => r.channel);
+          if (okChannels.length) {
+            console.log(`  🔔 已通知 [${okChannels.join(', ')}] (Token #${t.token_id})`);
             await recordAction({
               tokenId: t.token_id,
               tokenName: t.token_name,
@@ -1260,11 +1638,18 @@ async function pollAndCheck() {
               action: 'notify',
               reason: `日调用 ${t.count} 次超限`,
               dailyCount: t.count,
-              meta: { policy: 'daily_limit', limit: CONFIG.dailyLimit },
+              meta: { policy: 'daily_limit', limit: CONFIG.dailyLimit, channels: okChannels },
             });
-          } catch(e) {
-            console.error(`  📧 发送邮件错误 (Token #${t.token_id}): ${e.message}`);
+          } else if (results.length === 0) {
+            console.warn(`  🔕 未配置任何通知渠道，跳过 (Token #${t.token_id})`);
           }
+          await maybeDisableToken({
+            token: t,
+            enabled: CONFIG.disablePolicy === 'auto',
+            action: 'auto_disable',
+            reason: `日调用 ${t.count} 次超过阈值 ${CONFIG.dailyLimit}`,
+            meta: { policy: 'daily_limit', limit: CONFIG.dailyLimit },
+          });
         }
 
       }
@@ -1274,11 +1659,263 @@ async function pollAndCheck() {
     for (const item of candidates) {
       if (!item.token_id || whitelistSet.has(item.token_id)) continue;
       console.log(`⚠️ token ${item.token_name}(${item.token_id}) 命中脚本 trace，比例 ${item.ratio_pct}% / 次数 ${item.flagged_calls}`);
+      if (!CONFIG.notifyScript) continue;
+      // 与超限告警一样按天去重，避免每轮轮询重复轰炸
+      const dup = await pool.query(
+        "SELECT 1 FROM monitor_actions WHERE token_id = $1 AND action = 'notify_script' AND created_at >= $2",
+        [item.token_id, startOfDayUnix]
+      );
+      if (dup.rows.length > 0) continue;
+      const results = await notifyAlert({
+        title: `🤖 [脚本行为] Token: ${item.token_name} (用户: ${item.username})`,
+        level: 'warning',
+        lines: [
+          `**用户**：${item.username}`,
+          `**Token**：${item.token_name}（ID: ${item.token_id}）`,
+          `**命中次数**：${item.flagged_calls} / ${item.total_calls}（${item.ratio_pct}%）`,
+          `**Trace 类型**：${(item.trace_types || []).join('、') || '未知'}`,
+        ],
+      });
+      const okChannels = results.filter(r => r.ok).map(r => r.channel);
+      if (okChannels.length) {
+        await recordAction({
+          tokenId: item.token_id,
+          tokenName: item.token_name,
+          username: item.username,
+          action: 'notify_script',
+          reason: `脚本 trace 命中 ${item.flagged_calls} 次（${item.ratio_pct}%）`,
+          dailyCount: item.total_calls,
+          meta: { policy: 'script_trace', trace_types: item.trace_types, channels: okChannels },
+        });
+      }
+      await maybeDisableToken({
+        token: { token_id: item.token_id, token_name: item.token_name, username: item.username, user_id: item.user_id, count: item.total_calls },
+        enabled: CONFIG.disablePolicy === 'auto' && CONFIG.disableOnScript,
+        action: 'auto_disable_script',
+        reason: `脚本 trace 命中 ${item.flagged_calls} 次（${item.ratio_pct}%）`,
+        meta: { policy: 'script_trace', trace_types: item.trace_types },
+      });
     }
   } catch (err) {
     console.error('轮询出错:', err.message);
   } finally {
     isPolling = false;
+  }
+}
+
+// ==================== 订阅余量 ====================
+// NewAPI 把订阅信息写在 logs.other 里（subscription_remain / total / plan_title）。
+// 取每个用户「最近一条消费日志」的订阅快照，也就是他当前正在消耗的那个套餐。
+async function getSubscriptions(hours = 168) {
+  const seconds = Math.max(1, hours) * 3600;
+  const { rows } = await pool.query(`
+    WITH recent AS (
+      SELECT DISTINCT ON (username) username, user_id, id, created_at, other
+      FROM logs
+      WHERE type = 2 AND created_at >= EXTRACT(EPOCH FROM NOW())::bigint - $1
+        AND other LIKE '%"subscription_remain"%'
+      ORDER BY username, id DESC
+    )
+    SELECT username, user_id, created_at,
+      other::jsonb->>'subscription_plan_title' AS plan,
+      (other::jsonb->>'subscription_remain')::bigint AS remain,
+      (other::jsonb->>'subscription_total')::bigint  AS total,
+      (other::jsonb->>'subscription_used')::bigint   AS used
+    FROM recent
+    WHERE (other::jsonb->>'subscription_total')::bigint > 0
+  `, [seconds]);
+  return rows.map(r => {
+    const remain = parseInt(r.remain) || 0;
+    const total = parseInt(r.total) || 0;
+    return {
+      username: r.username,
+      user_id: parseInt(r.user_id) || 0,
+      plan: r.plan || '未知套餐',
+      last_at: parseInt(r.created_at) || 0,
+      remain, total,
+      used: parseInt(r.used) || 0,
+      remain_usd: +(remain / CONFIG.quotaPerUnit).toFixed(2),
+      total_usd: +(total / CONFIG.quotaPerUnit).toFixed(2),
+      remain_pct: total ? +(remain * 100 / total).toFixed(1) : 0,
+    };
+  }).sort((a, b) => a.remain_pct - b.remain_pct);
+}
+
+// 余量低于阈值时提醒续费；按用户 + 档位去重，从 20% 掉到 5% 会再提醒一次
+async function checkSubscriptions() {
+  if (!CONFIG.subscriptionAlertPct) return;
+  try {
+    const subs = await getSubscriptions(168);
+    for (const s of subs) {
+      if (s.remain_pct > CONFIG.subscriptionAlertPct) continue;
+      const tier = s.remain_pct <= 0 ? 'empty' : s.remain_pct <= 5 ? '5' : s.remain_pct <= 10 ? '10' : String(CONFIG.subscriptionAlertPct);
+      await alertOnce({
+        kind: 'alert_subscription',
+        subject: `sub:${s.username}:${tier}`,
+        alert: {
+          title: `📉 [订阅余量告急] ${s.username}`,
+          level: s.remain_pct <= 5 ? 'danger' : 'warning',
+          lines: [
+            `**用户**：${s.username}`,
+            `**套餐**：${s.plan}`,
+            `**剩余**：$${s.remain_usd} / $${s.total_usd}（**${s.remain_pct}%**）`,
+            s.remain_pct <= 0 ? '套餐已耗尽，请联系客户续费。' : '建议提前触达续费。',
+          ],
+        },
+        record: {
+          tokenId: 0, username: s.username,
+          reason: `订阅剩余 ${s.remain_pct}%（$${s.remain_usd} / $${s.total_usd}）`,
+          meta: { policy: 'subscription_low', plan: s.plan, remain_usd: s.remain_usd, total_usd: s.total_usd, pct: s.remain_pct },
+        },
+      });
+    }
+  } catch (err) {
+    console.error('订阅余量检查出错:', err.message);
+  }
+}
+
+// ==================== 实时风控规则 ====================
+// 与 pollAndCheck（日累计阈值）互补：这里看的是「最近几分钟发生了什么」，
+// 所以一个脚本刚开始刷就能告警，而不用等日累计撞线。
+let isRuleRunning = false;
+
+// 同一对象同类告警在冷却期内只发一次；即使没配通知渠道也落库，面板「通知记录」即告警日志
+async function alertOnce({ kind, subject, alert, record }) {
+  const since = Math.floor(Date.now() / 1000) - CONFIG.alertCooldownMin * 60;
+  const dup = await pool.query(
+    "SELECT 1 FROM monitor_actions WHERE action = $1 AND action_meta->>'subject' = $2 AND created_at >= $3 LIMIT 1",
+    [kind, String(subject), since]
+  );
+  if (dup.rows.length > 0) return false;
+  const results = await notifyAlert(alert);
+  await recordAction({
+    ...record,
+    action: kind,
+    meta: { ...(record.meta || {}), subject: String(subject), channels: results.filter(r => r.ok).map(r => r.channel) },
+  });
+  return true;
+}
+
+async function runRealtimeRules() {
+  if (!CONFIG.ruleEnabled || isRuleRunning) return;
+  isRuleRunning = true;
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const windowSec = Math.max(1, CONFIG.surgeWindowMin) * 60;
+    const curFrom = now - windowSec;
+    const prevFrom = now - windowSec * 2;
+
+    // 一条查询同时拿到：本窗口/上一窗口调用数、本窗口费用与 token 用量、本窗口 IP 数
+    const { rows } = await pool.query(`
+      SELECT token_id, token_name, username, user_id,
+        COUNT(*) FILTER (WHERE created_at >= $1) AS cur_calls,
+        COUNT(*) FILTER (WHERE created_at <  $1) AS prev_calls,
+        COALESCE(SUM(quota) FILTER (WHERE created_at >= $1 AND type = 2), 0) AS cur_quota,
+        COALESCE(SUM(COALESCE(prompt_tokens,0) + COALESCE(completion_tokens,0)) FILTER (WHERE created_at >= $1 AND type = 2), 0) AS cur_tokens,
+        COUNT(DISTINCT ip) FILTER (WHERE created_at >= $1 AND COALESCE(ip, '') <> '') AS cur_ips
+      FROM logs WHERE created_at >= $2 AND ${REQUEST_LOGS}
+      GROUP BY token_id, token_name, username, user_id
+      HAVING COUNT(*) FILTER (WHERE created_at >= $1) > 0
+    `, [curFrom, prevFrom]);
+
+    const win = CONFIG.surgeWindowMin;
+    for (const r of rows) {
+      const tokenId = parseInt(r.token_id) || 0;
+      if (whitelistSet.has(tokenId)) continue;
+      const cur = parseInt(r.cur_calls) || 0;
+      const prev = parseInt(r.prev_calls) || 0;
+      const usd = (parseInt(r.cur_quota) || 0) / CONFIG.quotaPerUnit;
+      const tokens = parseInt(r.cur_tokens) || 0;
+      const ips = parseInt(r.cur_ips) || 0;
+      const who = `${r.username} / ${r.token_name || tokenId}`;
+      const base = { tokenId, tokenName: r.token_name, username: r.username };
+
+      // 规则 1+2：用量异常 —— 调用量突增（绝对/相对）与费用速率共用一条告警和一个冷却，
+      // 否则同一次事件会同时推突增和费用两条消息，纯噪音。
+      const ratio = prev > 0 ? cur / prev : (cur >= CONFIG.surgeMinCalls ? Infinity : 0);
+      const hitAbs = cur >= CONFIG.surgeCalls;
+      const hitRatio = cur >= CONFIG.surgeMinCalls && ratio >= CONFIG.surgeRatio;
+      const hitCost = CONFIG.surgeCostUsd > 0 && usd >= CONFIG.surgeCostUsd;
+      const triggers = [];
+      if (hitAbs) triggers.push(`窗口调用数 ${cur} ≥ ${CONFIG.surgeCalls}`);
+      if (hitRatio) triggers.push(`较上一窗口放大 ${ratio === Infinity ? '∞' : ratio.toFixed(1)}× ≥ ${CONFIG.surgeRatio}×`);
+      if (hitCost) triggers.push(`窗口费用 $${usd.toFixed(2)} ≥ $${CONFIG.surgeCostUsd}`);
+      if (triggers.length) {
+        const costOnly = hitCost && !hitAbs && !hitRatio;
+        await alertOnce({
+          kind: 'alert_usage',
+          subject: `token:${tokenId}`,
+          alert: {
+            title: `${costOnly ? '💸 [费用飙升]' : '⚡ [用量异常]'} ${who}`,
+            level: 'danger',
+            lines: [
+              `**${win} 分钟内调用**：${cur} 次${prev ? `（上一窗口 ${prev} 次，${ratio === Infinity ? '∞' : ratio.toFixed(1)}×）` : '（上一窗口无调用）'}`,
+              `**Token 用量**：${tokens.toLocaleString()}`,
+              `**费用**：$${usd.toFixed(2)}，约 **$${(usd * 60 / win).toFixed(2)}/小时**`,
+              `**来源 IP 数**：${ips}`,
+              `触发条件：${triggers.join('；')}`,
+            ],
+          },
+          record: {
+            ...base,
+            reason: costOnly
+              ? `${win} 分钟内消耗 $${usd.toFixed(2)}（约 $${(usd * 60 / win).toFixed(2)}/h）`
+              : `${win} 分钟内 ${cur} 次调用、$${usd.toFixed(2)}`,
+            dailyCount: cur,
+            meta: { policy: 'usage_anomaly', cur, prev, usd: +usd.toFixed(4), tokens, triggers },
+          },
+        });
+      }
+
+      // 规则 3：单个 Token 短时间内来自多个 IP —— 账号共享/转卖的典型特征
+      if (ips >= CONFIG.shareIpPerToken) {
+        await alertOnce({
+          kind: 'alert_token_ips',
+          subject: `token:${tokenId}`,
+          alert: {
+            title: `👥 [疑似共享] ${who}`,
+            level: 'warning',
+            lines: [
+              `**${win} 分钟内来源 IP**：${ips} 个`,
+              `**调用次数**：${cur} 次`,
+              `触发条件：单 Token 窗口内 IP 数 ≥ ${CONFIG.shareIpPerToken}`,
+            ],
+          },
+          record: { ...base, reason: `${win} 分钟内来自 ${ips} 个 IP`, dailyCount: cur, meta: { policy: 'token_multi_ip', ips } },
+        });
+      }
+    }
+
+    // 规则 4：同一 IP 下出现多个账号
+    if (CONFIG.shareUsersPerIp > 1) {
+      const ipRes = await pool.query(`
+        SELECT ip, COUNT(DISTINCT username) AS users, COUNT(DISTINCT token_id) AS tokens,
+          COUNT(*) AS calls, STRING_AGG(DISTINCT username, ', ') AS usernames
+        FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS} AND COALESCE(ip, '') <> ''
+        GROUP BY ip HAVING COUNT(DISTINCT username) >= $2
+      `, [curFrom, CONFIG.shareUsersPerIp]);
+      for (const r of ipRes.rows) {
+        await alertOnce({
+          kind: 'alert_ip_users',
+          subject: `ip:${r.ip}`,
+          alert: {
+            title: `🌐 [同 IP 多账号] ${r.ip}`,
+            level: 'warning',
+            lines: [
+              `**IP**：${r.ip}`,
+              `**${win} 分钟内账号数**：${r.users}（${r.usernames}）`,
+              `**Token 数**：${r.tokens} · **调用**：${r.calls} 次`,
+              `触发条件：单 IP 窗口内账号数 ≥ ${CONFIG.shareUsersPerIp}`,
+            ],
+          },
+          record: { tokenId: 0, username: r.usernames, reason: `IP ${r.ip} 下有 ${r.users} 个账号`, dailyCount: parseInt(r.calls) || 0, meta: { policy: 'ip_multi_user', ip: r.ip, users: parseInt(r.users) || 0 } },
+        });
+      }
+    }
+  } catch (err) {
+    console.error('实时规则出错:', err.message);
+  } finally {
+    isRuleRunning = false;
   }
 }
 
@@ -1329,6 +1966,7 @@ app.get('/api/dashboard', async (req, res) => {
         pollInterval: CONFIG.pollInterval,
         notifyEmail: CONFIG.notifyEmail,
         baseUrl: CONFIG.baseUrl,
+        quotaPerUnit: CONFIG.quotaPerUnit,
       },
       whitelist,
       snapshot,
@@ -1338,6 +1976,17 @@ app.get('/api/dashboard', async (req, res) => {
     };
   });
   res.json({ success: true, data });
+});
+
+app.get('/api/subscriptions', async (req, res) => {
+  const hours = Math.min(720, Math.max(1, parseInt(req.query.hours) || 168));
+  try {
+    const data = await getOrBuildCached(`subscriptions:${hours}`, 'today', () => getSubscriptions(hours));
+    res.json({ success: true, data, alertPct: CONFIG.subscriptionAlertPct });
+  } catch (err) {
+    console.error('订阅余量查询错误:', err.message);
+    res.json({ success: false, message: err.message });
+  }
 });
 
 app.get('/api/error-analysis', async (req, res) => {
@@ -1365,9 +2014,11 @@ app.get('/api/user-analysis', async (req, res) => {
       SELECT COUNT(*) as total_calls, COUNT(DISTINCT token_id) as token_count,
         COUNT(DISTINCT model_name) as model_count, user_id,
         MIN(created_at) as first_at, MAX(created_at) as last_at,
-        SUM(quota) as total_quota, SUM(prompt_tokens) as total_prompt,
-        SUM(completion_tokens) as total_completion
-      FROM logs WHERE ${filterCol} = $1 AND created_at >= $2 GROUP BY user_id
+        SUM(quota) FILTER (WHERE type = 2) as total_quota,
+        SUM(prompt_tokens) FILTER (WHERE type = 2) as total_prompt,
+        SUM(completion_tokens) FILTER (WHERE type = 2) as total_completion,
+        SUM(${CACHE_TOKENS_EXPR}) FILTER (WHERE type = 2) as total_cache
+      FROM logs WHERE ${filterCol} = $1 AND created_at >= $2 AND ${REQUEST_LOGS} GROUP BY user_id
     `, [filterVal, ts]);
     if (basicRes.rows.length === 0) return res.json({ success: true, data: null });
     const basic = basicRes.rows[0];
@@ -1375,6 +2026,8 @@ app.get('/api/user-analysis', async (req, res) => {
     basic.total_quota = parseInt(basic.total_quota) || 0;
     basic.total_prompt = parseInt(basic.total_prompt) || 0;
     basic.total_completion = parseInt(basic.total_completion) || 0;
+    basic.total_cache = parseInt(basic.total_cache) || 0;
+    basic.total_tokens = basic.total_prompt + basic.total_completion;
     const scriptTraceStats = await getScriptTraceStatsForFilter(filterCol, filterVal, ts);
     const autoDisableWindowStats = filterCol === 'token_id'
       ? await getScriptTraceStatsForFilter(filterCol, filterVal, Math.floor(Date.now() / 1000) - 86400)
@@ -1385,7 +2038,7 @@ app.get('/api/user-analysis', async (req, res) => {
     const hourlyRes = await pool.query(`
       SELECT EXTRACT(HOUR FROM TO_TIMESTAMP(created_at) AT TIME ZONE $3)::INT as hour,
         COUNT(*) as count
-      FROM logs WHERE ${filterCol} = $1 AND created_at >= $2 GROUP BY hour ORDER BY hour
+      FROM logs WHERE ${filterCol} = $1 AND created_at >= $2 AND ${REQUEST_LOGS} GROUP BY hour ORDER BY hour
     `, [filterVal, ts, CONFIG.timezone]);
     const hourly = hourlyRes.rows.map(r => ({ hour: r.hour, count: parseInt(r.count) }));
 
@@ -1393,7 +2046,7 @@ app.get('/api/user-analysis', async (req, res) => {
     const intRes = await pool.query(`
       WITH ordered AS (
         SELECT created_at, LAG(created_at) OVER (ORDER BY created_at) as prev_at
-        FROM logs WHERE ${filterCol} = $1 AND created_at >= $2
+        FROM logs WHERE ${filterCol} = $1 AND created_at >= $2 AND ${REQUEST_LOGS}
       )
       SELECT created_at, (created_at - prev_at) as gap FROM ordered WHERE prev_at IS NOT NULL
       ORDER BY created_at DESC LIMIT 5000
@@ -1428,16 +2081,16 @@ app.get('/api/user-analysis', async (req, res) => {
 
     // 4. 模型分布
     const modelRes = await pool.query(`
-      SELECT model_name, COUNT(*) as count, SUM(quota) as quota
-      FROM logs WHERE ${filterCol} = $1 AND created_at >= $2
+      SELECT model_name, ${USAGE_AGG}
+      FROM logs WHERE ${filterCol} = $1 AND created_at >= $2 AND ${REQUEST_LOGS}
       GROUP BY model_name ORDER BY count DESC LIMIT 20
     `, [filterVal, ts]);
-    const models = modelRes.rows.map(r => ({ ...r, count: parseInt(r.count), quota: parseInt(r.quota) || 0 }));
+    const models = modelRes.rows.map(parseUsageRow);
 
     // 5. 并发检测
     const concurRes = await pool.query(`
       SELECT COUNT(*) as cnt FROM (
-        SELECT created_at FROM logs WHERE ${filterCol} = $1 AND created_at >= $2
+        SELECT created_at FROM logs WHERE ${filterCol} = $1 AND created_at >= $2 AND ${REQUEST_LOGS}
         GROUP BY created_at HAVING COUNT(*) > 1
       ) t
     `, [filterVal, ts]);
@@ -1447,7 +2100,7 @@ app.get('/api/user-analysis', async (req, res) => {
     const streakRes = await pool.query(`
       WITH ordered AS (
         SELECT created_at, LAG(created_at) OVER (ORDER BY created_at) as prev_at
-        FROM logs WHERE ${filterCol} = $1 AND created_at >= $2
+        FROM logs WHERE ${filterCol} = $1 AND created_at >= $2 AND ${REQUEST_LOGS}
       ),
       flagged AS (
         SELECT created_at, CASE WHEN (created_at - prev_at) <= 2 THEN 0 ELSE 1 END as ng
@@ -1463,7 +2116,7 @@ app.get('/api/user-analysis', async (req, res) => {
     // 7. 深夜活跃
     const nightRes = await pool.query(`
       SELECT COUNT(*) FILTER (WHERE EXTRACT(HOUR FROM TO_TIMESTAMP(created_at) AT TIME ZONE $3) BETWEEN 0 AND 5) as n
-      FROM logs WHERE ${filterCol} = $1 AND created_at >= $2
+      FROM logs WHERE ${filterCol} = $1 AND created_at >= $2 AND ${REQUEST_LOGS}
     `, [filterVal, ts, CONFIG.timezone]);
     const nightCalls = parseInt(nightRes.rows[0].n);
 
@@ -1471,7 +2124,7 @@ app.get('/api/user-analysis', async (req, res) => {
     const sessionRes = await pool.query(`
       WITH ordered AS (
         SELECT created_at, LAG(created_at) OVER (ORDER BY created_at) as prev_at
-        FROM logs WHERE ${filterCol} = $1 AND created_at >= $2
+        FROM logs WHERE ${filterCol} = $1 AND created_at >= $2 AND ${REQUEST_LOGS}
       ),
       breaks AS (
         SELECT created_at, prev_at,
@@ -1501,7 +2154,7 @@ app.get('/api/user-analysis', async (req, res) => {
     const weekdayRes = await pool.query(`
       SELECT EXTRACT(DOW FROM TO_TIMESTAMP(created_at) AT TIME ZONE $3)::INT as dow,
         COUNT(*) as count
-      FROM logs WHERE ${filterCol} = $1 AND created_at >= $2 GROUP BY dow ORDER BY dow
+      FROM logs WHERE ${filterCol} = $1 AND created_at >= $2 AND ${REQUEST_LOGS} GROUP BY dow ORDER BY dow
     `, [filterVal, ts, CONFIG.timezone]);
     const weekday = new Array(7).fill(0);
     for (const r of weekdayRes.rows) weekday[r.dow] = parseInt(r.count);
@@ -1595,13 +2248,16 @@ app.get('/api/recent-logs', async (req, res) => {
   const data = await getOrBuildCached(`recent-logs:${range}:${page}:${pageSize}:ip:${ip || '-'}`, range, async () => {
     const ts = getRangeTs(range);
     const offset = (page - 1) * pageSize;
-    const where = ip ? 'WHERE created_at >= $1 AND ip = $2' : 'WHERE created_at >= $1';
+    const where = ip
+      ? `WHERE created_at >= $1 AND ip = $2 AND ${REQUEST_LOGS}`
+      : `WHERE created_at >= $1 AND ${REQUEST_LOGS}`;
     const values = ip ? [ts, ip] : [ts];
     const [countRes, dataRes] = await Promise.all([
       pool.query(`SELECT COUNT(*) as cnt FROM logs ${where}`, values),
       pool.query(`
-        SELECT id, created_at, username, token_name, token_id, model_name, quota,
-          prompt_tokens, completion_tokens, channel_name, "group" as grp, ip
+        SELECT id, created_at, type, username, token_name, token_id, model_name, quota,
+          prompt_tokens, completion_tokens, ${CACHE_TOKENS_EXPR} as cache_tokens,
+          channel_name, "group" as grp, ip
         FROM logs ${where}
         ORDER BY created_at DESC LIMIT $${values.length + 1} OFFSET $${values.length + 2}
       `, [...values, pageSize, offset]),
@@ -1674,34 +2330,105 @@ app.delete('/api/whitelist/:id', async (req, res) => {
 });
 
 app.get('/api/config', (req, res) => {
-  res.json({ success: true, data: { dailyLimit: CONFIG.dailyLimit, pollInterval: CONFIG.pollInterval, notifyEmail: CONFIG.notifyEmail, timezone: CONFIG.timezone, baseUrl: CONFIG.baseUrl } });
+  res.json({ success: true, data: publicConfig() });
 });
 
+// 密钥类字段永远不回传明文：webhook 只回掩码，密码/签名只回“是否已设置”
+function publicConfig() {
+  return {
+    dailyLimit: CONFIG.dailyLimit,
+    pollInterval: CONFIG.pollInterval,
+    notifyEmail: CONFIG.notifyEmail,
+    timezone: CONFIG.timezone,
+    baseUrl: CONFIG.baseUrl,
+    quotaPerUnit: CONFIG.quotaPerUnit,
+    realtimeIntervalMs: CONFIG.realtimeIntervalMs,
+    smtpHost: CONFIG.smtpHost,
+    smtpPort: CONFIG.smtpPort,
+    smtpSecure: CONFIG.smtpSecure,
+    smtpUser: CONFIG.smtpUser,
+    smtpFrom: CONFIG.smtpFrom,
+    smtpPassSet: Boolean(CONFIG.smtpPass),
+    feishuWebhookMasked: maskSecret(CONFIG.feishuWebhook, 8),
+    feishuWebhookSet: Boolean(CONFIG.feishuWebhook),
+    feishuSecretSet: Boolean(CONFIG.feishuSecret),
+    notifyScript: CONFIG.notifyScript,
+    disablePolicy: CONFIG.disablePolicy,
+    disableOnScript: CONFIG.disableOnScript,
+    ruleEnabled: CONFIG.ruleEnabled,
+    ruleIntervalMs: CONFIG.ruleIntervalMs,
+    surgeWindowMin: CONFIG.surgeWindowMin,
+    surgeCalls: CONFIG.surgeCalls,
+    surgeRatio: CONFIG.surgeRatio,
+    surgeMinCalls: CONFIG.surgeMinCalls,
+    surgeCostUsd: CONFIG.surgeCostUsd,
+    shareIpPerToken: CONFIG.shareIpPerToken,
+    shareUsersPerIp: CONFIG.shareUsersPerIp,
+    alertCooldownMin: CONFIG.alertCooldownMin,
+    subscriptionAlertPct: CONFIG.subscriptionAlertPct,
+    channels: {
+      email: Boolean(getTransporter()),
+      feishu: Boolean(CONFIG.feishuWebhook),
+    },
+  };
+}
+
 app.put('/api/config', async (req, res) => {
-  const { dailyLimit, pollInterval, notifyEmail, timezone } = req.body;
+  const body = req.body || {};
+  const timezone = body.timezone;
   const normalizedTimeZone = timezone == null ? null : String(timezone).trim();
   if (normalizedTimeZone != null && !isValidTimeZone(normalizedTimeZone)) {
     return res.status(400).json({ success: false, message: '无效时区，请使用 IANA 时区名称，例如 Asia/Shanghai' });
   }
-  if (dailyLimit != null) {
-    CONFIG.dailyLimit = parseInt(dailyLimit);
-    await setKV('dailyLimit', CONFIG.dailyLimit);
+  // 掩码原样回传视为「不修改」，其余情况必须是合法 URL
+  if (body.feishuWebhook && !String(body.feishuWebhook).startsWith('******')) {
+    try { new URL(String(body.feishuWebhook).trim()); }
+    catch { return res.status(400).json({ success: false, message: '飞书 Webhook 需要是完整的 http(s) 地址' }); }
   }
-  if (pollInterval != null) {
-    CONFIG.pollInterval = parseInt(pollInterval);
-    await setKV('pollInterval', CONFIG.pollInterval);
+
+  const apply = async (key, value, parse = v => v) => {
+    if (value == null) return;
+    CONFIG[key] = parse(value);
+    await setKV(key, CONFIG[key]);
+  };
+
+  await apply('dailyLimit', body.dailyLimit, v => parseInt(v));
+  if (body.pollInterval != null) {
+    await apply('pollInterval', body.pollInterval, v => parseInt(v));
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = setInterval(pollAndCheck, CONFIG.pollInterval);
   }
-  if (notifyEmail != null) {
-    CONFIG.notifyEmail = notifyEmail;
-    await setKV('notifyEmail', CONFIG.notifyEmail);
+  await apply('notifyEmail', body.notifyEmail, v => String(v).trim());
+  if (timezone != null) await apply('timezone', normalizedTimeZone);
+  await apply('smtpHost', body.smtpHost, v => String(v).trim());
+  await apply('smtpPort', body.smtpPort, v => parseInt(v) || 587);
+  await apply('smtpSecure', body.smtpSecure, v => Boolean(v));
+  await apply('smtpUser', body.smtpUser, v => String(v).trim());
+  await apply('smtpFrom', body.smtpFrom, v => String(v).trim());
+  await apply('notifyScript', body.notifyScript, v => Boolean(v));
+  await apply('disablePolicy', body.disablePolicy, v => (v === 'auto' ? 'auto' : 'notify_only'));
+  await apply('disableOnScript', body.disableOnScript, v => Boolean(v));
+  await apply('ruleEnabled', body.ruleEnabled, v => Boolean(v));
+  await apply('surgeWindowMin', body.surgeWindowMin, v => Math.max(1, parseInt(v) || 5));
+  await apply('surgeCalls', body.surgeCalls, v => Math.max(1, parseInt(v) || 300));
+  await apply('surgeRatio', body.surgeRatio, v => Math.max(1, parseFloat(v) || 5));
+  await apply('surgeMinCalls', body.surgeMinCalls, v => Math.max(1, parseInt(v) || 30));
+  await apply('surgeCostUsd', body.surgeCostUsd, v => Math.max(0, parseFloat(v) || 0));
+  await apply('shareIpPerToken', body.shareIpPerToken, v => Math.max(1, parseInt(v) || 4));
+  await apply('shareUsersPerIp', body.shareUsersPerIp, v => Math.max(1, parseInt(v) || 2));
+  await apply('alertCooldownMin', body.alertCooldownMin, v => Math.max(1, parseInt(v) || 30));
+  await apply('subscriptionAlertPct', body.subscriptionAlertPct, v => Math.min(100, Math.max(0, parseFloat(v) || 0)));
+  // 空字符串 = 保持原值；显式传 null 才是清空
+  if (body.smtpPass) await apply('smtpPass', body.smtpPass);
+  if (body.smtpPass === null) await apply('smtpPass', '');
+  if (body.feishuWebhook && !String(body.feishuWebhook).startsWith('******')) {
+    await apply('feishuWebhook', String(body.feishuWebhook).trim());
   }
-  if (timezone != null) {
-    CONFIG.timezone = normalizedTimeZone;
-    await setKV('timezone', CONFIG.timezone);
-  }
-  console.log(`⚙️ 配置已更新: dailyLimit=${CONFIG.dailyLimit}, pollInterval=${CONFIG.pollInterval}, notifyEmail=${CONFIG.notifyEmail}, timezone=${CONFIG.timezone}`);
+  if (body.feishuWebhook === null) await apply('feishuWebhook', '');
+  if (body.feishuSecret) await apply('feishuSecret', String(body.feishuSecret).trim());
+  if (body.feishuSecret === null) await apply('feishuSecret', '');
+
+  console.log(`⚙️ 配置已更新: dailyLimit=${CONFIG.dailyLimit}, pollInterval=${CONFIG.pollInterval}, 通知渠道=${[getTransporter() && 'email', CONFIG.feishuWebhook && 'feishu'].filter(Boolean).join('+') || '无'}`);
   await Promise.all([
     cacheDeleteByPrefix('dashboard:'),
     cacheDeleteByPrefix('stats:'),
@@ -1709,7 +2436,46 @@ app.put('/api/config', async (req, res) => {
     cacheDeleteByPrefix('distribution:'),
     cacheDeleteByPrefix('recent-logs:'),
   ]);
-  res.json({ success: true, data: { dailyLimit: CONFIG.dailyLimit, pollInterval: CONFIG.pollInterval, notifyEmail: CONFIG.notifyEmail, timezone: CONFIG.timezone } });});
+  res.json({ success: true, data: publicConfig() });
+});
+
+// 通知渠道连通性测试：channel = email | feishu | all
+app.post('/api/notify/test', async (req, res) => {
+  const channel = String((req.body && req.body.channel) || 'all');
+  const alert = {
+    title: '✅ NewAPI Monitor 测试通知',
+    level: 'info',
+    lines: [
+      '这是一条测试消息，收到即代表通知渠道配置正确。',
+      `**当前阈值**：日调用 ${CONFIG.dailyLimit} 次`,
+      `**轮询间隔**：${Math.round(CONFIG.pollInterval / 1000)} 秒`,
+    ],
+  };
+  const results = [];
+  const run = async (name, fn) => {
+    try { await fn(alert); results.push({ channel: name, ok: true }); }
+    catch (err) { results.push({ channel: name, ok: false, message: err.message }); }
+  };
+  if (channel === 'email' || channel === 'all') await run('email', sendEmail);
+  if (channel === 'feishu' || channel === 'all') await run('feishu', sendFeishu);
+  if (!results.length) return res.json({ success: false, message: '未知渠道' });
+  res.json({ success: results.some(r => r.ok), data: results });
+});
+
+// SSE 实时事件流：有新日志时推送，前端据此刷新当前面板
+app.get('/api/events', (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.write(`retry: 5000\n\n`);
+  res.write(`data: ${JSON.stringify({ type: 'hello', intervalMs: CONFIG.realtimeIntervalMs, at: Date.now() })}\n\n`);
+  sseClients.add(res);
+  const heartbeat = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 25000);
+  req.on('close', () => { clearInterval(heartbeat); sseClients.delete(res); });
+});
 
 // ==================== 启动 ====================
 async function main() {
@@ -1718,14 +2484,42 @@ async function main() {
   await loadWhitelist();
   await initRedis();
 
-  app.listen(CONFIG.port, () => {
+  if (!CONFIG.dashboardAccessKey) {
+    console.warn('⚠️  未设置 DASHBOARD_ACCESS_KEY：面板与所有 API 无需登录即可访问，公网部署务必配置');
+  }
+  httpServer = app.listen(CONFIG.port, () => {
     console.log(`🚀 NewAPI Monitor http://localhost:${CONFIG.port}`);
-    console.log(`📊 日调用限制: ${CONFIG.dailyLimit} 次 | 轮询: ${CONFIG.pollInterval / 1000}s`);
+    console.log(`📊 日调用限制: ${CONFIG.dailyLimit} 次 | 轮询: ${CONFIG.pollInterval / 1000}s | 实时推送: ${CONFIG.realtimeIntervalMs / 1000}s`);
+    console.log(`🔔 通知渠道: ${[getTransporter() && 'SMTP', CONFIG.feishuWebhook && '飞书'].filter(Boolean).join(' + ') || '未配置'}`);
     console.log(`🐘 数据库: PostgreSQL (直连 NewAPI logs 表)`);
     pollAndCheck();
     pollTimer = setInterval(pollAndCheck, CONFIG.pollInterval);
+    realtimeTimer = setInterval(watchRealtime, CONFIG.realtimeIntervalMs);
+    runRealtimeRules();
+    ruleTimer = setInterval(runRealtimeRules, CONFIG.ruleIntervalMs);
+    // 订阅余量变化慢，跟着轮询节奏走即可
+    checkSubscriptions();
+    subscriptionTimer = setInterval(checkSubscriptions, Math.max(CONFIG.pollInterval, 300000));
   });
 }
+
+// 优雅退出：停掉定时器、断开 SSE、关掉连接池，避免容器滚动更新时写到一半被杀
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`\n收到 ${signal}，正在退出...`);
+  for (const timer of [pollTimer, ruleTimer, subscriptionTimer, realtimeTimer]) if (timer) clearInterval(timer);
+  for (const client of sseClients) { try { client.end(); } catch {} }
+  sseClients.clear();
+  if (httpServer) await new Promise(resolve => httpServer.close(resolve));
+  try { if (redis && redisReady) await redis.quit(); } catch {}
+  try { await pool.end(); } catch {}
+  console.log('已安全退出');
+  process.exit(0);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
 main().catch(err => {
   console.error('启动失败:', err.message);

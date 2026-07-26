@@ -53,8 +53,40 @@ header h1 { font-size: 20px; font-weight: 600; }
 
 main { max-width: 1200px; margin: 0 auto; padding: 20px 32px; }
 
+/* 实时开关 */
+.live-btn { display: inline-flex; align-items: center; gap: 6px; }
+.live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-dim); flex: none; }
+.live-btn.active { border-color: #2ecc71; color: #2ecc71; }
+.live-btn.active .live-dot { background: #2ecc71; animation: livePulse 1.6s ease-in-out infinite; }
+@keyframes livePulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.35; transform: scale(0.8); } }
+
+/* Live tail：新到的调用记录高亮一下 */
+@keyframes rowFlash {
+  from { background: rgba(46, 204, 113, 0.22); }
+  to { background: transparent; }
+}
+tr.row-new td { animation: rowFlash 2.5s ease-out; }
+tr.row-new td:first-child { box-shadow: inset 3px 0 0 #2ecc71; }
+
+/* 实时提示条 */
+.live-toast {
+  position: fixed; right: 20px; bottom: 20px; z-index: 999;
+  background: var(--surface); border: 1px solid var(--border); border-left: 3px solid #2ecc71;
+  border-radius: 8px; padding: 10px 14px; font-size: 13px; color: var(--text);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.35); opacity: 0; transform: translateY(8px);
+  transition: opacity 0.2s, transform 0.2s; pointer-events: none;
+}
+.live-toast.show { opacity: 1; transform: translateY(0); }
+.live-toast.alert { border-left-color: var(--danger); }
+
+/* 设置分区 */
+.settings-section { margin: 24px 0 12px; font-size: 14px; font-weight: 600; color: var(--text); border-top: 1px solid var(--border); padding-top: 16px; }
+.setting-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.switch-line { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-dim); cursor: pointer; }
+.switch-line input { width: auto; }
+
 /* 统计卡片 */
-.stats-row { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 20px; }
+.stats-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 20px; }
 .stat-card {
   background: var(--surface); border: 1px solid var(--border);
   border-radius: 12px; padding: 16px; text-align: center;

@@ -21,6 +21,7 @@
         <button class="range-btn" data-range="7d">7天</button>
         <button class="range-btn" data-range="30d">30天</button>
       </div>
+      <button class="btn live-btn" id="btnLive" title="开启后有新调用即自动刷新当前面板"><span class="live-dot"></span> 实时</button>
       <button class="btn btn-primary" id="btnRefresh"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.92-5.27l3.08-3.08"/></svg> 刷新</button>
     </div>
   </header>
@@ -41,6 +42,14 @@
         <div class="stat-label">TPM</div>
       </div>
       <div class="stat-card">
+        <div class="stat-value" id="statTokenUsage">-</div>
+        <div class="stat-label">Token 用量</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" id="statQuota">-</div>
+        <div class="stat-label">费用 (USD)</div>
+      </div>
+      <div class="stat-card">
         <div class="stat-value" id="statTokens">-</div>
         <div class="stat-label">活跃 Token</div>
       </div>
@@ -56,6 +65,7 @@
       <button class="tab" data-tab="trend"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg> 趋势</button>
       <button class="tab" data-tab="errors"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg> 报错分析</button>
       <button class="tab" data-tab="logs"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg> 调用记录</button>
+      <button class="tab" data-tab="subs"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="5" width="20" height="14" rx="2"/><line x1="2" y1="10" x2="22" y2="10"/></svg> 订阅余量</button>
       <button class="tab" data-tab="actions"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg> 通知记录</button>
       <button class="tab" data-tab="whitelist"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg> 白名单</button>
       <button class="tab" data-tab="settings"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg> 设置</button>
@@ -90,7 +100,7 @@
           <canvas id="userRankChart"></canvas>
         </div>
         <div class="chart-container">
-          <h3 class="chart-title"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg> 用户额度消耗排名 TOP10</h3>
+          <h3 class="chart-title"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg> 用户 Token 用量排名 TOP10</h3>
           <canvas id="userQuotaRankChart"></canvas>
         </div>
       </div>
@@ -208,12 +218,27 @@
       <table id="logsTable">
         <thead>
           <tr>
-            <th>时间</th><th>客户端 IP</th><th>用户</th><th>Token</th><th>模型</th><th>额度</th><th>Prompt</th><th>Completion</th><th>渠道</th>
+            <th>时间</th><th>客户端 IP</th><th>用户</th><th>Token</th><th>模型</th><th>费用</th><th>输入 Token</th><th>输出 Token</th><th>总 Token</th><th>渠道</th>
           </tr>
         </thead>
         <tbody></tbody>
       </table>
       <div id="logsPagination" class="pagination"></div>
+    </section>
+
+    <!-- 订阅余量 -->
+    <section class="tab-panel" id="panel-subs">
+      <div class="toolbar">
+        <span class="setting-hint" id="subsHint">按剩余比例升序，余量低于阈值会推送续费提醒</span>
+      </div>
+      <table id="subsTable">
+        <thead>
+          <tr>
+            <th>#</th><th>用户</th><th>套餐</th><th>剩余</th><th>总额</th><th>剩余比例</th><th>最近使用</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
     </section>
 
     <!-- 通知记录 -->
@@ -257,18 +282,142 @@
         <div class="setting-item">
           <label>每日调用警告阈值</label>
           <input type="number" id="cfgDailyLimit" min="1">
-          <span class="setting-hint">超过此值将触发通知并尝试禁用 Token</span>
+          <span class="setting-hint">单个 Token 当天调用超过此值即触发告警</span>
         </div>
         <div class="setting-item">
-          <label>通知邮箱</label>
-          <input type="email" id="cfgNotifyEmail" placeholder="接收告警通知的邮箱">
-          <span class="setting-hint">留空则默认使用 SMTP 发件人邮箱</span>
+          <label>超限处置方式</label>
+          <select id="cfgDisablePolicy">
+            <option value="notify_only">仅告警（推荐）</option>
+            <option value="auto">告警并自动禁用 Token</option>
+          </select>
+          <span class="setting-hint">选择「自动禁用」会真的调用 NewAPI 关停 Token，客户正在跑的任务会中断；白名单 Token 永远豁免</span>
+        </div>
+        <div class="setting-item">
+          <label class="switch-line"><input type="checkbox" id="cfgDisableOnScript"> 脚本行为也自动禁用（需先选择「告警并自动禁用」）</label>
         </div>
         <div class="setting-item">
           <label>时区（IANA）</label>
           <input type="text" id="cfgTimezone" placeholder="Asia/Shanghai">
           <span class="setting-hint">默认 Asia/Shanghai；用于日统计边界、趋势和所有时间展示</span>
         </div>
+        <div class="setting-item">
+          <label>脚本行为告警</label>
+          <label class="switch-line"><input type="checkbox" id="cfgNotifyScript"> 检测到脚本/自动化 trace 时推送告警（每个 Token 每天一次）</label>
+        </div>
+
+        <h3 class="settings-section">⚡ 实时风控规则</h3>
+        <div class="setting-item">
+          <label class="switch-line"><input type="checkbox" id="cfgRuleEnabled"> 启用实时规则（默认每分钟检查一次滑动窗口，不依赖面板是否打开）</label>
+        </div>
+        <div class="setting-row">
+          <div class="setting-item">
+            <label>滑动窗口（分钟）</label>
+            <input type="number" id="cfgSurgeWindowMin" min="1">
+            <span class="setting-hint">所有规则都基于「最近 N 分钟」判断</span>
+          </div>
+          <div class="setting-item">
+            <label>告警冷却（分钟）</label>
+            <input type="number" id="cfgAlertCooldownMin" min="1">
+            <span class="setting-hint">同一对象同类告警的最小间隔，防止刷屏</span>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-item">
+            <label>窗口调用数阈值</label>
+            <input type="number" id="cfgSurgeCalls" min="1">
+            <span class="setting-hint">窗口内调用数超过即告警</span>
+          </div>
+          <div class="setting-item">
+            <label>突增倍数</label>
+            <input type="number" id="cfgSurgeRatio" min="1" step="0.5">
+            <span class="setting-hint">相对上一窗口放大多少倍算突增</span>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-item">
+            <label>突增最低调用数</label>
+            <input type="number" id="cfgSurgeMinCalls" min="1">
+            <span class="setting-hint">低于此值不触发倍数规则，避免 1→5 误报</span>
+          </div>
+          <div class="setting-item">
+            <label>窗口费用阈值（USD）</label>
+            <input type="number" id="cfgSurgeCostUsd" min="0" step="0.5">
+            <span class="setting-hint">窗口内消耗超过即告警，告警里会折算成 $/小时</span>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-item">
+            <label>单 Token 最多 IP 数</label>
+            <input type="number" id="cfgShareIpPerToken" min="1">
+            <span class="setting-hint">窗口内超过即疑似账号共享/转卖</span>
+          </div>
+          <div class="setting-item">
+            <label>单 IP 最多账号数</label>
+            <input type="number" id="cfgShareUsersPerIp" min="1">
+            <span class="setting-hint">同一 IP 下出现多个账号即告警</span>
+          </div>
+        </div>
+        <div class="setting-item">
+          <label>订阅余量提醒阈值（%）</label>
+          <input type="number" id="cfgSubscriptionAlertPct" min="0" max="100" step="1">
+          <span class="setting-hint">套餐剩余低于此比例时推送续费提醒，填 0 关闭</span>
+        </div>
+
+        <h3 class="settings-section">📧 SMTP 邮件通知</h3>
+        <div class="setting-row">
+          <div class="setting-item">
+            <label>SMTP 服务器</label>
+            <input type="text" id="cfgSmtpHost" placeholder="smtp.qq.com">
+          </div>
+          <div class="setting-item">
+            <label>端口</label>
+            <input type="number" id="cfgSmtpPort" placeholder="587">
+          </div>
+        </div>
+        <div class="setting-item">
+          <label class="switch-line"><input type="checkbox" id="cfgSmtpSecure"> 使用 SSL/TLS（465 端口自动启用）</label>
+        </div>
+        <div class="setting-row">
+          <div class="setting-item">
+            <label>发件账号</label>
+            <input type="text" id="cfgSmtpUser" placeholder="your_email@qq.com">
+          </div>
+          <div class="setting-item">
+            <label>授权码 / 密码</label>
+            <input type="password" id="cfgSmtpPass" placeholder="留空表示不修改">
+            <span class="setting-hint" id="smtpPassHint"></span>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-item">
+            <label>发件人显示名</label>
+            <input type="text" id="cfgSmtpFrom" placeholder='"NewAPI Monitor" &lt;bot@example.com&gt;'>
+            <span class="setting-hint">留空则使用发件账号</span>
+          </div>
+          <div class="setting-item">
+            <label>收件邮箱</label>
+            <input type="email" id="cfgNotifyEmail" placeholder="接收告警通知的邮箱">
+            <span class="setting-hint">留空则发给发件账号自己</span>
+          </div>
+        </div>
+        <button class="btn" id="btnTestEmail">发送测试邮件</button>
+        <span id="testEmailStatus" class="save-status"></span>
+
+        <h3 class="settings-section">🪶 飞书机器人</h3>
+        <div class="setting-item">
+          <label>Webhook 地址</label>
+          <input type="text" id="cfgFeishuWebhook" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx">
+          <span class="setting-hint">飞书群 → 设置 → 群机器人 → 添加自定义机器人，复制 Webhook 地址</span>
+        </div>
+        <div class="setting-item">
+          <label>签名密钥（可选）</label>
+          <input type="password" id="cfgFeishuSecret" placeholder="留空表示不修改">
+          <span class="setting-hint" id="feishuSecretHint">机器人安全设置勾选「签名校验」时才需要填写</span>
+        </div>
+        <button class="btn" id="btnTestFeishu">发送测试消息</button>
+        <span id="testFeishuStatus" class="save-status"></span>
+
+        <h3 class="settings-section">💾 保存</h3>
         <button class="btn btn-primary" id="btnSaveConfig"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg> 保存设置</button>
         <span id="cfgSaveStatus" class="save-status"></span>
       </div>

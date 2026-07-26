@@ -27,11 +27,41 @@ function formatTime(ts) {
   if (!ts) return '-';
   return new Date(ts * 1000).toLocaleString('zh-CN', { hour12: false, timeZone: config.timezone || 'Asia/Shanghai' });
 }
-function formatQuota(q) {
-  if (!q) return '0';
-  if (q >= 1e8) return (q / 1e8).toFixed(2) + ' 亿';
-  if (q >= 1e4) return (q / 1e4).toFixed(1) + ' 万';
-  return q.toLocaleString();
+// logs.quota 是 NewAPI 内部计费单位（默认 500000 = $1），面板一律换算成美元展示
+function formatUSD(q) {
+  const unit = (config && config.quotaPerUnit) || 500000;
+  const usd = (q || 0) / unit;
+  if (!usd) return '$0';
+  if (usd >= 100) return '$' + usd.toFixed(0);
+  if (usd >= 1) return '$' + usd.toFixed(2);
+  if (usd < 0.000001) return '<$0.000001';
+  const digits = usd >= 0.01 ? 3 : 6;
+  return '$' + usd.toFixed(digits).replace(/0+$/, '').replace(/\.$/, '');
+}
+// 实际使用的 token（输入 + 输出）
+function formatTokens(n) {
+  n = n || 0;
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return n.toLocaleString();
+}
+// prompt_tokens 已含缓存读取，这里把缓存部分拆出来展示，不重复累加
+function tokenUsageCell(r) {
+  const total = r.total_tokens != null ? r.total_tokens : (r.prompt_tokens || 0) + (r.completion_tokens || 0);
+  const cache = r.cache_tokens || 0;
+  const fresh = Math.max(0, (r.prompt_tokens || 0) - cache);
+  const detail = cache > 0
+    ? `入 ${formatTokens(fresh)} + 缓存 ${formatTokens(cache)} / 出 ${formatTokens(r.completion_tokens)}`
+    : `入 ${formatTokens(r.prompt_tokens)} / 出 ${formatTokens(r.completion_tokens)}`;
+  const title = `总计 ${(total || 0).toLocaleString()} tokens`
+    + `\n输入 ${(r.prompt_tokens || 0).toLocaleString()}`
+    + (cache > 0 ? `（其中缓存读取 ${cache.toLocaleString()}）` : '')
+    + `\n输出 ${(r.completion_tokens || 0).toLocaleString()}`;
+  return `<td title="${title}">
+    <strong>${formatTokens(total)}</strong>
+    <br><span class="dim">${detail}</span>
+  </td>`;
 }
 function formatNumber(n) {
   if (!n) return '0';
@@ -47,7 +77,8 @@ const COLUMNS = {
     { key: 'token_name', label: 'Token', sortable: true },
     { key: 'username', label: '用户', sortable: true },
     { key: 'count', label: '调用次数', sortable: true },
-    { key: 'quota', label: '额度消耗', sortable: true },
+    { key: 'total_tokens', label: 'Token 用量', sortable: true },
+    { key: 'quota', label: '费用', sortable: true },
     { key: 'models', label: '模型分布', sortable: false },
     { key: 'action', label: '操作', sortable: false },
   ],
@@ -56,26 +87,30 @@ const COLUMNS = {
     { key: 'username', label: '用户', sortable: true },
     { key: 'token_count', label: 'Token数', sortable: true },
     { key: 'count', label: '调用次数', sortable: true },
-    { key: 'quota', label: '额度消耗', sortable: true },
+    { key: 'total_tokens', label: 'Token 用量', sortable: true },
+    { key: 'quota', label: '费用', sortable: true },
     { key: 'action', label: '操作', sortable: false },
   ],
   model: [
     { key: '#', label: '#' },
     { key: 'model_name', label: '模型', sortable: true },
     { key: 'count', label: '调用次数', sortable: true },
-    { key: 'quota', label: '额度消耗', sortable: true },
+    { key: 'total_tokens', label: 'Token 用量', sortable: true },
+    { key: 'quota', label: '费用', sortable: true },
   ],
   group: [
     { key: '#', label: '#' },
     { key: 'grp', label: '分组', sortable: true },
     { key: 'count', label: '调用次数', sortable: true },
-    { key: 'quota', label: '额度消耗', sortable: true },
+    { key: 'total_tokens', label: 'Token 用量', sortable: true },
+    { key: 'quota', label: '费用', sortable: true },
   ],
   channel: [
     { key: '#', label: '#' },
     { key: 'channel_name', label: '渠道', sortable: true },
     { key: 'count', label: '调用次数', sortable: true },
-    { key: 'quota', label: '额度消耗', sortable: true },
+    { key: 'total_tokens', label: 'Token 用量', sortable: true },
+    { key: 'quota', label: '费用', sortable: true },
   ],
   ip: [
     { key: '#', label: '#' },
@@ -95,6 +130,16 @@ function renderStats(data) {
   document.getElementById('statRpm').textContent = data.stat ? data.stat.rpm : '-';
   document.getElementById('statTpm').textContent = data.stat ? formatNumber(data.stat.tpm) : '-';
   document.getElementById('statTokens').textContent = data.tokens ? data.tokens.length : (data.rows ? data.rows.length : '-');
+  // token 用量 / 费用：按当前区间的聚合行求和（usageRows 优先，快照只覆盖今天）
+  const usageRows = data.usageRows || data.tokens || data.rows || [];
+  const totals = usageRows.reduce((acc, r) => {
+    acc.tokens += r.total_tokens != null ? r.total_tokens : (r.prompt_tokens || 0) + (r.completion_tokens || 0);
+    acc.quota += r.quota || 0;
+    return acc;
+  }, { tokens: 0, quota: 0 });
+  document.getElementById('statTokenUsage').textContent = usageRows.length ? formatTokens(totals.tokens) : '-';
+  document.getElementById('statTokenUsage').title = totals.tokens.toLocaleString() + ' tokens';
+  document.getElementById('statQuota').textContent = usageRows.length ? formatUSD(totals.quota) : '-';
   const overLimit = data.tokens ? data.tokens.filter(t => t.count > config.dailyLimit).length : 0;
   document.getElementById('statOverLimit').textContent = overLimit;
   document.getElementById('updateTime').textContent =
@@ -220,7 +265,8 @@ function renderTokenRow(t, i, limit) {
       <td><strong>${t.token_name || '-'}</strong><br><span class="dim">ID: ${t.token_id}</span></td>
       <td>${t.username}${isWl ? ' <span class="wl-badge"><svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>' : ''}</td>
       <td><div class="count-bar"><span>${t.count}</span><div class="count-bar-bg"><div class="count-bar-fill ${overLimit?'danger':''}" style="width:${pct}%"></div></div></div></td>
-      <td>${formatQuota(t.quota)}</td>
+      ${tokenUsageCell(t)}
+      <td>${formatUSD(t.quota)}</td>
       <td><div class="model-tags">${models}</div></td>
       <td>
         <button class="btn-analyze" onclick="analyzeItem('token', ${t.token_id}, '${(t.token_name || t.token_id).toString().replace(/'/g, "\\'")}')">分析</button>
@@ -228,22 +274,33 @@ function renderTokenRow(t, i, limit) {
     </tr>`;
 }
 function renderUserRow(r, i) {
-  return `<tr><td>${i+1}</td><td><strong>${r.username || '-'}</strong></td><td>${r.token_count || '-'}</td><td>${r.count}</td><td>${formatQuota(r.quota)}</td><td><button class="btn-analyze" onclick="analyzeItem('user', '${r.username}', '${r.username}')">分析</button></td></tr>`;
+  return `<tr><td>${i+1}</td><td><strong>${r.username || '-'}</strong></td><td>${r.token_count || '-'}</td><td>${r.count}</td>${tokenUsageCell(r)}<td>${formatUSD(r.quota)}</td><td><button class="btn-analyze" onclick="analyzeItem('user', '${r.username}', '${r.username}')">分析</button></td></tr>`;
 }
 function renderModelRow(r, i) {
-  return `<tr><td>${i+1}</td><td><span class="model-tag">${r.model_name || '-'}</span></td><td>${r.count}</td><td>${formatQuota(r.quota)}</td></tr>`;
+  return `<tr><td>${i+1}</td><td><span class="model-tag">${r.model_name || '-'}</span></td><td>${r.count}</td>${tokenUsageCell(r)}<td>${formatUSD(r.quota)}</td></tr>`;
 }
 function renderGroupRow(r, i) {
-  return `<tr><td>${i+1}</td><td>${r.grp || '-'}</td><td>${r.count}</td><td>${formatQuota(r.quota)}</td></tr>`;
+  return `<tr><td>${i+1}</td><td>${r.grp || '-'}</td><td>${r.count}</td>${tokenUsageCell(r)}<td>${formatUSD(r.quota)}</td></tr>`;
 }
 function renderChannelRow(r, i) {
-  return `<tr><td>${i+1}</td><td>${r.channel_name || r.channel || '-'}</td><td>${r.count}</td><td>${formatQuota(r.quota)}</td></tr>`;
+  return `<tr><td>${i+1}</td><td>${r.channel_name || r.channel || '-'}</td><td>${r.count}</td>${tokenUsageCell(r)}<td>${formatUSD(r.quota)}</td></tr>`;
 }
 function renderIpRow(r, i) {
   const isMissing = r.ip === '(未记录)';
   const action = isMissing ? '-' : `<button class="btn-analyze" onclick="showIpLogs('${r.ip.replace(/'/g, "\\'")}')">查看调用</button>`;
   return `<tr><td>${i + 1}</td><td><strong>${r.ip}</strong></td><td>${formatNumber(r.count)}</td><td>${r.user_count}</td><td>${r.token_count}</td><td>${formatTime(r.first_at)}</td><td>${formatTime(r.last_at)} ${action}</td></tr>`;
 }
+
+// 实时规则产生的告警类型
+const ACTION_LABELS = {
+  notify_script: '🤖 脚本行为',
+  alert_usage: '⚡ 用量异常',
+  alert_token_ips: '👥 疑似共享',
+  alert_ip_users: '🌐 同 IP 多账号',
+  alert_subscription: '📉 订阅余量告急',
+  auto_disable: '🔒 自动禁用',
+  auto_disable_script: '🔒 脚本禁用',
+};
 
 function renderActions(actions) {
   const tbody = document.querySelector('#actionsTable tbody');
@@ -261,7 +318,8 @@ function renderActions(actions) {
         a.action === 'auto_disable' ? '<svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><path d="M12 7v4"/><path d="M8 16h.01"/><path d="M16 16h.01"/></svg> 自动禁用' :
         a.action === 'auto_disable_script' ? '<svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 3h6l1 5-4 2v2.5l3.5 2v3L12 21l-3.5-3.5v-3L12 12.5V10L8 8l1-5z"/></svg> 脚本禁用' :
         a.action === 'manual_disable' ? '<svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="7.86 2 16.14 2 22 7.86 22 16.14 16.14 22 7.86 22 2 16.14 2 7.86 7.86 2"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg> 手动禁用' :
-        a.action === 'manual_enable' ? '<svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg> 手动启用' : a.action
+        a.action === 'manual_enable' ? '<svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg> 手动启用' :
+        ACTION_LABELS[a.action] || a.action
       }</span></td>
       <td>${a.reason || '-'}</td>
       <td>${a.daily_count || '-'}</td>
@@ -316,7 +374,7 @@ function renderTrend(trendData, distData) {
   destroyCharts();
   const labels = trendData.map(d => d.label);
 
-  // 1. 每小时调用量
+  // 1. 每小时调用量（tooltip 附带该小时的 token 用量与费用）
   charts.push(new Chart(document.getElementById('trendChart').getContext('2d'), {
     type: 'bar',
     data: { labels, datasets: [{
@@ -324,7 +382,20 @@ function renderTrend(trendData, distData) {
       backgroundColor: 'rgba(74, 158, 255, 0.6)', borderColor: 'rgba(74, 158, 255, 1)',
       borderWidth: 1, borderRadius: 4,
     }] },
-    options: { responsive: true, plugins: { legend: { labels: { color: '#e0e0e0' } } }, scales: darkTheme },
+    options: {
+      responsive: true,
+      plugins: {
+        legend: { labels: { color: '#e0e0e0' } },
+        tooltip: { callbacks: {
+          label: ctx => `调用 ${ctx.parsed.y} 次`,
+          afterLabel: ctx => {
+            const d = trendData[ctx.dataIndex] || {};
+            return `Token 用量: ${(d.total_tokens || 0).toLocaleString()}\n费用: ${formatUSD(d.quota)}`;
+          },
+        } },
+      },
+      scales: darkTheme,
+    },
   }));
 
   // 2. 每小时活跃 Token / 用户 (双折线)
@@ -365,16 +436,23 @@ function renderTrend(trendData, distData) {
     }));
   }
 
-  // 5. 用户额度消耗排名 (水平柱状)
-  if (distData.users) {
-    const u = distData.users;
+  // 5. 用户 Token 用量排名 (水平柱状)
+  if (distData.users_by_tokens || distData.users) {
+    const u = [...(distData.users_by_tokens || distData.users)].sort((a, b) => (b.total_tokens || 0) - (a.total_tokens || 0));
+    const opts = barOpts('y');
+    opts.plugins = {
+      ...(opts.plugins || {}),
+      tooltip: { callbacks: {
+        label: ctx => `Token 用量: ${(u[ctx.dataIndex].total_tokens || 0).toLocaleString()} · 费用: ${formatUSD(u[ctx.dataIndex].quota)}`,
+      } },
+    };
     charts.push(new Chart(document.getElementById('userQuotaRankChart').getContext('2d'), {
       type: 'bar',
       data: { labels: u.map(x => x.username), datasets: [{
-        label: '额度消耗', data: u.map(x => x.quota),
+        label: 'Token 用量', data: u.map(x => x.total_tokens || 0),
         backgroundColor: COLORS.map(c => c + 'cc'), borderRadius: 4,
       }] },
-      options: barOpts('y'),
+      options: opts,
     }));
   }
 
@@ -415,8 +493,8 @@ function applyDashboardData(payload) {
   renderTableHead();
   renderTableBody();
   const statPayload = payload.snapshot
-    ? { ...payload.snapshot, totalLogs: payload.stats ? payload.stats.total : payload.snapshot.totalLogs }
-    : { total: payload.stats ? payload.stats.total : 0, rows: currentData, time: Date.now() };
+    ? { ...payload.snapshot, totalLogs: payload.stats ? payload.stats.total : payload.snapshot.totalLogs, usageRows: currentData }
+    : { total: payload.stats ? payload.stats.total : 0, rows: currentData, usageRows: currentData, time: Date.now() };
   renderStats(statPayload);
 }
 
@@ -461,6 +539,7 @@ async function loadStats() {
     const snap = await api('/api/snapshot');
     if (snap.success && snap.data) {
       snap.data.totalLogs = res.data.total;
+      snap.data.usageRows = currentData; // 用量按当前区间统计，快照只覆盖今天
       renderStats(snap.data);
     }
   }
@@ -691,6 +770,7 @@ async function loadErrorAnalysis() {
 }
 
 let logsPage = 1;
+let seenLogIds = null;
 async function loadLogs(page) {
   if (page !== undefined) logsPage = page;
   const ip = document.getElementById('logIpFilter').value.trim();
@@ -700,15 +780,25 @@ async function loadLogs(page) {
   if (!res.success) return;
   const { items, total, pageSize } = res.data;
   const tbody = document.querySelector('#logsTable tbody');
+  // Live tail：与上一次渲染对比，新出现的记录高亮一下（首次加载不闪）
+  const isFirstRender = seenLogIds === null;
+  const previous = seenLogIds || new Set();
+  const current = new Set(items.map(r => String(r.id)));
   tbody.innerHTML = items.map(r => {
-    const q = r.quota >= 10000 ? (r.quota / 10000).toFixed(1) + '万' : (r.quota || 0);
-    return `<tr>
+    const failed = r.type === 5;
+    const total = (r.prompt_tokens || 0) + (r.completion_tokens || 0);
+    const isNew = !isFirstRender && logsPage === 1 && !previous.has(String(r.id));
+    return `<tr class="${isNew ? 'row-new' : ''}">
       <td>${formatTime(r.created_at)}</td><td>${r.ip || '-'}</td><td>${r.username}</td><td><span class="dim">#${r.token_id}</span> ${r.token_name || ''}</td>
-      <td><span class="model-tag">${r.model_name}</span></td><td>${q}</td>
-      <td>${(r.prompt_tokens||0).toLocaleString()}</td><td>${(r.completion_tokens||0).toLocaleString()}</td>
+      <td><span class="model-tag">${r.model_name}</span>${failed ? ' <span class="dim">失败</span>' : ''}</td>
+      <td>${failed ? '-' : formatUSD(r.quota)}</td>
+      <td>${(r.prompt_tokens||0).toLocaleString()}${r.cache_tokens > 0 ? `<br><span class="dim">缓存 ${(r.cache_tokens).toLocaleString()}</span>` : ''}</td>
+      <td>${(r.completion_tokens||0).toLocaleString()}</td>
+      <td>${total.toLocaleString()}</td>
       <td>${r.channel_name || '-'}</td>
     </tr>`;
   }).join('');
+  seenLogIds = current;
   // 分页
   const totalPages = Math.ceil(total / pageSize);
   const pag = document.getElementById('logsPagination');
@@ -722,6 +812,43 @@ async function loadLogs(page) {
   html += `<button class="page-btn" onclick="loadLogs(${totalPages})" ${logsPage>=totalPages?'disabled':''}>&raquo;</button>`;
   html += `<span class="page-info">共 ${total} 条</span>`;
   pag.innerHTML = html;
+}
+
+// ==================== 订阅余量 ====================
+async function loadSubscriptions() {
+  const tbody = document.querySelector('#subsTable tbody');
+  tbody.innerHTML = '<tr><td colspan="7" class="loading">加载中...</td></tr>';
+  const res = await api('/api/subscriptions');
+  if (!res.success) {
+    tbody.innerHTML = `<tr><td colspan="7" class="loading">${res.message || '加载失败'}</td></tr>`;
+    return;
+  }
+  const list = res.data || [];
+  const alertPct = res.alertPct || 0;
+  document.getElementById('subsHint').textContent =
+    `共 ${list.length} 个活跃订阅（近 7 天有调用），按剩余比例升序；低于 ${alertPct}% 会推送续费提醒`;
+  if (!list.length) {
+    tbody.innerHTML = '<tr><td colspan="7" class="loading">暂无订阅数据</td></tr>';
+    return;
+  }
+  tbody.innerHTML = list.map((s, i) => {
+    const danger = s.remain_pct <= 5;
+    const warn = !danger && s.remain_pct <= alertPct;
+    const color = danger ? 'var(--danger)' : warn ? '#feca57' : '#2ecc71';
+    return `<tr class="${danger ? 'over-limit' : ''}">
+      <td>${i + 1}</td>
+      <td><strong>${s.username}</strong></td>
+      <td>${s.plan}</td>
+      <td>$${s.remain_usd}</td>
+      <td>$${s.total_usd}</td>
+      <td>
+        <div class="count-bar"><span>${s.remain_pct}%</span>
+          <div class="count-bar-bg"><div class="count-bar-fill" style="width:${Math.min(100, s.remain_pct)}%;background:${color}"></div></div>
+        </div>
+      </td>
+      <td>${formatTime(s.last_at)}</td>
+    </tr>`;
+  }).join('');
 }
 
 async function refreshAll() {
@@ -777,6 +904,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     if (tab.dataset.tab === 'trend') loadTrend();
     if (tab.dataset.tab === 'errors') loadErrorAnalysis();
     if (tab.dataset.tab === 'logs') loadLogs(1);
+    if (tab.dataset.tab === 'subs') loadSubscriptions();
   });
 });
 
@@ -855,26 +983,108 @@ document.getElementById('btnAddWhitelist').addEventListener('click', async () =>
 
 // 设置面板
 function loadSettingsUI() {
-  document.getElementById('cfgPollInterval').value = Math.round((config.pollInterval || 300000) / 1000);
-  document.getElementById('cfgDailyLimit').value = config.dailyLimit || 2000;
-  document.getElementById('cfgNotifyEmail').value = config.notifyEmail || '';
-  document.getElementById('cfgTimezone').value = config.timezone || 'Asia/Shanghai';
+  const set = (id, value) => { const el = document.getElementById(id); if (el) el.value = value; };
+  const check = (id, value) => { const el = document.getElementById(id); if (el) el.checked = !!value; };
+  set('cfgPollInterval', Math.round((config.pollInterval || 300000) / 1000));
+  set('cfgDailyLimit', config.dailyLimit || 2000);
+  set('cfgNotifyEmail', config.notifyEmail || '');
+  set('cfgTimezone', config.timezone || 'Asia/Shanghai');
+  check('cfgNotifyScript', config.notifyScript !== false);
+  set('cfgDisablePolicy', config.disablePolicy || 'notify_only');
+  check('cfgDisableOnScript', config.disableOnScript);
+  check('cfgRuleEnabled', config.ruleEnabled !== false);
+  set('cfgSurgeWindowMin', config.surgeWindowMin ?? 5);
+  set('cfgAlertCooldownMin', config.alertCooldownMin ?? 30);
+  set('cfgSurgeCalls', config.surgeCalls ?? 300);
+  set('cfgSurgeRatio', config.surgeRatio ?? 5);
+  set('cfgSurgeMinCalls', config.surgeMinCalls ?? 30);
+  set('cfgSurgeCostUsd', config.surgeCostUsd ?? 5);
+  set('cfgShareIpPerToken', config.shareIpPerToken ?? 4);
+  set('cfgShareUsersPerIp', config.shareUsersPerIp ?? 2);
+  set('cfgSubscriptionAlertPct', config.subscriptionAlertPct ?? 20);
+  set('cfgSmtpHost', config.smtpHost || '');
+  set('cfgSmtpPort', config.smtpPort || 587);
+  check('cfgSmtpSecure', config.smtpSecure);
+  set('cfgSmtpUser', config.smtpUser || '');
+  set('cfgSmtpFrom', config.smtpFrom || '');
+  set('cfgSmtpPass', '');
+  set('cfgFeishuWebhook', config.feishuWebhookMasked || '');
+  set('cfgFeishuSecret', '');
+  const passHint = document.getElementById('smtpPassHint');
+  if (passHint) passHint.textContent = config.smtpPassSet ? '已设置，留空表示不修改' : '未设置';
+  const secretHint = document.getElementById('feishuSecretHint');
+  if (secretHint) secretHint.textContent = config.feishuSecretSet
+    ? '已设置，留空表示不修改'
+    : '机器人安全设置勾选「签名校验」时才需要填写';
 }
+
+// 通知渠道测试
+async function testChannel(channel, btnId, statusId) {
+  const btn = document.getElementById(btnId);
+  const status = document.getElementById(statusId);
+  btn.disabled = true;
+  status.textContent = '发送中...';
+  status.className = 'save-status';
+  try {
+    const res = await api('/api/notify/test', 'POST', { channel });
+    const item = (res.data || []).find(r => r.channel === channel) || {};
+    if (item.ok) {
+      status.textContent = '✅ 已发送，请查收';
+      status.className = 'save-status success';
+    } else {
+      status.textContent = '❌ ' + (item.message || res.message || '发送失败');
+      status.className = 'save-status error';
+    }
+  } catch (e) {
+    status.textContent = '❌ ' + e.message;
+    status.className = 'save-status error';
+  }
+  btn.disabled = false;
+  setTimeout(() => { status.textContent = ''; status.className = 'save-status'; }, 8000);
+}
+document.getElementById('btnTestEmail').addEventListener('click', () => testChannel('email', 'btnTestEmail', 'testEmailStatus'));
+document.getElementById('btnTestFeishu').addEventListener('click', () => testChannel('feishu', 'btnTestFeishu', 'testFeishuStatus'));
 
 document.getElementById('btnSaveConfig').addEventListener('click', async () => {
   const btn = document.getElementById('btnSaveConfig');
   const status = document.getElementById('cfgSaveStatus');
   btn.disabled = true;
+  const val = id => (document.getElementById(id) ? document.getElementById(id).value.trim() : '');
   const body = {
     pollInterval: parseInt(document.getElementById('cfgPollInterval').value) * 1000,
     dailyLimit: parseInt(document.getElementById('cfgDailyLimit').value),
-    notifyEmail: document.getElementById('cfgNotifyEmail').value.trim(),
-    timezone: document.getElementById('cfgTimezone').value.trim(),
+    notifyEmail: val('cfgNotifyEmail'),
+    timezone: val('cfgTimezone'),
+    notifyScript: document.getElementById('cfgNotifyScript').checked,
+    disablePolicy: document.getElementById('cfgDisablePolicy').value,
+    disableOnScript: document.getElementById('cfgDisableOnScript').checked,
+    smtpHost: val('cfgSmtpHost'),
+    smtpPort: parseInt(val('cfgSmtpPort')) || 587,
+    smtpSecure: document.getElementById('cfgSmtpSecure').checked,
+    smtpUser: val('cfgSmtpUser'),
+    smtpFrom: val('cfgSmtpFrom'),
+    ruleEnabled: document.getElementById('cfgRuleEnabled').checked,
+    surgeWindowMin: parseInt(val('cfgSurgeWindowMin')) || 5,
+    alertCooldownMin: parseInt(val('cfgAlertCooldownMin')) || 30,
+    surgeCalls: parseInt(val('cfgSurgeCalls')) || 300,
+    surgeRatio: parseFloat(val('cfgSurgeRatio')) || 5,
+    surgeMinCalls: parseInt(val('cfgSurgeMinCalls')) || 30,
+    surgeCostUsd: parseFloat(val('cfgSurgeCostUsd')) || 0,
+    shareIpPerToken: parseInt(val('cfgShareIpPerToken')) || 4,
+    shareUsersPerIp: parseInt(val('cfgShareUsersPerIp')) || 2,
+    subscriptionAlertPct: parseFloat(val('cfgSubscriptionAlertPct')) || 0,
   };
+  // 密钥类字段：留空 = 不修改，填了才提交
+  if (val('cfgSmtpPass')) body.smtpPass = val('cfgSmtpPass');
+  if (val('cfgFeishuSecret')) body.feishuSecret = val('cfgFeishuSecret');
+  const webhook = val('cfgFeishuWebhook');
+  if (webhook && !webhook.startsWith('******')) body.feishuWebhook = webhook;
+  if (!webhook && config.feishuWebhookSet) body.feishuWebhook = null; // 清空需显式置 null
   try {
     const res = await api('/api/config', 'PUT', body);
     if (res.success) {
       config = { ...config, ...res.data };
+      loadSettingsUI();
       await Promise.all([loadStats(), loadTrend()]);
       if (document.getElementById('panel-logs').classList.contains('active')) loadLogs(1);
       status.innerHTML = '<svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg> 已保存';
@@ -955,8 +1165,9 @@ async function analyzeItem(type, value, displayName) {
     <div style="margin-top:10px;font-size:13px;color:var(--text-dim);line-height:1.8">
       Token数: ${b.token_count} · 模型数: ${b.model_count}<br>
       活跃: ${d.activeHours || '-'}h（夜${d.nightActiveHours || 0}+日${d.dayActiveHours || 0}） · 密度: ${d.density || '-'}次/h<br>
-      额度: ${formatQuota(b.total_quota)}<br>
-      Prompt: ${formatNumber(b.total_prompt)} · Completion: ${formatNumber(b.total_completion)}
+      Token 用量: <strong>${(b.total_tokens || 0).toLocaleString()}</strong>（入 ${formatTokens(b.total_prompt)} / 出 ${formatTokens(b.total_completion)}）<br>
+      ${b.total_cache ? `其中缓存读取: ${formatTokens(b.total_cache)}（${((b.total_cache / (b.total_prompt || 1)) * 100).toFixed(0)}% 输入命中缓存）<br>` : ''}
+      费用: ${formatUSD(b.total_quota)}
     </div>
   </div>`;
 
@@ -1123,13 +1334,89 @@ async function analyzeItem(type, value, displayName) {
     safeChart('chartModels', ctx => new Chart(ctx, {
       type: 'doughnut',
       data: { labels: d.models.map(m => m.model_name || '(空)'), datasets: [{ data: d.models.map(m => m.count), backgroundColor: chartColors }] },
-      options: { responsive: true, plugins: { legend: { position: 'right', labels: { color: '#e0e0e0', font: { size: 11 }, padding: 6, usePointStyle: true, boxWidth: 8 } }, tooltip: { callbacks: { label: ctx => `${ctx.label}: ${ctx.parsed.toLocaleString()}次` } } } },
+      options: { responsive: true, plugins: { legend: { position: 'right', labels: { color: '#e0e0e0', font: { size: 11 }, padding: 6, usePointStyle: true, boxWidth: 8 } }, tooltip: { callbacks: {
+        label: ctx => `${ctx.label}: ${ctx.parsed.toLocaleString()}次`,
+        afterLabel: ctx => { const m = d.models[ctx.dataIndex] || {}; return `Token: ${(m.total_tokens || 0).toLocaleString()}\n费用: ${formatUSD(m.quota)}`; },
+      } } } },
     }));
   }
 }
+
+// ==================== 实时监控（SSE） ====================
+let liveSource = null;
+let liveRefreshTimer = null;
+let lastLiveRefresh = 0;
+const LIVE_MIN_INTERVAL = 3000; // 两次刷新之间的最小间隔，避免高频调用把面板刷爆
+
+function showToast(text, kind = '') {
+  let el = document.getElementById('liveToast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'liveToast';
+    el.className = 'live-toast';
+    document.body.appendChild(el);
+  }
+  el.textContent = text;
+  el.className = `live-toast show ${kind}`;
+  clearTimeout(el._timer);
+  el._timer = setTimeout(() => { el.className = `live-toast ${kind}`; }, 4000);
+}
+
+// 只刷新当前打开的面板，省掉无谓的查询
+async function refreshActivePanel() {
+  const active = document.querySelector('.tab-panel.active');
+  const id = active ? active.id : 'panel-ranking';
+  if (id === 'panel-trend') return loadTrend();
+  if (id === 'panel-logs') return loadLogs();
+  if (id === 'panel-errors') return loadErrorAnalysis();
+  if (id === 'panel-subs') return loadSubscriptions();
+  return loadStats();
+}
+
+function scheduleLiveRefresh() {
+  const wait = Math.max(0, LIVE_MIN_INTERVAL - (Date.now() - lastLiveRefresh));
+  if (liveRefreshTimer) return;
+  liveRefreshTimer = setTimeout(async () => {
+    liveRefreshTimer = null;
+    lastLiveRefresh = Date.now();
+    try { await refreshActivePanel(); } catch {}
+  }, wait);
+}
+
+function startLive() {
+  if (liveSource) return;
+  liveSource = new EventSource('/api/events');
+  liveSource.onmessage = ev => {
+    let data;
+    try { data = JSON.parse(ev.data); } catch { return; }
+    if (data.type === 'logs') {
+      document.getElementById('updateTime').textContent =
+        `实时 · 新增 ${data.added} 条 · ${new Date(data.at).toLocaleTimeString('zh-CN', { hour12: false })}`;
+      scheduleLiveRefresh();
+    } else if (data.type === 'alert') {
+      showToast(`🔔 ${data.title}`, data.level === 'danger' ? 'alert' : '');
+    }
+  };
+  liveSource.onerror = () => { /* EventSource 自带重连，这里只保持状态 */ };
+  document.getElementById('btnLive').classList.add('active');
+  localStorage.setItem('liveMode', '1');
+}
+
+function stopLive() {
+  if (liveSource) { liveSource.close(); liveSource = null; }
+  if (liveRefreshTimer) { clearTimeout(liveRefreshTimer); liveRefreshTimer = null; }
+  document.getElementById('btnLive').classList.remove('active');
+  localStorage.setItem('liveMode', '0');
+}
+
+document.getElementById('btnLive').addEventListener('click', () => {
+  if (liveSource) { stopLive(); showToast('已关闭实时刷新'); }
+  else { startLive(); showToast('已开启实时刷新，有新调用会自动更新'); }
+});
 
 // ==================== 初始化 ====================
 (async () => {
   await loadDashboard();
   loadSettingsUI();
+  if (localStorage.getItem('liveMode') === '1') startLive();
 })();

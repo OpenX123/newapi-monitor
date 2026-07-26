@@ -1,11 +1,14 @@
 {
   "name": "newapi-monitor",
   "version": "1.0.0",
-  "description": "NewAPI 令牌监控面板 — 实时监控用户调用量、额度消耗、Token 使用情况，支持自动禁用超限 Token 和邮件告警",
+  "description": "NewAPI 令牌监控面板 — 实时监控用户调用量、Token 用量与美元费用，支持实时风控告警（突增/费用/账号共享）、飞书与邮件通知",
   "type": "commonjs",
   "scripts": {
     "dev": "node --watch server.js",
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node test/unit.test.js",
+    "test:db": "node test/db.test.js",
+    "test:all": "node test/unit.test.js && node test/db.test.js"
   },
   "engines": {
     "node": ">=18.0.0"
