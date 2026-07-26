@@ -52,7 +52,7 @@ async function run(name, sql, params = []) {
   section('趋势 / 分布 / 快照');
   await run('每小时趋势', `SELECT LPAD(EXTRACT(HOUR FROM TO_TIMESTAMP(created_at) AT TIME ZONE '${TZ}')::TEXT, 2, '0') || ':00' as label,
       COUNT(*) as count, SUM(quota) FILTER (WHERE type = 2) as quota,
-      SUM(COALESCE(prompt_tokens,0) + COALESCE(completion_tokens,0)) FILTER (WHERE type = 2) as total_tokens,
+      SUM(COALESCE(prompt_tokens,0) + COALESCE(completion_tokens,0) + (${CACHE_TOKENS_EXPR} * 0.5)) FILTER (WHERE type = 2) as total_tokens,
       COUNT(DISTINCT token_id) as active_tokens, COUNT(DISTINCT username) as active_users
     FROM logs WHERE created_at >= ${TS} AND ${REQUEST_LOGS} GROUP BY label ORDER BY label LIMIT 3`);
   await run('用户 token 用量 TOP', `SELECT username, ${USAGE_AGG}
