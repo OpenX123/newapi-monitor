@@ -1025,11 +1025,37 @@ async function testChannel(channel, btnId, statusId) {
   btn.disabled = true;
   status.textContent = '发送中...';
   status.className = 'save-status';
+  // 测的是表单里的当前值（未保存也能测），dirty 时提醒用户别忘了保存
+  const val = id => (document.getElementById(id) ? document.getElementById(id).value.trim() : '');
+  const checked = id => Boolean(document.getElementById(id) && document.getElementById(id).checked);
+  const body = { channel };
+  let dirty = false;
+  if (channel === 'email' || channel === 'all') {
+    Object.assign(body, {
+      smtpHost: val('cfgSmtpHost'),
+      smtpPort: parseInt(val('cfgSmtpPort')) || 587,
+      smtpSecure: checked('cfgSmtpSecure'),
+      smtpUser: val('cfgSmtpUser'),
+      smtpPass: val('cfgSmtpPass'),
+      smtpFrom: val('cfgSmtpFrom'),
+      notifyEmail: val('cfgNotifyEmail'),
+    });
+    dirty = dirty || Boolean(body.smtpPass)
+      || body.smtpHost !== (config.smtpHost || '') || body.smtpPort !== (config.smtpPort || 587)
+      || body.smtpSecure !== Boolean(config.smtpSecure) || body.smtpUser !== (config.smtpUser || '')
+      || body.smtpFrom !== (config.smtpFrom || '') || body.notifyEmail !== (config.notifyEmail || '');
+  }
+  if (channel === 'feishu' || channel === 'all') {
+    body.feishuWebhook = val('cfgFeishuWebhook');
+    body.feishuSecret = val('cfgFeishuSecret');
+    dirty = dirty || Boolean(body.feishuSecret)
+      || Boolean(body.feishuWebhook && !body.feishuWebhook.startsWith('******'));
+  }
   try {
-    const res = await api('/api/notify/test', 'POST', { channel });
+    const res = await api('/api/notify/test', 'POST', body);
     const item = (res.data || []).find(r => r.channel === channel) || {};
     if (item.ok) {
-      status.textContent = '✅ 已发送，请查收';
+      status.textContent = dirty ? '✅ 已发送，别忘了点「保存设置」' : '✅ 已发送，请查收';
       status.className = 'save-status success';
     } else {
       status.textContent = '❌ ' + (item.message || res.message || '发送失败');

@@ -90,6 +90,7 @@ npm run test:db # 集成测试，需 DATABASE_URL（只读查询真实库）
 - **渠道出口统一走 `notifyAlert({title, level, lines})`**，内部并行尝试 email + 飞书，单个渠道失败不影响其他渠道，返回每个渠道的结果
 - **飞书签名**：`feishuSign()` 以 `"{timestamp}\n{secret}"` 为 HMAC key 对空串签名再 base64（飞书自定义机器人规范）
 - **密钥不回传**：`publicConfig()` 里 `smtpPass`/`feishuSecret` 只返回「是否已设置」，`feishuWebhook` 只返回掩码；PUT 时留空表示不修改，显式传 `null` 才清空
+- **`/api/notify/test` 测的是表单当前值**，不是已保存配置：面板的「发送测试」按钮排在「保存设置」之前，用户粘完 Webhook 就点测试是常态。`testOverrides()` 把请求体里的表单值覆盖到 `CONFIG` 之上（密钥类字段留空或仍是掩码 = 沿用已保存值），测试用的 SMTP 连接是一次性的，不进 `getTransporter()` 缓存
 - **告警去重**：超限告警和脚本告警都按 `monitor_actions` 里当天是否已有对应 action 记录（`notify` / `notify_script`）去重
 - **SSE**：`/api/events` 维护 `sseClients`，`watchRealtime()` 每 `REALTIME_INTERVAL_MS` 检查一次 `logs` 游标——**没有订阅者时直接返回，不查库**
 

@@ -125,15 +125,24 @@ app.use(express.static(path.join(__dirname,'public')));
 // SMTP 连接按当前配置惰性构建，配置变更后自动重建，无需重启
 let transporter = null;
 let transporterKey = '';
+function createSmtpTransport({ host, port, secure, user, pass }) {
+  return nodemailer.createTransport({
+    host,
+    port,
+    secure: secure || port === 465,
+    auth: { user, pass },
+  });
+}
 function getTransporter() {
   if (!CONFIG.smtpHost || !CONFIG.smtpUser) return null;
   const key = [CONFIG.smtpHost, CONFIG.smtpPort, CONFIG.smtpSecure, CONFIG.smtpUser, CONFIG.smtpPass].join('|');
   if (transporter && transporterKey === key) return transporter;
-  transporter = nodemailer.createTransport({
+  transporter = createSmtpTransport({
     host: CONFIG.smtpHost,
     port: CONFIG.smtpPort,
-    secure: CONFIG.smtpSecure || CONFIG.smtpPort === 465,
-    auth: { user: CONFIG.smtpUser, pass: CONFIG.smtpPass },
+    secure: CONFIG.smtpSecure,
+    user: CONFIG.smtpUser,
+    pass: CONFIG.smtpPass,
   });
   transporterKey = key;
   return transporter;
@@ -172,8 +181,11 @@ function feishuSign(timestamp, secret) {
   return crypto.createHmac('sha256', `${timestamp}\n${secret}`).update('').digest('base64');
 }
 
-async function sendFeishu({ title, level = 'info', lines = [] }) {
-  if (!CONFIG.feishuWebhook) throw new Error('未配置飞书 Webhook');
+// override 用于面板「发送测试消息」：测的是表单里还没保存的值，不传则读已保存配置
+async function sendFeishu({ title, level = 'info', lines = [] }, override = {}) {
+  const webhook = override.webhook || CONFIG.feishuWebhook;
+  const secret = override.secret || CONFIG.feishuSecret;
+  if (!webhook) throw new Error('未配置飞书 Webhook');
   const template = level === 'danger' ? 'red' : level === 'warning' ? 'orange' : 'blue';
   const payload = {
     msg_type: 'interactive',
@@ -186,28 +198,38 @@ async function sendFeishu({ title, level = 'info', lines = [] }) {
       ],
     },
   };
-  if (CONFIG.feishuSecret) {
+  if (secret) {
     payload.timestamp = String(Math.floor(Date.now() / 1000));
-    payload.sign = feishuSign(payload.timestamp, CONFIG.feishuSecret);
+    payload.sign = feishuSign(payload.timestamp, secret);
   }
-  const res = await postJson(CONFIG.feishuWebhook, payload);
+  const res = await postJson(webhook, payload);
   if (res.status !== 200 || (res.json && res.json.code !== 0)) {
     throw new Error(`飞书返回 ${res.status} ${res.json ? res.json.msg || res.json.code : res.raw.slice(0, 120)}`);
   }
   return true;
 }
 
-async function sendEmail({ title, lines = [] }) {
-  const mailer = getTransporter();
+async function sendEmail({ title, lines = [] }, override = null) {
+  const smtp = override || {
+    host: CONFIG.smtpHost, port: CONFIG.smtpPort, secure: CONFIG.smtpSecure,
+    user: CONFIG.smtpUser, pass: CONFIG.smtpPass, from: CONFIG.smtpFrom, to: CONFIG.notifyEmail,
+  };
+  if (!smtp.host || !smtp.user) throw new Error('未配置 SMTP');
+  // 测试用的一次性连接不进缓存，避免未保存的表单值污染正式告警通道
+  const mailer = override ? createSmtpTransport(smtp) : getTransporter();
   if (!mailer) throw new Error('未配置 SMTP');
-  const to = CONFIG.notifyEmail || CONFIG.smtpUser;
+  const to = smtp.to || smtp.user;
   if (!to) throw new Error('未配置收件邮箱');
-  await mailer.sendMail({
-    from: CONFIG.smtpFrom || `"NewAPI Monitor" <${CONFIG.smtpUser}>`,
-    to,
-    subject: title,
-    text: lines.map(l => l.replace(/\*\*/g, '')).join('\n'),
-  });
+  try {
+    await mailer.sendMail({
+      from: smtp.from || `"NewAPI Monitor" <${smtp.user}>`,
+      to,
+      subject: title,
+      text: lines.map(l => l.replace(/\*\*/g, '')).join('\n'),
+    });
+  } finally {
+    if (override) mailer.close();
+  }
   return true;
 }
 
@@ -2439,9 +2461,37 @@ app.put('/api/config', async (req, res) => {
   res.json({ success: true, data: publicConfig() });
 });
 
+// 面板上「发送测试」按钮位于「保存设置」之前，用户往往还没保存就点测试。
+// 这里接受表单里的当前值：密钥类字段留空或仍是掩码 = 沿用已保存的值，其余字段以传入值为准。
+function testOverrides(body) {
+  const has = key => Object.prototype.hasOwnProperty.call(body, key);
+  const str = (key, fallback) => (has(key) && body[key] != null ? String(body[key]).trim() : fallback);
+  const secret = (key, fallback) => {
+    const v = has(key) && body[key] != null ? String(body[key]).trim() : '';
+    return !v || v.startsWith('******') ? fallback : v;
+  };
+  return {
+    smtp: {
+      host: str('smtpHost', CONFIG.smtpHost),
+      port: has('smtpPort') ? (parseInt(body.smtpPort) || 587) : CONFIG.smtpPort,
+      secure: has('smtpSecure') ? Boolean(body.smtpSecure) : CONFIG.smtpSecure,
+      user: str('smtpUser', CONFIG.smtpUser),
+      pass: secret('smtpPass', CONFIG.smtpPass),
+      from: str('smtpFrom', CONFIG.smtpFrom),
+      to: str('notifyEmail', CONFIG.notifyEmail),
+    },
+    feishu: {
+      webhook: secret('feishuWebhook', CONFIG.feishuWebhook),
+      secret: secret('feishuSecret', CONFIG.feishuSecret),
+    },
+  };
+}
+
 // 通知渠道连通性测试：channel = email | feishu | all
 app.post('/api/notify/test', async (req, res) => {
-  const channel = String((req.body && req.body.channel) || 'all');
+  const body = req.body || {};
+  const channel = String(body.channel || 'all');
+  const override = testOverrides(body);
   const alert = {
     title: '✅ NewAPI Monitor 测试通知',
     level: 'info',
@@ -2456,8 +2506,8 @@ app.post('/api/notify/test', async (req, res) => {
     try { await fn(alert); results.push({ channel: name, ok: true }); }
     catch (err) { results.push({ channel: name, ok: false, message: err.message }); }
   };
-  if (channel === 'email' || channel === 'all') await run('email', sendEmail);
-  if (channel === 'feishu' || channel === 'all') await run('feishu', sendFeishu);
+  if (channel === 'email' || channel === 'all') await run('email', a => sendEmail(a, override.smtp));
+  if (channel === 'feishu' || channel === 'all') await run('feishu', a => sendFeishu(a, override.feishu));
   if (!results.length) return res.json({ success: false, message: '未知渠道' });
   res.json({ success: results.some(r => r.ok), data: results });
 });

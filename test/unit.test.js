@@ -67,6 +67,38 @@ async function testFeishu() {
   server.close();
 }
 
+// ---------- 通知测试按钮的取值 ----------
+function testNotifyOverrides() {
+  section('通知测试取值');
+  const src = serverSource();
+  const CONFIG = {
+    smtpHost: 'smtp.qq.com', smtpPort: 587, smtpSecure: false, smtpUser: 'a@qq.com',
+    smtpPass: 'saved-pass', smtpFrom: '', notifyEmail: 'to@qq.com',
+    feishuWebhook: 'https://saved/hook', feishuSecret: 'saved-secret',
+  };
+  const testOverrides = eval(`(function(){ ${extract('function testOverrides(', '// 通知渠道连通性测试')}
+    return testOverrides; })()`);
+
+  const empty = testOverrides({ channel: 'feishu' });
+  equal('不传字段时沿用已保存 Webhook', empty.feishu.webhook, 'https://saved/hook');
+  equal('不传字段时沿用已保存密码', empty.smtp.pass, 'saved-pass');
+
+  const typed = testOverrides({ feishuWebhook: ' https://new/hook ', feishuSecret: '' });
+  equal('表单里刚填的 Webhook 立刻可测', typed.feishu.webhook, 'https://new/hook');
+  equal('签名留空沿用已保存', typed.feishu.secret, 'saved-secret');
+  equal('掩码回传不覆盖 Webhook', testOverrides({ feishuWebhook: '******cbd09bc1' }).feishu.webhook, 'https://saved/hook');
+
+  const mail = testOverrides({ smtpHost: 'smtp.163.com', smtpPort: '465', smtpSecure: true, smtpPass: '', notifyEmail: '' });
+  equal('SMTP 主机以表单为准', mail.smtp.host, 'smtp.163.com');
+  equal('端口转成数字', mail.smtp.port, 465);
+  equal('密码留空沿用已保存', mail.smtp.pass, 'saved-pass');
+  equal('收件邮箱可以留空', mail.smtp.to, '');
+
+  check('测试路由把表单值传给渠道',
+    /sendEmail\(a, override\.smtp\)/.test(src) && /sendFeishu\(a, override\.feishu\)/.test(src));
+  check('测试用的 SMTP 连接不写进缓存', /override \? createSmtpTransport\(smtp\) : getTransporter\(\)/.test(src));
+}
+
 // ---------- 前端格式化 ----------
 function testFormatters() {
   section('前端格式化');
@@ -154,6 +186,7 @@ function testUsageSemantics() {
 
 (async () => {
   await testFeishu();
+  testNotifyOverrides();
   testFormatters();
   testConfigSafety();
   testWiring();
