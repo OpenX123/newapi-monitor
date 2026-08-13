@@ -1161,6 +1161,9 @@ async function analyzeItem(type, value, displayName) {
   }
   const d = res.data;
   const b = d.basic;
+  const cacheHitPct = b.total_cache > 0
+    ? b.total_cache / (b.total_prompt + b.total_cache) * 100
+    : 0;
   const sc = d.score;
   const level = sc.value >= 14 ? 'high' : sc.value >= 8 ? 'mid' : 'low';
   const verdict = sc.value >= 14 ? '⛔ 极大概率是脚本' : sc.value >= 8 ? '⚠️ 较大可能是脚本' : sc.value >= 4 ? '🟡 有部分脚本特征' : '✅ 看起来像正常用户';
@@ -1185,7 +1188,7 @@ async function analyzeItem(type, value, displayName) {
     html += `<div class="analysis-card full">
       <h4>🧪 强规则脚本证据</h4>
       <div style="font-size:13px;line-height:1.9;color:var(--text)">
-        <div>命中次数: <strong>${st.flagged_calls}</strong> / ${st.total_calls} (${(st.ratio_pct || 0).toFixed ? st.ratio_pct.toFixed(1) : st.ratio_pct}%)</div>
+        <div>Trace 占比: <strong>${(st.ratio_pct || 0).toFixed ? st.ratio_pct.toFixed(1) : st.ratio_pct}%</strong>（${st.flagged_calls} / ${st.total_calls}）</div>
         <div>Trace 类型: <strong>${(st.trace_types || []).join('、') || '未知'}</strong></div>
         <div>脚本检测已关闭，仅作提醒</div>
       </div>
@@ -1203,8 +1206,9 @@ async function analyzeItem(type, value, displayName) {
     <div style="margin-top:10px;font-size:13px;color:var(--text-dim);line-height:1.8">
       Token数: ${b.token_count} · 模型数: ${b.model_count}<br>
       活跃: ${d.activeHours || '-'}h（夜${d.nightActiveHours || 0}+日${d.dayActiveHours || 0}） · 密度: ${d.density || '-'}次/h<br>
+      客户端 IP（${b.ip_count || 0}）: ${(d.ips || []).join('、') || '-'}<br>
       Token 用量: <strong>${(b.total_tokens || 0).toLocaleString()}</strong>（入 ${formatTokens(b.total_prompt)} / 出 ${formatTokens(b.total_completion)}）<br>
-      ${b.total_cache ? `其中缓存读取: ${formatTokens(b.total_cache)}（${((b.total_cache / (b.total_prompt || 1)) * 100).toFixed(0)}% 输入命中缓存）<br>` : ''}
+      ${b.total_cache ? `其中缓存读取: ${formatTokens(b.total_cache)}（缓存命中率 ${cacheHitPct.toFixed(1)}%）<br>` : ''}
       费用: ${formatUSD(b.total_quota)}
     </div>
   </div>`;

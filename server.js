@@ -2063,6 +2063,8 @@ app.get('/api/user-analysis', async (req, res) => {
     const basicRes = await pool.query(`
       SELECT COUNT(*) as total_calls, COUNT(DISTINCT token_id) as token_count,
         COUNT(DISTINCT model_name) as model_count, user_id,
+        COUNT(DISTINCT NULLIF(ip, '')) as ip_count,
+        ARRAY_REMOVE(ARRAY_AGG(DISTINCT NULLIF(ip, '')), NULL) as ips,
         MIN(created_at) as first_at, MAX(created_at) as last_at,
         SUM(quota) FILTER (WHERE type = 2) as total_quota,
         SUM(prompt_tokens) FILTER (WHERE type = 2) as total_prompt,
@@ -2077,6 +2079,9 @@ app.get('/api/user-analysis', async (req, res) => {
     basic.total_prompt = parseInt(basic.total_prompt) || 0;
     basic.total_completion = parseInt(basic.total_completion) || 0;
     basic.total_cache = parseInt(basic.total_cache) || 0;
+    basic.ip_count = parseInt(basic.ip_count) || 0;
+    const ips = Array.isArray(basic.ips) ? basic.ips : [];
+    delete basic.ips;
     basic.total_tokens = basic.total_prompt + basic.total_completion + basic.total_cache * 0.6;
     const scriptTraceStats = await getScriptTraceStatsForFilter(filterCol, filterVal, ts);
     const autoDisableWindowStats = filterCol === 'token_id'
@@ -2274,7 +2279,7 @@ app.get('/api/user-analysis', async (req, res) => {
     const density = activeHours > 0 ? Math.round(basic.total_calls / activeHours) : 0;
 
     res.json({ success: true, data: {
-      username: username || token_name || token_id, basic, hourly, intervals, intervalTimeline,
+      username: username || token_name || token_id, basic, ips, hourly, intervals, intervalTimeline,
       models, concurrentPoints, streaks, sessions, weekday,
       nightCalls, nightPct: +(nightPct * 100).toFixed(1),
       activeHours, nightActiveHours, dayActiveHours, density,

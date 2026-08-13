@@ -175,6 +175,7 @@ function testWiring() {
 function testUsageSemantics() {
   section('统计口径');
   const src = serverSource();
+  const js = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
   check('调用次数只统计真实请求（type 2/5）', /const REQUEST_LOGS = 'type IN \(2, 5\)'/.test(src));
   check('费用只对消费日志求和', /SUM\(quota\) FILTER \(WHERE type = 2\)/.test(src));
   check('token 用量只对消费日志求和且缓存按 60% 计入', /SUM\(COALESCE\(prompt_tokens, 0\) \+ COALESCE\(completion_tokens, 0\) \+ \(\$\{CACHE_TOKENS_EXPR\} \* 0\.6\)\) FILTER \(WHERE type = 2\)/.test(src));
@@ -184,6 +185,9 @@ function testUsageSemantics() {
   check('聚合缓存带版本号', /CACHE_SCHEMA_VERSION/.test(src));
   check('脚本告警同时按模型名统计 Claude/GPT', /model_name[\s\S]{0,180}claude_calls[\s\S]{0,180}gpt_calls/.test(src));
   check('非聚焦告警可分别关闭', /CONFIG\.alertUsageAnomaly && triggers\.length/.test(src) && /CONFIG\.alertDailyLimit && t\.count/.test(src));
+  check('缓存命中率以新输入加缓存为分母', /total_cache \/ \(b\.total_prompt \+ b\.total_cache\)/.test(js));
+  check('用户分析返回并展示 IP 分布', /ip_count/.test(src) && /d\.ips/.test(js));
+  check('用户分析明确标注 Trace 占比', /Trace 占比/.test(js));
 }
 
 (async () => {
