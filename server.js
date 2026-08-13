@@ -396,8 +396,8 @@ async function loadSavedConfig() {
 }
 
 // ==================== Redis 缓存 ====================
-// 聚合结果结构变化时递增，避免升级后读到旧口径的缓存（v6：客户端优先读取 User-Agent）
-const CACHE_SCHEMA_VERSION = 'v6';
+// 聚合结果结构变化时递增，避免升级后读到旧口径的缓存（v7：区分真实客户端与 Trace 兜底）
+const CACHE_SCHEMA_VERSION = 'v7';
 function cacheKey(key) {
   return `${CONFIG.redisKeyPrefix}:${CACHE_SCHEMA_VERSION}:${key}`;
 }
@@ -862,6 +862,7 @@ const CLIENT_EXPR = `CASE
         WHEN ${CLIENT_USER_AGENT_EXPR} LIKE '%codex desktop%' THEN 'Codex Desktop'
         WHEN ${CLIENT_USER_AGENT_EXPR} LIKE '%opencode%' THEN 'OpenCode'
         WHEN ${CLIENT_USER_AGENT_EXPR} LIKE '%trae%' THEN 'Trae'
+        WHEN ${CLIENT_USER_AGENT_EXPR} LIKE '%claude-vscode%' THEN 'Claude VS Code'
         WHEN ${CLIENT_USER_AGENT_EXPR} LIKE '%claude-cli%' THEN 'Claude CLI'
         WHEN ${CLIENT_USER_AGENT_EXPR} LIKE '%anthropic/python%' THEN 'Claude Python SDK'
         WHEN ${CLIENT_USER_AGENT_EXPR} LIKE '%anthropic/js%' THEN 'Claude JS SDK'
@@ -874,10 +875,10 @@ const CLIENT_EXPR = `CASE
         WHEN ${CLIENT_USER_AGENT_EXPR} LIKE '%curl/%' THEN 'curl'
         WHEN ${CLIENT_USER_AGENT_EXPR} LIKE '%chrome/%' THEN 'Chrome'
         WHEN ${CLIENT_USER_AGENT_EXPR} <> '' THEN LEFT(other_json->>'user_agent', 48)
-        WHEN ${CLIENT_SIGNAL_EXPR} LIKE '%opencode%' THEN 'OpenCode'
-        WHEN ${CLIENT_SIGNAL_EXPR} LIKE '%trae%' THEN 'Trae'
-        WHEN ${CLIENT_SIGNAL_EXPR} LIKE '%claude%' THEN 'Claude'
-        WHEN ${CLIENT_SIGNAL_EXPR} LIKE '%codex%' THEN 'Codex'
+        WHEN ${CLIENT_SIGNAL_EXPR} LIKE '%opencode%' THEN 'OpenCode (Trace)'
+        WHEN ${CLIENT_SIGNAL_EXPR} LIKE '%trae%' THEN 'Trae (Trace)'
+        WHEN ${CLIENT_SIGNAL_EXPR} LIKE '%claude%' THEN 'Claude (Trace)'
+        WHEN ${CLIENT_SIGNAL_EXPR} LIKE '%codex%' THEN 'Codex (Trace)'
         ELSE NULL
       END`;
 const USAGE_AGG = `COUNT(*) as count,

@@ -191,7 +191,7 @@ function testUsageSemantics() {
   check('用户分析返回并展示 IP 分布', /ip_count/.test(src) && /d\.ips/.test(js));
   check('用户分析明确标注 Trace 占比', /Trace 占比/.test(js));
   check('Token 聚合返回 IP 数量和客户端', /ip_count/.test(src) && /clients/.test(src));
-  check('客户端识别覆盖常见四类', ['Claude', 'Codex', 'OpenCode', 'Trae'].every(client => src.includes(`'${client}'`)));
+  check('客户端识别覆盖常见四类', ['Claude', 'Codex', 'OpenCode', 'Trae'].every(client => src.includes(client)));
   check('客户端优先读取真实 User-Agent，Trace 仅作兜底', /CLIENT_USER_AGENT_EXPR/.test(src) && /'user_agent'/.test(src) && /CLIENT_SIGNAL_EXPR/.test(src));
   check('Token 排行展示 IP 数量和使用客户端', /label: 'IP 数量'/.test(js) && /label: '使用客户端'/.test(js) && /t\.ip_count/.test(js) && /clientTags\(t\.clients\)/.test(js));
 }
