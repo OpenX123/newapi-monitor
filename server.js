@@ -396,8 +396,8 @@ async function loadSavedConfig() {
 }
 
 // ==================== Redis 缓存 ====================
-// 聚合结果结构变化时递增，避免升级后读到旧口径的缓存（v4：缓存按每请求 60% 权重计入总 token）
-const CACHE_SCHEMA_VERSION = 'v4';
+// 聚合结果结构变化时递增，避免升级后读到旧口径的缓存（v5：Token 聚合增加 IP 与客户端）
+const CACHE_SCHEMA_VERSION = 'v5';
 function cacheKey(key) {
   return `${CONFIG.redisKeyPrefix}:${CACHE_SCHEMA_VERSION}:${key}`;
 }
@@ -848,6 +848,18 @@ const REQUEST_LOGS = 'type IN (2, 5)';
 // 面板按运营口径逐条请求计入 60% 缓存读取：prompt + completion + cache * 0.6。
 // 缓存 token 用正则从 other 文本里取，避免 other 非法 JSON 或非整数值导致整条聚合报错。
 const CACHE_TOKENS_EXPR = `COALESCE(NULLIF(SUBSTRING(other FROM '"cache_tokens":([0-9]+)'), '')::bigint, 0)`;
+const CLIENT_SIGNAL_EXPR = `LOWER(
+        COALESCE(SUBSTRING(other FROM '"reason"[[:space:]]*:[[:space:]]*"([^"]*)"'), '') || ' ' ||
+        COALESCE(SUBSTRING(other FROM '"rule_name"[[:space:]]*:[[:space:]]*"([^"]*)"'), '')
+      )`;
+const CLIENT_KEY_PATH_EXPR = `COALESCE(SUBSTRING(other FROM '"key_path"[[:space:]]*:[[:space:]]*"([^"]*)"'), '')`;
+const CLIENT_EXPR = `CASE
+        WHEN ${CLIENT_SIGNAL_EXPR} LIKE '%opencode%' THEN 'OpenCode'
+        WHEN ${CLIENT_SIGNAL_EXPR} LIKE '%trae%' THEN 'Trae'
+        WHEN ${CLIENT_SIGNAL_EXPR} LIKE '%claude cli trace%' OR ${CLIENT_KEY_PATH_EXPR} = 'metadata.user_id' THEN 'Claude'
+        WHEN ${CLIENT_SIGNAL_EXPR} LIKE '%codex cli trace%' OR ${CLIENT_KEY_PATH_EXPR} = 'prompt_cache_key' THEN 'Codex'
+        ELSE NULL
+      END`;
 const USAGE_AGG = `COUNT(*) as count,
       SUM(quota) FILTER (WHERE type = 2) as quota,
       SUM(prompt_tokens) FILTER (WHERE type = 2) as prompt_tokens,
@@ -864,6 +876,8 @@ function parseUsageRow(r) {
     completion_tokens: parseInt(r.completion_tokens) || 0,
     total_tokens: parseFloat(r.total_tokens) || 0,
     cache_tokens: parseInt(r.cache_tokens) || 0,
+    ip_count: parseInt(r.ip_count) || 0,
+    clients: Array.isArray(r.clients) ? r.clients : [],
   };
 }
 
@@ -1123,7 +1137,9 @@ async function getScriptDisableCandidates(ts) {
 async function getAggregation(range, dimension) {
   const ts = getRangeTs(range);
   const dims = {
-    token: { group: 'token_id, token_name, username, user_id', select: 'token_id, token_name, username, user_id' },
+    token: { group: 'token_id, token_name, username, user_id', select: `token_id, token_name, username, user_id,
+      COUNT(DISTINCT NULLIF(ip, '')) as ip_count,
+      ARRAY_REMOVE(ARRAY_AGG(DISTINCT (${CLIENT_EXPR})), NULL) as clients` },
     user:  { group: 'username', select: 'username, COUNT(DISTINCT token_id) as token_count' },
     model: { group: 'model_name', select: 'model_name' },
     group: { group: '"group"', select: '"group" as grp' },

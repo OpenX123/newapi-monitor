@@ -63,6 +63,12 @@ function tokenUsageCell(r) {
     <br><span class="dim">${detail}</span>
   </td>`;
 }
+function clientTags(clients) {
+  const values = Array.isArray(clients) ? clients : [];
+  return values.length
+    ? values.map(client => `<span class="model-tag">${client}</span>`).join('')
+    : '<span class="dim">未知</span>';
+}
 function formatNumber(n) {
   if (!n) return '0';
   if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
@@ -76,6 +82,8 @@ const COLUMNS = {
     { key: '#', label: '#', sortable: false },
     { key: 'token_name', label: 'Token', sortable: true },
     { key: 'username', label: '用户', sortable: true },
+    { key: 'ip_count', label: 'IP 数量', sortable: true },
+    { key: 'clients', label: '使用客户端', sortable: false },
     { key: 'count', label: '调用次数', sortable: true },
     { key: 'total_tokens', label: 'Token 用量', sortable: true },
     { key: 'quota', label: '费用', sortable: true },
@@ -264,6 +272,8 @@ function renderTokenRow(t, i, limit) {
       <td>${i+1}</td>
       <td><strong>${t.token_name || '-'}</strong><br><span class="dim">ID: ${t.token_id}</span></td>
       <td>${t.username}${isWl ? ' <span class="wl-badge"><svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>' : ''}</td>
+      <td>${t.ip_count || 0}</td>
+      <td><div class="model-tags">${clientTags(t.clients)}</div></td>
       <td><div class="count-bar"><span>${t.count}</span><div class="count-bar-bg"><div class="count-bar-fill ${overLimit?'danger':''}" style="width:${pct}%"></div></div></div></td>
       ${tokenUsageCell(t)}
       <td>${formatUSD(t.quota)}</td>

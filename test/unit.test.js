@@ -105,8 +105,8 @@ function testFormatters() {
   const app = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
   const slice = app.slice(app.indexOf('function formatUSD'), app.indexOf('function formatNumber'));
   const config = { quotaPerUnit: 500000 };
-  const { formatUSD, formatTokens, tokenUsageCell } =
-    eval(`(function(){ ${slice} return { formatUSD, formatTokens, tokenUsageCell }; })()`);
+  const { formatUSD, formatTokens, tokenUsageCell, clientTags } =
+    eval(`(function(){ ${slice} return { formatUSD, formatTokens, tokenUsageCell, clientTags }; })()`);
 
   equal('0 额度显示 $0', formatUSD(0), '$0');
   equal('500000 quota = $1', formatUSD(500000), '$1.00');
@@ -122,6 +122,7 @@ function testFormatters() {
   check('缓存按 60% 重复计入总量', cell.includes('1,360'), '');
   const noCache = tokenUsageCell({ total_tokens: 1000, prompt_tokens: 900, completion_tokens: 100, cache_tokens: 0 });
   check('无缓存时不显示缓存段', !noCache.includes('缓存'), '');
+  check('客户端列表渲染为标签', clientTags(['Claude', 'OpenCode']).includes('Claude') && clientTags(['Claude', 'OpenCode']).includes('OpenCode'));
 }
 
 // ---------- 配置安全性 ----------
@@ -188,6 +189,10 @@ function testUsageSemantics() {
   check('缓存命中率以新输入加缓存为分母', /total_cache \/ \(b\.total_prompt \+ b\.total_cache\)/.test(js));
   check('用户分析返回并展示 IP 分布', /ip_count/.test(src) && /d\.ips/.test(js));
   check('用户分析明确标注 Trace 占比', /Trace 占比/.test(js));
+  check('Token 聚合返回 IP 数量和客户端', /ip_count/.test(src) && /clients/.test(src));
+  check('客户端识别覆盖常见四类', ['Claude', 'Codex', 'OpenCode', 'Trae'].every(client => src.includes(`'${client}'`)));
+  check('客户端只读取结构化 trace 字段', /CLIENT_SIGNAL_EXPR/.test(src) && /CLIENT_KEY_PATH_EXPR/.test(src) && !/LOWER\(COALESCE\(other, ''\)\) LIKE/.test(src));
+  check('Token 排行展示 IP 数量和使用客户端', /label: 'IP 数量'/.test(js) && /label: '使用客户端'/.test(js) && /t\.ip_count/.test(js) && /clientTags\(t\.clients\)/.test(js));
 }
 
 (async () => {

@@ -12,6 +12,11 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 const REQUEST_LOGS = constant('REQUEST_LOGS');
 const CACHE_TOKENS_EXPR = constant('CACHE_TOKENS_EXPR');
+const CLIENT_SIGNAL_EXPR = constant('CLIENT_SIGNAL_EXPR');
+const CLIENT_KEY_PATH_EXPR = constant('CLIENT_KEY_PATH_EXPR');
+const CLIENT_EXPR = constant('CLIENT_EXPR')
+  .replaceAll('${CLIENT_SIGNAL_EXPR}', CLIENT_SIGNAL_EXPR)
+  .replaceAll('${CLIENT_KEY_PATH_EXPR}', CLIENT_KEY_PATH_EXPR);
 const USAGE_AGG = constant('USAGE_AGG').replace(/\$\{CACHE_TOKENS_EXPR\}/g, CACHE_TOKENS_EXPR);
 const TS = 'EXTRACT(EPOCH FROM NOW())::bigint - 86400';
 const TZ = 'Asia/Shanghai';
@@ -37,7 +42,7 @@ async function run(name, sql, params = []) {
 (async () => {
   section('聚合查询（各维度）');
   const dims = {
-    token: { group: 'token_id, token_name, username, user_id', select: 'token_id, token_name, username, user_id' },
+    token: { group: 'token_id, token_name, username, user_id', select: `token_id, token_name, username, user_id, COUNT(DISTINCT NULLIF(ip, '')) as ip_count, ARRAY_REMOVE(ARRAY_AGG(DISTINCT (${CLIENT_EXPR})), NULL) as clients` },
     user: { group: 'username', select: 'username, COUNT(DISTINCT token_id) as token_count' },
     model: { group: 'model_name', select: 'model_name' },
     group: { group: '"group"', select: '"group" as grp' },
