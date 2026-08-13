@@ -396,8 +396,8 @@ async function loadSavedConfig() {
 }
 
 // ==================== Redis 缓存 ====================
-// 聚合结果结构变化时递增，避免升级后读到旧口径的缓存（v8：增加 UA 次数与匹配率）
-const CACHE_SCHEMA_VERSION = 'v8';
+// 聚合结果结构变化时递增，避免升级后读到旧口径的缓存（v9：展示完整 User-Agent）
+const CACHE_SCHEMA_VERSION = 'v9';
 function cacheKey(key) {
   return `${CONFIG.redisKeyPrefix}:${CACHE_SCHEMA_VERSION}:${key}`;
 }
@@ -903,25 +903,6 @@ function parseUsageRow(r) {
   };
 }
 
-function userAgentLabel(userAgent) {
-  const ua = String(userAgent || '');
-  if (/codex desktop/i.test(ua)) return 'Codex Desktop';
-  if (/claude-cli/i.test(ua)) return 'claude-cli';
-  if (/anthropic\/python/i.test(ua)) return 'Anthropic/Python';
-  if (/anthropic\/js/i.test(ua)) return 'Anthropic/JS';
-  if (/asyncopenai/i.test(ua)) return 'AsyncOpenAI';
-  if (/openai\/python/i.test(ua)) return 'OpenAI/Python';
-  if (/go-http-client/i.test(ua)) return 'Go-http-client';
-  if (/python-requests/i.test(ua)) return 'python-requests';
-  if (/urllib/i.test(ua)) return 'urllib';
-  if (/undici/i.test(ua)) return 'undici';
-  if (/curl\//i.test(ua)) return 'curl';
-  if (/chrome\//i.test(ua)) return /windows/i.test(ua) ? 'Chrome/Windows' : /linux/i.test(ua) ? 'Chrome/Linux' : 'Chrome';
-  if (/opencode/i.test(ua)) return 'OpenCode';
-  if (/trae/i.test(ua)) return 'Trae';
-  return ua.slice(0, 48) || '未知';
-}
-
 async function fetchLogsSinceId(lastLogId, minCreatedAt = 0) {
   const { rows } = await pool.query(`
     SELECT id, created_at, type, username, token_name, token_id, user_id, model_name,
@@ -1206,16 +1187,13 @@ async function getAggregation(range, dimension) {
     for (const r of uaRes.rows) {
       if (!r.user_agent) continue;
       const token = String(r.token_id);
-      const label = userAgentLabel(r.user_agent);
       const counts = byToken.get(token) || new Map();
-      counts.set(label, (counts.get(label) || 0) + (parseInt(r.count) || 0));
+      counts.set(r.user_agent, (counts.get(r.user_agent) || 0) + (parseInt(r.count) || 0));
       byToken.set(token, counts);
     }
     for (const row of rows) {
       const counts = byToken.get(String(row.token_id)) || new Map();
       row.user_agents = [...counts].map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count);
-      row.ua_matched = row.user_agents.reduce((sum, item) => sum + item.count, 0);
-      row.ua_match_rate = row.count ? +(row.ua_matched * 100 / row.count).toFixed(1) : 0;
     }
   }
   const totalRes = await pool.query(`SELECT COUNT(*) as cnt FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS}`, [ts]);
@@ -2232,11 +2210,9 @@ app.get('/api/user-analysis', async (req, res) => {
     const uaCounts = new Map();
     for (const r of uaRes.rows) {
       if (!r.user_agent) continue;
-      const label = userAgentLabel(r.user_agent);
-      uaCounts.set(label, (uaCounts.get(label) || 0) + (parseInt(r.count) || 0));
+      uaCounts.set(r.user_agent, (uaCounts.get(r.user_agent) || 0) + (parseInt(r.count) || 0));
     }
     const userAgents = [...uaCounts].map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count);
-    const uaMatched = userAgents.reduce((sum, item) => sum + item.count, 0);
 
     // 5. 最近请求明细（请求体从网关审计副本读取，历史日志可能没有）
     const recentRequestsRes = await pool.query(`
@@ -2392,7 +2368,7 @@ app.get('/api/user-analysis', async (req, res) => {
 
     res.json({ success: true, data: {
       username: username || token_name || token_id, basic, ips, hourly, intervals, intervalTimeline,
-      models, userAgents, uaMatched, uaMatchRate: basic.total_calls ? +(uaMatched * 100 / basic.total_calls).toFixed(1) : 0,
+      models, userAgents,
       recentRequests, concurrentPoints, streaks, sessions, weekday,
       nightCalls, nightPct: +(nightPct * 100).toFixed(1),
       activeHours, nightActiveHours, dayActiveHours, density,
