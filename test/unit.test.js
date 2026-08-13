@@ -189,6 +189,8 @@ function testUsageSemantics() {
   check('非聚焦告警可分别关闭', /CONFIG\.alertUsageAnomaly && triggers\.length/.test(src) && /CONFIG\.alertDailyLimit && t\.count/.test(src));
   check('缓存命中率以新输入加缓存为分母', /total_cache \/ \(b\.total_prompt \+ b\.total_cache\)/.test(js));
   check('用户分析返回并展示 IP 分布', /ip_count/.test(src) && /d\.ips/.test(js));
+  check('用户分析返回并展示最近请求体', /recentRequests/.test(src) && /request_body/.test(src) && /最近请求明细/.test(js));
+  check('分析弹窗醒目展示来源 IP', /analysis-ip-panel/.test(js) && /analysis-ip-list/.test(js));
   check('用户分析明确标注 Trace 占比', /Trace 占比/.test(js));
   check('Token 聚合返回 IP 数量和客户端', /ip_count/.test(src) && /clients/.test(src));
   check('客户端识别覆盖常见四类', ['Claude', 'Codex', 'OpenCode', 'Trae'].every(client => src.includes(client)));

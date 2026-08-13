@@ -292,7 +292,7 @@ tr.over-limit:hover { background: rgba(255,77,79,0.12); }
 .modal-overlay.active { display: flex; }
 .modal {
   background: var(--card-bg); border: 1px solid var(--border); border-radius: 16px;
-  width: 100%; max-width: 720px; box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+  width: 100%; max-width: 1100px; box-shadow: 0 20px 60px rgba(0,0,0,0.3);
   animation: modalIn 0.25s ease-out;
 }
 @keyframes modalIn { from { opacity: 0; transform: translateY(-20px); } to { opacity: 1; transform: translateY(0); } }
@@ -355,6 +355,17 @@ tr.over-limit:hover { background: rgba(255,77,79,0.12); }
 }
 .analysis-card .big-num { font-size: 28px; font-weight: 700; color: var(--text); }
 .analysis-card .sub-num { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+.analysis-ip-panel { margin: 0 0 16px; padding: 14px 16px; border: 1px solid rgba(74,158,255,.45); border-radius: 12px; background: rgba(74,158,255,.1); }
+.analysis-ip-panel strong { color: var(--accent); }
+.analysis-ip-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.analysis-ip-list span, .request-ip { padding: 4px 9px; border-radius: 7px; background: rgba(74,158,255,.18); color: #76b7ff; font-family: monospace; font-weight: 700; }
+.request-list { display: grid; gap: 8px; }
+.request-item { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.request-item summary { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; padding: 10px 12px; cursor: pointer; }
+.request-item summary::marker { color: var(--accent); }
+.request-item summary span:not(.request-ip) { color: var(--text-dim); font-size: 12px; }
+.request-meta { padding: 9px 12px; border-top: 1px solid var(--border); color: var(--text-dim); font: 12px/1.7 monospace; overflow-wrap: anywhere; }
+.request-body { margin: 0; padding: 14px; max-height: 420px; overflow: auto; background: #0b0d10; color: #d9e2ef; font: 12px/1.55 monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* 间隔统计行 */
 .interval-stats {

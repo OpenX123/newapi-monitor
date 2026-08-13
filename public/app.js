@@ -1206,6 +1206,11 @@ async function analyzeItem(type, value, displayName) {
     </div>`;
   }
 
+  html += `<div class="analysis-ip-panel">
+    <strong>来源 IP · ${b.ip_count || 0} 个</strong>
+    <div class="analysis-ip-list">${(d.ips || []).map(ip => `<span>${escapeHtml(ip)}</span>`).join('') || '<span>未记录</span>'}</div>
+  </div>`;
+
   html += '<div class="analysis-grid">';
 
   // 基本信息
@@ -1216,7 +1221,6 @@ async function analyzeItem(type, value, displayName) {
     <div style="margin-top:10px;font-size:13px;color:var(--text-dim);line-height:1.8">
       Token数: ${b.token_count} · 模型数: ${b.model_count}<br>
       活跃: ${d.activeHours || '-'}h（夜${d.nightActiveHours || 0}+日${d.dayActiveHours || 0}） · 密度: ${d.density || '-'}次/h<br>
-      客户端 IP（${b.ip_count || 0}）: ${(d.ips || []).join('、') || '-'}<br>
       Token 用量: <strong>${(b.total_tokens || 0).toLocaleString()}</strong>（入 ${formatTokens(b.total_prompt)} / 出 ${formatTokens(b.total_completion)}）<br>
       ${b.total_cache ? `其中缓存读取: ${formatTokens(b.total_cache)}（缓存命中率 ${cacheHitPct.toFixed(1)}%）<br>` : ''}
       费用: ${formatUSD(b.total_quota)}
@@ -1269,6 +1273,18 @@ async function analyzeItem(type, value, displayName) {
       <div>连续快速调用: <strong>${d.streaks.length}</strong> 段${d.streaks.length > 0 ? ' (最长 ' + Math.max(...d.streaks) + ' 次)' : ''}</div>
       <div>深夜(0-6点): <strong>${d.nightCalls}</strong> 次 (${d.nightPct}%)</div>
     </div>
+  </div>`;
+
+  html += `<div class="analysis-card full">
+    <h4>🧾 最近请求明细</h4>
+    <div class="request-list">${(d.recentRequests || []).map((req, index) => {
+      const body = req.request_body == null ? '该历史请求未记录请求体' : typeof req.request_body === 'string' ? req.request_body : JSON.stringify(req.request_body, null, 2);
+      return `<details class="request-item" ${index === 0 ? 'open' : ''}>
+        <summary><strong>${formatTime(req.created_at)}</strong><span class="request-ip">${escapeHtml(req.ip || 'IP 未记录')}</span><span>${escapeHtml(req.client || '客户端未知')}</span><span>${escapeHtml(req.model_name || '-')}</span></summary>
+        <div class="request-meta">请求 ID：${escapeHtml(req.request_id || '-')} · 日志 ID：${escapeHtml(req.id || '-')}<br>User-Agent：${escapeHtml(req.user_agent || '-')}</div>
+        <pre class="request-body">${escapeHtml(body)}</pre>
+      </details>`;
+    }).join('') || '<div class="dim">暂无请求</div>'}</div>
   </div>`;
 
   // === Chart.js 图表区 ===

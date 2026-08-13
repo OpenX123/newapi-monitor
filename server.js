@@ -849,7 +849,7 @@ const REQUEST_LOGS = 'type IN (2, 5)';
 // 缓存 token 用正则从 other 文本里取，避免 other 非法 JSON 或非整数值导致整条聚合报错。
 const CACHE_TOKENS_EXPR = `COALESCE(NULLIF(SUBSTRING(other FROM '"cache_tokens":([0-9]+)'), '')::bigint, 0)`;
 const SAFE_OTHER_JSON_EXPR = `(CASE
-        WHEN other NOT LIKE '%"user_agent"%' AND other NOT LIKE '%"channel_affinity"%' THEN '{}'::jsonb
+        WHEN other NOT LIKE '%"user_agent"%' AND other NOT LIKE '%"request_body"%' AND other NOT LIKE '%"channel_affinity"%' THEN '{}'::jsonb
         WHEN other IS JSON THEN other::jsonb
         ELSE '{}'::jsonb
       END)`;
@@ -2186,7 +2186,23 @@ app.get('/api/user-analysis', async (req, res) => {
     `, [filterVal, ts]);
     const models = modelRes.rows.map(parseUsageRow);
 
-    // 5. 并发检测
+    // 5. 最近请求明细（请求体从网关审计副本读取，历史日志可能没有）
+    const recentRequestsRes = await pool.query(`
+      SELECT id, created_at, model_name, ip, request_id, other_json->>'user_agent' AS user_agent,
+        (${CLIENT_EXPR}) AS client, other_json->'request_body' AS request_body
+      FROM (
+        SELECT id, created_at, model_name, ip, request_id, ${SAFE_OTHER_JSON_EXPR} AS other_json
+        FROM logs WHERE ${filterCol} = $1 AND created_at >= $2 AND type = 2
+        ORDER BY created_at DESC LIMIT 20
+      ) recent ORDER BY created_at DESC
+    `, [filterVal, ts]);
+    const recentRequests = recentRequestsRes.rows.map(r => ({
+      ...r,
+      id: String(r.id),
+      created_at: parseInt(r.created_at) || 0,
+    }));
+
+    // 6. 并发检测
     const concurRes = await pool.query(`
       SELECT COUNT(*) as cnt FROM (
         SELECT created_at FROM logs WHERE ${filterCol} = $1 AND created_at >= $2 AND ${REQUEST_LOGS}
@@ -2195,7 +2211,7 @@ app.get('/api/user-analysis', async (req, res) => {
     `, [filterVal, ts]);
     const concurrentPoints = parseInt(concurRes.rows[0].cnt);
 
-    // 6. 连续快速调用
+    // 7. 连续快速调用
     const streakRes = await pool.query(`
       WITH ordered AS (
         SELECT created_at, LAG(created_at) OVER (ORDER BY created_at) as prev_at
@@ -2212,14 +2228,14 @@ app.get('/api/user-analysis', async (req, res) => {
     `, [filterVal, ts]);
     const streaks = streakRes.rows.map(r => parseInt(r.len));
 
-    // 7. 深夜活跃
+    // 8. 深夜活跃
     const nightRes = await pool.query(`
       SELECT COUNT(*) FILTER (WHERE EXTRACT(HOUR FROM TO_TIMESTAMP(created_at) AT TIME ZONE $3) BETWEEN 0 AND 5) as n
       FROM logs WHERE ${filterCol} = $1 AND created_at >= $2 AND ${REQUEST_LOGS}
     `, [filterVal, ts, CONFIG.timezone]);
     const nightCalls = parseInt(nightRes.rows[0].n);
 
-    // 8. 会话检测（间隔 > 300s 即视为新会话）
+    // 9. 会话检测（间隔 > 300s 即视为新会话）
     const sessionRes = await pool.query(`
       WITH ordered AS (
         SELECT created_at, LAG(created_at) OVER (ORDER BY created_at) as prev_at
@@ -2249,7 +2265,7 @@ app.get('/api/user-analysis', async (req, res) => {
       maxCalls: sessionList.length > 0 ? Math.max(...sessionList.map(s => s.calls)) : 0,
     };
 
-    // 9. 星期分布
+    // 10. 星期分布
     const weekdayRes = await pool.query(`
       SELECT EXTRACT(DOW FROM TO_TIMESTAMP(created_at) AT TIME ZONE $3)::INT as dow,
         COUNT(*) as count
@@ -2258,7 +2274,7 @@ app.get('/api/user-analysis', async (req, res) => {
     const weekday = new Array(7).fill(0);
     for (const r of weekdayRes.rows) weekday[r.dow] = parseInt(r.count);
 
-    // 10. 脚本评分（v4：分离夜间/白天独立分析）
+    // 11. 脚本评分（v4：分离夜间/白天独立分析）
     let score = 0; const reasons = [];
 
     // 先把 hourly 按时段分类
@@ -2324,7 +2340,7 @@ app.get('/api/user-analysis', async (req, res) => {
 
     res.json({ success: true, data: {
       username: username || token_name || token_id, basic, ips, hourly, intervals, intervalTimeline,
-      models, concurrentPoints, streaks, sessions, weekday,
+      models, recentRequests, concurrentPoints, streaks, sessions, weekday,
       nightCalls, nightPct: +(nightPct * 100).toFixed(1),
       activeHours, nightActiveHours, dayActiveHours, density,
       scriptSignals,
