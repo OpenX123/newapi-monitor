@@ -6,7 +6,7 @@
 - Production checkout: `/root/newapi-monitor`
 - Branch: `agent/focused-alerts`
 - Process manager: PM2 process `newapi-monitor`
-- Do not build, pull, or run a Docker image for this application.
+- Do not use Docker commands for this application. PM2 loads its runtime configuration from the server-only `.env` file.
 - This project has no frontend build step; static files are served directly from `public/`.
 
 After each completed change:
