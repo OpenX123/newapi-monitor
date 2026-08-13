@@ -66,7 +66,7 @@ function tokenUsageCell(r) {
 function clientTags(clients) {
   const values = Array.isArray(clients) ? clients : [];
   return values.length
-    ? values.map(client => `<span class="model-tag">${client}</span>`).join('')
+    ? values.map(client => `<span class="model-tag">${String(client).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c])}</span>`).join('')
     : '<span class="dim">未知</span>';
 }
 function formatNumber(n) {

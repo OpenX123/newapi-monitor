@@ -123,6 +123,7 @@ function testFormatters() {
   const noCache = tokenUsageCell({ total_tokens: 1000, prompt_tokens: 900, completion_tokens: 100, cache_tokens: 0 });
   check('无缓存时不显示缓存段', !noCache.includes('缓存'), '');
   check('客户端列表渲染为标签', clientTags(['Claude', 'OpenCode']).includes('Claude') && clientTags(['Claude', 'OpenCode']).includes('OpenCode'));
+  check('客户端名称按 HTML 文本安全展示', clientTags(['<script>']).includes('&lt;script&gt;'));
 }
 
 // ---------- 配置安全性 ----------
@@ -191,7 +192,7 @@ function testUsageSemantics() {
   check('用户分析明确标注 Trace 占比', /Trace 占比/.test(js));
   check('Token 聚合返回 IP 数量和客户端', /ip_count/.test(src) && /clients/.test(src));
   check('客户端识别覆盖常见四类', ['Claude', 'Codex', 'OpenCode', 'Trae'].every(client => src.includes(`'${client}'`)));
-  check('客户端只读取 channel_affinity 的明确类型', /SAFE_OTHER_JSON_EXPR/.test(src) && /'channel_affinity'/.test(src) && !/CLIENT_KEY_PATH_EXPR/.test(src));
+  check('客户端优先读取真实 User-Agent，Trace 仅作兜底', /CLIENT_USER_AGENT_EXPR/.test(src) && /'user_agent'/.test(src) && /CLIENT_SIGNAL_EXPR/.test(src));
   check('Token 排行展示 IP 数量和使用客户端', /label: 'IP 数量'/.test(js) && /label: '使用客户端'/.test(js) && /t\.ip_count/.test(js) && /clientTags\(t\.clients\)/.test(js));
 }
 

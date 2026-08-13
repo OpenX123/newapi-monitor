@@ -13,9 +13,10 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const REQUEST_LOGS = constant('REQUEST_LOGS');
 const CACHE_TOKENS_EXPR = constant('CACHE_TOKENS_EXPR');
 const SAFE_OTHER_JSON_EXPR = constant('SAFE_OTHER_JSON_EXPR');
-const CLIENT_SIGNAL_EXPR = constant('CLIENT_SIGNAL_EXPR')
-  .replaceAll('${SAFE_OTHER_JSON_EXPR}', SAFE_OTHER_JSON_EXPR);
+const CLIENT_USER_AGENT_EXPR = constant('CLIENT_USER_AGENT_EXPR');
+const CLIENT_SIGNAL_EXPR = constant('CLIENT_SIGNAL_EXPR');
 const CLIENT_EXPR = constant('CLIENT_EXPR')
+  .replaceAll('${CLIENT_USER_AGENT_EXPR}', CLIENT_USER_AGENT_EXPR)
   .replaceAll('${CLIENT_SIGNAL_EXPR}', CLIENT_SIGNAL_EXPR);
 const USAGE_AGG = constant('USAGE_AGG').replace(/\$\{CACHE_TOKENS_EXPR\}/g, CACHE_TOKENS_EXPR);
 const TS = 'EXTRACT(EPOCH FROM NOW())::bigint - 86400';
@@ -50,8 +51,11 @@ async function run(name, sql, params = []) {
     ip: { group: "COALESCE(NULLIF(ip, ''), '(未记录)')", select: "COALESCE(NULLIF(ip, ''), '(未记录)') as ip, COUNT(DISTINCT username) as user_count, COUNT(DISTINCT token_id) as token_count, MIN(created_at) as first_at, MAX(created_at) as last_at" },
   };
   for (const [name, d] of Object.entries(dims)) {
+    const source = name === 'token'
+      ? `(SELECT *, ${SAFE_OTHER_JSON_EXPR} AS other_json FROM logs WHERE created_at >= ${TS} AND ${REQUEST_LOGS}) usage_logs`
+      : `logs WHERE created_at >= ${TS} AND ${REQUEST_LOGS}`;
     await run(`dim=${name}`, `SELECT ${d.select}, ${USAGE_AGG}
-      FROM logs WHERE created_at >= ${TS} AND ${REQUEST_LOGS} GROUP BY ${d.group} ORDER BY count DESC LIMIT 3`);
+      FROM ${source} GROUP BY ${d.group} ORDER BY count DESC LIMIT 3`);
   }
 
   section('趋势 / 分布 / 快照');

@@ -396,8 +396,8 @@ async function loadSavedConfig() {
 }
 
 // ==================== Redis 缓存 ====================
-// 聚合结果结构变化时递增，避免升级后读到旧口径的缓存（v5：Token 聚合增加 IP 与客户端）
-const CACHE_SCHEMA_VERSION = 'v5';
+// 聚合结果结构变化时递增，避免升级后读到旧口径的缓存（v6：客户端优先读取 User-Agent）
+const CACHE_SCHEMA_VERSION = 'v6';
 function cacheKey(key) {
   return `${CONFIG.redisKeyPrefix}:${CACHE_SCHEMA_VERSION}:${key}`;
 }
@@ -849,15 +849,31 @@ const REQUEST_LOGS = 'type IN (2, 5)';
 // 缓存 token 用正则从 other 文本里取，避免 other 非法 JSON 或非整数值导致整条聚合报错。
 const CACHE_TOKENS_EXPR = `COALESCE(NULLIF(SUBSTRING(other FROM '"cache_tokens":([0-9]+)'), '')::bigint, 0)`;
 const SAFE_OTHER_JSON_EXPR = `(CASE
-        WHEN other NOT LIKE '%"channel_affinity"%' THEN '{}'::jsonb
+        WHEN other NOT LIKE '%"user_agent"%' AND other NOT LIKE '%"channel_affinity"%' THEN '{}'::jsonb
         WHEN other IS JSON THEN other::jsonb
         ELSE '{}'::jsonb
       END)`;
+const CLIENT_USER_AGENT_EXPR = `LOWER(COALESCE(other_json->>'user_agent', ''))`;
 const CLIENT_SIGNAL_EXPR = `LOWER(
-        COALESCE(${SAFE_OTHER_JSON_EXPR}->'admin_info'->'channel_affinity'->>'reason', '') || ' ' ||
-        COALESCE(${SAFE_OTHER_JSON_EXPR}->'admin_info'->'channel_affinity'->'override_template'->>'rule_name', '')
+        COALESCE(other_json->'admin_info'->'channel_affinity'->>'reason', '') || ' ' ||
+        COALESCE(other_json->'admin_info'->'channel_affinity'->'override_template'->>'rule_name', '')
       )`;
 const CLIENT_EXPR = `CASE
+        WHEN ${CLIENT_USER_AGENT_EXPR} LIKE '%codex desktop%' THEN 'Codex Desktop'
+        WHEN ${CLIENT_USER_AGENT_EXPR} LIKE '%opencode%' THEN 'OpenCode'
+        WHEN ${CLIENT_USER_AGENT_EXPR} LIKE '%trae%' THEN 'Trae'
+        WHEN ${CLIENT_USER_AGENT_EXPR} LIKE '%claude-cli%' THEN 'Claude CLI'
+        WHEN ${CLIENT_USER_AGENT_EXPR} LIKE '%anthropic/python%' THEN 'Claude Python SDK'
+        WHEN ${CLIENT_USER_AGENT_EXPR} LIKE '%anthropic/js%' THEN 'Claude JS SDK'
+        WHEN ${CLIENT_USER_AGENT_EXPR} LIKE '%asyncopenai%' OR ${CLIENT_USER_AGENT_EXPR} LIKE '%openai/python%' THEN 'OpenAI Python SDK'
+        WHEN ${CLIENT_USER_AGENT_EXPR} LIKE '%litellm%' THEN 'LiteLLM'
+        WHEN ${CLIENT_USER_AGENT_EXPR} LIKE '%undici%' THEN 'undici'
+        WHEN ${CLIENT_USER_AGENT_EXPR} LIKE '%python-requests%' THEN 'Python requests'
+        WHEN ${CLIENT_USER_AGENT_EXPR} LIKE '%python-urllib%' THEN 'Python urllib'
+        WHEN ${CLIENT_USER_AGENT_EXPR} LIKE '%go-http-client%' THEN 'Go HTTP'
+        WHEN ${CLIENT_USER_AGENT_EXPR} LIKE '%curl/%' THEN 'curl'
+        WHEN ${CLIENT_USER_AGENT_EXPR} LIKE '%chrome/%' THEN 'Chrome'
+        WHEN ${CLIENT_USER_AGENT_EXPR} <> '' THEN LEFT(other_json->>'user_agent', 48)
         WHEN ${CLIENT_SIGNAL_EXPR} LIKE '%opencode%' THEN 'OpenCode'
         WHEN ${CLIENT_SIGNAL_EXPR} LIKE '%trae%' THEN 'Trae'
         WHEN ${CLIENT_SIGNAL_EXPR} LIKE '%claude%' THEN 'Claude'
