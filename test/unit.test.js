@@ -191,7 +191,7 @@ function testUsageSemantics() {
   check('用户分析明确标注 Trace 占比', /Trace 占比/.test(js));
   check('Token 聚合返回 IP 数量和客户端', /ip_count/.test(src) && /clients/.test(src));
   check('客户端识别覆盖常见四类', ['Claude', 'Codex', 'OpenCode', 'Trae'].every(client => src.includes(`'${client}'`)));
-  check('客户端只读取结构化 trace 字段', /CLIENT_SIGNAL_EXPR/.test(src) && /CLIENT_KEY_PATH_EXPR/.test(src) && !/LOWER\(COALESCE\(other, ''\)\) LIKE/.test(src));
+  check('客户端只读取 channel_affinity 的明确类型', /SAFE_OTHER_JSON_EXPR/.test(src) && /'channel_affinity'/.test(src) && !/CLIENT_KEY_PATH_EXPR/.test(src));
   check('Token 排行展示 IP 数量和使用客户端', /label: 'IP 数量'/.test(js) && /label: '使用客户端'/.test(js) && /t\.ip_count/.test(js) && /clientTags\(t\.clients\)/.test(js));
 }
 

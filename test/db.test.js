@@ -12,11 +12,11 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 const REQUEST_LOGS = constant('REQUEST_LOGS');
 const CACHE_TOKENS_EXPR = constant('CACHE_TOKENS_EXPR');
-const CLIENT_SIGNAL_EXPR = constant('CLIENT_SIGNAL_EXPR');
-const CLIENT_KEY_PATH_EXPR = constant('CLIENT_KEY_PATH_EXPR');
+const SAFE_OTHER_JSON_EXPR = constant('SAFE_OTHER_JSON_EXPR');
+const CLIENT_SIGNAL_EXPR = constant('CLIENT_SIGNAL_EXPR')
+  .replaceAll('${SAFE_OTHER_JSON_EXPR}', SAFE_OTHER_JSON_EXPR);
 const CLIENT_EXPR = constant('CLIENT_EXPR')
-  .replaceAll('${CLIENT_SIGNAL_EXPR}', CLIENT_SIGNAL_EXPR)
-  .replaceAll('${CLIENT_KEY_PATH_EXPR}', CLIENT_KEY_PATH_EXPR);
+  .replaceAll('${CLIENT_SIGNAL_EXPR}', CLIENT_SIGNAL_EXPR);
 const USAGE_AGG = constant('USAGE_AGG').replace(/\$\{CACHE_TOKENS_EXPR\}/g, CACHE_TOKENS_EXPR);
 const TS = 'EXTRACT(EPOCH FROM NOW())::bigint - 86400';
 const TZ = 'Asia/Shanghai';

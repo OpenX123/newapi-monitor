@@ -848,16 +848,20 @@ const REQUEST_LOGS = 'type IN (2, 5)';
 // 面板按运营口径逐条请求计入 60% 缓存读取：prompt + completion + cache * 0.6。
 // 缓存 token 用正则从 other 文本里取，避免 other 非法 JSON 或非整数值导致整条聚合报错。
 const CACHE_TOKENS_EXPR = `COALESCE(NULLIF(SUBSTRING(other FROM '"cache_tokens":([0-9]+)'), '')::bigint, 0)`;
+const SAFE_OTHER_JSON_EXPR = `(CASE
+        WHEN other NOT LIKE '%"channel_affinity"%' THEN '{}'::jsonb
+        WHEN other IS JSON THEN other::jsonb
+        ELSE '{}'::jsonb
+      END)`;
 const CLIENT_SIGNAL_EXPR = `LOWER(
-        COALESCE(SUBSTRING(other FROM '"reason"[[:space:]]*:[[:space:]]*"([^"]*)"'), '') || ' ' ||
-        COALESCE(SUBSTRING(other FROM '"rule_name"[[:space:]]*:[[:space:]]*"([^"]*)"'), '')
+        COALESCE(${SAFE_OTHER_JSON_EXPR}->'admin_info'->'channel_affinity'->>'reason', '') || ' ' ||
+        COALESCE(${SAFE_OTHER_JSON_EXPR}->'admin_info'->'channel_affinity'->'override_template'->>'rule_name', '')
       )`;
-const CLIENT_KEY_PATH_EXPR = `COALESCE(SUBSTRING(other FROM '"key_path"[[:space:]]*:[[:space:]]*"([^"]*)"'), '')`;
 const CLIENT_EXPR = `CASE
         WHEN ${CLIENT_SIGNAL_EXPR} LIKE '%opencode%' THEN 'OpenCode'
         WHEN ${CLIENT_SIGNAL_EXPR} LIKE '%trae%' THEN 'Trae'
-        WHEN ${CLIENT_SIGNAL_EXPR} LIKE '%claude cli trace%' OR ${CLIENT_KEY_PATH_EXPR} = 'metadata.user_id' THEN 'Claude'
-        WHEN ${CLIENT_SIGNAL_EXPR} LIKE '%codex cli trace%' OR ${CLIENT_KEY_PATH_EXPR} = 'prompt_cache_key' THEN 'Codex'
+        WHEN ${CLIENT_SIGNAL_EXPR} LIKE '%claude%' THEN 'Claude'
+        WHEN ${CLIENT_SIGNAL_EXPR} LIKE '%codex%' THEN 'Codex'
         ELSE NULL
       END`;
 const USAGE_AGG = `COUNT(*) as count,
@@ -1147,9 +1151,16 @@ async function getAggregation(range, dimension) {
     ip: { group: "COALESCE(NULLIF(ip, ''), '(未记录)')", select: "COALESCE(NULLIF(ip, ''), '(未记录)') as ip, COUNT(DISTINCT username) as user_count, COUNT(DISTINCT token_id) as token_count, MIN(created_at) as first_at, MAX(created_at) as last_at" },
   };
   const d = dims[dimension] || dims.token;
+  const source = dimension === 'token'
+    ? `SELECT *, ${SAFE_OTHER_JSON_EXPR} AS other_json FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS}`
+    : `SELECT * FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS}`;
+  const select = dimension === 'token'
+    ? d.select.replaceAll(SAFE_OTHER_JSON_EXPR, 'other_json')
+    : d.select;
   const result = await pool.query(`
-    SELECT ${d.select}, ${USAGE_AGG}
-    FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS} GROUP BY ${d.group} ORDER BY count DESC
+    WITH source AS MATERIALIZED (${source})
+    SELECT ${select}, ${USAGE_AGG}
+    FROM source GROUP BY ${d.group} ORDER BY count DESC
   `, [ts]);
   const rows = result.rows.map(parseUsageRow);
   const totalRes = await pool.query(`SELECT COUNT(*) as cnt FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS}`, [ts]);
