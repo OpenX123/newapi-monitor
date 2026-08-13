@@ -359,6 +359,9 @@ tr.over-limit:hover { background: rgba(255,77,79,0.12); }
 .analysis-ip-panel strong { color: var(--accent); }
 .analysis-ip-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 .analysis-ip-list span, .request-ip { padding: 4px 9px; border-radius: 7px; background: rgba(74,158,255,.18); color: #76b7ff; font-family: monospace; font-weight: 700; }
+.ua-summary-card { margin-bottom: 16px; }
+.ua-match-rate { margin-bottom: 10px; color: var(--text-dim); }
+.ua-match-rate strong { color: var(--accent); font-size: 22px; }
 .request-list { display: grid; gap: 8px; }
 .request-item { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
 .request-item summary { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; padding: 10px 12px; cursor: pointer; }

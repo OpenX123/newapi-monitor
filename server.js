@@ -396,8 +396,8 @@ async function loadSavedConfig() {
 }
 
 // ==================== Redis 缓存 ====================
-// 聚合结果结构变化时递增，避免升级后读到旧口径的缓存（v7：区分真实客户端与 Trace 兜底）
-const CACHE_SCHEMA_VERSION = 'v7';
+// 聚合结果结构变化时递增，避免升级后读到旧口径的缓存（v8：增加 UA 次数与匹配率）
+const CACHE_SCHEMA_VERSION = 'v8';
 function cacheKey(key) {
   return `${CONFIG.redisKeyPrefix}:${CACHE_SCHEMA_VERSION}:${key}`;
 }
@@ -848,6 +848,7 @@ const REQUEST_LOGS = 'type IN (2, 5)';
 // 面板按运营口径逐条请求计入 60% 缓存读取：prompt + completion + cache * 0.6。
 // 缓存 token 用正则从 other 文本里取，避免 other 非法 JSON 或非整数值导致整条聚合报错。
 const CACHE_TOKENS_EXPR = `COALESCE(NULLIF(SUBSTRING(other FROM '"cache_tokens":([0-9]+)'), '')::bigint, 0)`;
+const USER_AGENT_EXPR = `NULLIF(SUBSTRING(other FROM '"user_agent":"([^"\\\\]*)"'), '')`;
 const SAFE_OTHER_JSON_EXPR = `(CASE
         WHEN other NOT LIKE '%"user_agent"%' AND other NOT LIKE '%"request_body"%' AND other NOT LIKE '%"channel_affinity"%' THEN '{}'::jsonb
         WHEN other IS JSON THEN other::jsonb
@@ -900,6 +901,25 @@ function parseUsageRow(r) {
     ip_count: parseInt(r.ip_count) || 0,
     clients: Array.isArray(r.clients) ? r.clients : [],
   };
+}
+
+function userAgentLabel(userAgent) {
+  const ua = String(userAgent || '');
+  if (/codex desktop/i.test(ua)) return 'Codex Desktop';
+  if (/claude-cli/i.test(ua)) return 'claude-cli';
+  if (/anthropic\/python/i.test(ua)) return 'Anthropic/Python';
+  if (/anthropic\/js/i.test(ua)) return 'Anthropic/JS';
+  if (/asyncopenai/i.test(ua)) return 'AsyncOpenAI';
+  if (/openai\/python/i.test(ua)) return 'OpenAI/Python';
+  if (/go-http-client/i.test(ua)) return 'Go-http-client';
+  if (/python-requests/i.test(ua)) return 'python-requests';
+  if (/urllib/i.test(ua)) return 'urllib';
+  if (/undici/i.test(ua)) return 'undici';
+  if (/curl\//i.test(ua)) return 'curl';
+  if (/chrome\//i.test(ua)) return /windows/i.test(ua) ? 'Chrome/Windows' : /linux/i.test(ua) ? 'Chrome/Linux' : 'Chrome';
+  if (/opencode/i.test(ua)) return 'OpenCode';
+  if (/trae/i.test(ua)) return 'Trae';
+  return ua.slice(0, 48) || '未知';
 }
 
 async function fetchLogsSinceId(lastLogId, minCreatedAt = 0) {
@@ -1159,8 +1179,7 @@ async function getAggregation(range, dimension) {
   const ts = getRangeTs(range);
   const dims = {
     token: { group: 'token_id, token_name, username, user_id', select: `token_id, token_name, username, user_id,
-      COUNT(DISTINCT NULLIF(ip, '')) as ip_count,
-      ARRAY_REMOVE(ARRAY_AGG(DISTINCT (${CLIENT_EXPR})), NULL) as clients` },
+      COUNT(DISTINCT NULLIF(ip, '')) as ip_count` },
     user:  { group: 'username', select: 'username, COUNT(DISTINCT token_id) as token_count' },
     model: { group: 'model_name', select: 'model_name' },
     group: { group: '"group"', select: '"group" as grp' },
@@ -1168,18 +1187,37 @@ async function getAggregation(range, dimension) {
     ip: { group: "COALESCE(NULLIF(ip, ''), '(未记录)')", select: "COALESCE(NULLIF(ip, ''), '(未记录)') as ip, COUNT(DISTINCT username) as user_count, COUNT(DISTINCT token_id) as token_count, MIN(created_at) as first_at, MAX(created_at) as last_at" },
   };
   const d = dims[dimension] || dims.token;
-  const source = dimension === 'token'
-    ? `SELECT *, ${SAFE_OTHER_JSON_EXPR} AS other_json FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS}`
-    : `SELECT * FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS}`;
-  const select = dimension === 'token'
-    ? d.select.replaceAll(SAFE_OTHER_JSON_EXPR, 'other_json')
-    : d.select;
+  const source = `SELECT * FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS}`;
+  const select = d.select;
   const result = await pool.query(`
     WITH source AS MATERIALIZED (${source})
     SELECT ${select}, ${USAGE_AGG}
     FROM source GROUP BY ${d.group} ORDER BY count DESC
   `, [ts]);
   const rows = result.rows.map(parseUsageRow);
+  if (dimension === 'token') {
+    const uaRes = await pool.query(`
+      SELECT token_id, ${USER_AGENT_EXPR} AS user_agent, COUNT(*) AS count
+      FROM logs
+      WHERE created_at >= $1 AND type = 2 AND other LIKE '%"user_agent"%'
+      GROUP BY token_id, user_agent
+    `, [ts]);
+    const byToken = new Map();
+    for (const r of uaRes.rows) {
+      if (!r.user_agent) continue;
+      const token = String(r.token_id);
+      const label = userAgentLabel(r.user_agent);
+      const counts = byToken.get(token) || new Map();
+      counts.set(label, (counts.get(label) || 0) + (parseInt(r.count) || 0));
+      byToken.set(token, counts);
+    }
+    for (const row of rows) {
+      const counts = byToken.get(String(row.token_id)) || new Map();
+      row.user_agents = [...counts].map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count);
+      row.ua_matched = row.user_agents.reduce((sum, item) => sum + item.count, 0);
+      row.ua_match_rate = row.count ? +(row.ua_matched * 100 / row.count).toFixed(1) : 0;
+    }
+  }
   const totalRes = await pool.query(`SELECT COUNT(*) as cnt FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS}`, [ts]);
   const total = parseInt(totalRes.rows[0].cnt);
   return { rows, total };
@@ -2186,6 +2224,20 @@ app.get('/api/user-analysis', async (req, res) => {
     `, [filterVal, ts]);
     const models = modelRes.rows.map(parseUsageRow);
 
+    const uaRes = await pool.query(`
+      SELECT ${USER_AGENT_EXPR} AS user_agent, COUNT(*) AS count
+      FROM logs WHERE ${filterCol} = $1 AND created_at >= $2 AND type = 2 AND other LIKE '%"user_agent"%'
+      GROUP BY user_agent ORDER BY count DESC
+    `, [filterVal, ts]);
+    const uaCounts = new Map();
+    for (const r of uaRes.rows) {
+      if (!r.user_agent) continue;
+      const label = userAgentLabel(r.user_agent);
+      uaCounts.set(label, (uaCounts.get(label) || 0) + (parseInt(r.count) || 0));
+    }
+    const userAgents = [...uaCounts].map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count);
+    const uaMatched = userAgents.reduce((sum, item) => sum + item.count, 0);
+
     // 5. 最近请求明细（请求体从网关审计副本读取，历史日志可能没有）
     const recentRequestsRes = await pool.query(`
       SELECT id, created_at, model_name, ip, request_id, other_json->>'user_agent' AS user_agent,
@@ -2340,7 +2392,8 @@ app.get('/api/user-analysis', async (req, res) => {
 
     res.json({ success: true, data: {
       username: username || token_name || token_id, basic, ips, hourly, intervals, intervalTimeline,
-      models, recentRequests, concurrentPoints, streaks, sessions, weekday,
+      models, userAgents, uaMatched, uaMatchRate: basic.total_calls ? +(uaMatched * 100 / basic.total_calls).toFixed(1) : 0,
+      recentRequests, concurrentPoints, streaks, sessions, weekday,
       nightCalls, nightPct: +(nightPct * 100).toFixed(1),
       activeHours, nightActiveHours, dayActiveHours, density,
       scriptSignals,

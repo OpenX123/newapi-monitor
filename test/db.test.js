@@ -12,6 +12,7 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 const REQUEST_LOGS = constant('REQUEST_LOGS');
 const CACHE_TOKENS_EXPR = constant('CACHE_TOKENS_EXPR');
+const USER_AGENT_EXPR = constant('USER_AGENT_EXPR');
 const SAFE_OTHER_JSON_EXPR = constant('SAFE_OTHER_JSON_EXPR');
 const CLIENT_USER_AGENT_EXPR = constant('CLIENT_USER_AGENT_EXPR');
 const CLIENT_SIGNAL_EXPR = constant('CLIENT_SIGNAL_EXPR');
@@ -43,7 +44,7 @@ async function run(name, sql, params = []) {
 (async () => {
   section('聚合查询（各维度）');
   const dims = {
-    token: { group: 'token_id, token_name, username, user_id', select: `token_id, token_name, username, user_id, COUNT(DISTINCT NULLIF(ip, '')) as ip_count, ARRAY_REMOVE(ARRAY_AGG(DISTINCT (${CLIENT_EXPR})), NULL) as clients` },
+    token: { group: 'token_id, token_name, username, user_id', select: `token_id, token_name, username, user_id, COUNT(DISTINCT NULLIF(ip, '')) as ip_count` },
     user: { group: 'username', select: 'username, COUNT(DISTINCT token_id) as token_count' },
     model: { group: 'model_name', select: 'model_name' },
     group: { group: '"group"', select: '"group" as grp' },
@@ -57,6 +58,9 @@ async function run(name, sql, params = []) {
     await run(`dim=${name}`, `SELECT ${d.select}, ${USAGE_AGG}
       FROM ${source} GROUP BY ${d.group} ORDER BY count DESC LIMIT 3`);
   }
+  await run('Token User-Agent 次数', `SELECT token_id, ${USER_AGENT_EXPR} AS user_agent, COUNT(*) AS count
+    FROM logs WHERE created_at >= ${TS} AND type = 2 AND other LIKE '%"user_agent"%'
+    GROUP BY token_id, user_agent ORDER BY count DESC LIMIT 10`);
 
   section('趋势 / 分布 / 快照');
   await run('每小时趋势', `SELECT LPAD(EXTRACT(HOUR FROM TO_TIMESTAMP(created_at) AT TIME ZONE '${TZ}')::TEXT, 2, '0') || ':00' as label,

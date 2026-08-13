@@ -63,10 +63,10 @@ function tokenUsageCell(r) {
     <br><span class="dim">${detail}</span>
   </td>`;
 }
-function clientTags(clients) {
-  const values = Array.isArray(clients) ? clients : [];
+function userAgentTags(userAgents) {
+  const values = Array.isArray(userAgents) ? userAgents : [];
   return values.length
-    ? values.map(client => `<span class="model-tag">${String(client).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c])}</span>`).join('')
+    ? values.map(item => `<span class="model-tag">${escapeHtml(item.name)} ×${item.count}</span>`).join('')
     : '<span class="dim">未知</span>';
 }
 function formatNumber(n) {
@@ -83,7 +83,8 @@ const COLUMNS = {
     { key: 'token_name', label: 'Token', sortable: true },
     { key: 'username', label: '用户', sortable: true },
     { key: 'ip_count', label: 'IP 数量', sortable: true },
-    { key: 'clients', label: '使用客户端', sortable: false },
+    { key: 'ua_match_rate', label: 'UA 匹配率', sortable: true },
+    { key: 'user_agents', label: 'User-Agent', sortable: false },
     { key: 'count', label: '调用次数', sortable: true },
     { key: 'total_tokens', label: 'Token 用量', sortable: true },
     { key: 'quota', label: '费用', sortable: true },
@@ -273,7 +274,8 @@ function renderTokenRow(t, i, limit) {
       <td><strong>${t.token_name || '-'}</strong><br><span class="dim">ID: ${t.token_id}</span></td>
       <td>${t.username}${isWl ? ' <span class="wl-badge"><svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>' : ''}</td>
       <td>${t.ip_count || 0}</td>
-      <td><div class="model-tags">${clientTags(t.clients)}</div></td>
+      <td><strong>${(t.ua_match_rate || 0).toFixed(1)}%</strong><br><span class="dim">${t.ua_matched || 0} / ${t.count}</span></td>
+      <td><div class="model-tags">${userAgentTags(t.user_agents)}</div></td>
       <td><div class="count-bar"><span>${t.count}</span><div class="count-bar-bg"><div class="count-bar-fill ${overLimit?'danger':''}" style="width:${pct}%"></div></div></div></td>
       ${tokenUsageCell(t)}
       <td>${formatUSD(t.quota)}</td>
@@ -1209,6 +1211,12 @@ async function analyzeItem(type, value, displayName) {
   html += `<div class="analysis-ip-panel">
     <strong>来源 IP · ${b.ip_count || 0} 个</strong>
     <div class="analysis-ip-list">${(d.ips || []).map(ip => `<span>${escapeHtml(ip)}</span>`).join('') || '<span>未记录</span>'}</div>
+  </div>`;
+
+  html += `<div class="analysis-card full ua-summary-card">
+    <h4>🌐 User-Agent 分布</h4>
+    <div class="ua-match-rate"><strong>${(d.uaMatchRate || 0).toFixed(1)}%</strong> 匹配（${d.uaMatched || 0} / ${b.total_calls}）</div>
+    <div class="model-tags">${userAgentTags(d.userAgents)}</div>
   </div>`;
 
   html += '<div class="analysis-grid">';

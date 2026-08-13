@@ -105,8 +105,9 @@ function testFormatters() {
   const app = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
   const slice = app.slice(app.indexOf('function formatUSD'), app.indexOf('function formatNumber'));
   const config = { quotaPerUnit: 500000 };
-  const { formatUSD, formatTokens, tokenUsageCell, clientTags } =
-    eval(`(function(){ ${slice} return { formatUSD, formatTokens, tokenUsageCell, clientTags }; })()`);
+  const escapeHtml = text => String(text).replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const { formatUSD, formatTokens, tokenUsageCell, userAgentTags } =
+    eval(`(function(){ ${slice} return { formatUSD, formatTokens, tokenUsageCell, userAgentTags }; })()`);
 
   equal('0 额度显示 $0', formatUSD(0), '$0');
   equal('500000 quota = $1', formatUSD(500000), '$1.00');
@@ -122,8 +123,8 @@ function testFormatters() {
   check('缓存按 60% 重复计入总量', cell.includes('1,360'), '');
   const noCache = tokenUsageCell({ total_tokens: 1000, prompt_tokens: 900, completion_tokens: 100, cache_tokens: 0 });
   check('无缓存时不显示缓存段', !noCache.includes('缓存'), '');
-  check('客户端列表渲染为标签', clientTags(['Claude', 'OpenCode']).includes('Claude') && clientTags(['Claude', 'OpenCode']).includes('OpenCode'));
-  check('客户端名称按 HTML 文本安全展示', clientTags(['<script>']).includes('&lt;script&gt;'));
+  check('User-Agent 次数渲染为标签', userAgentTags([{ name: 'undici', count: 202 }]).includes('undici ×202'));
+  check('User-Agent 名称按 HTML 文本安全展示', userAgentTags([{ name: '<script>', count: 1 }]).includes('&lt;script&gt;'));
 }
 
 // ---------- 配置安全性 ----------
@@ -178,6 +179,7 @@ function testUsageSemantics() {
   section('统计口径');
   const src = serverSource();
   const js = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+  const userAgentLabel = eval(`(${extract('function userAgentLabel', 'async function fetchLogsSinceId')})`);
   check('调用次数只统计真实请求（type 2/5）', /const REQUEST_LOGS = 'type IN \(2, 5\)'/.test(src));
   check('费用只对消费日志求和', /SUM\(quota\) FILTER \(WHERE type = 2\)/.test(src));
   check('token 用量只对消费日志求和且缓存按 60% 计入', /SUM\(COALESCE\(prompt_tokens, 0\) \+ COALESCE\(completion_tokens, 0\) \+ \(\$\{CACHE_TOKENS_EXPR\} \* 0\.6\)\) FILTER \(WHERE type = 2\)/.test(src));
@@ -191,11 +193,14 @@ function testUsageSemantics() {
   check('用户分析返回并展示 IP 分布', /ip_count/.test(src) && /d\.ips/.test(js));
   check('用户分析返回并展示最近请求体', /recentRequests/.test(src) && /request_body/.test(src) && /最近请求明细/.test(js));
   check('分析弹窗醒目展示来源 IP', /analysis-ip-panel/.test(js) && /analysis-ip-list/.test(js));
+  equal('UA 识别 Anthropic Python', userAgentLabel('Anthropic/Python 0.87.0'), 'Anthropic/Python');
+  equal('UA 区分 Chrome Windows', userAgentLabel('Mozilla/5.0 (Windows NT 10.0) Chrome/140.0'), 'Chrome/Windows');
+  equal('UA 识别 undici', userAgentLabel('undici'), 'undici');
   check('用户分析明确标注 Trace 占比', /Trace 占比/.test(js));
-  check('Token 聚合返回 IP 数量和客户端', /ip_count/.test(src) && /clients/.test(src));
+  check('Token 聚合返回 IP、UA 次数和匹配率', /ip_count/.test(src) && /user_agents/.test(src) && /ua_match_rate/.test(src));
   check('客户端识别覆盖常见四类', ['Claude', 'Codex', 'OpenCode', 'Trae'].every(client => src.includes(client)));
   check('客户端优先读取真实 User-Agent，Trace 仅作兜底', /CLIENT_USER_AGENT_EXPR/.test(src) && /'user_agent'/.test(src) && /CLIENT_SIGNAL_EXPR/.test(src));
-  check('Token 排行展示 IP 数量和使用客户端', /label: 'IP 数量'/.test(js) && /label: '使用客户端'/.test(js) && /t\.ip_count/.test(js) && /clientTags\(t\.clients\)/.test(js));
+  check('Token 排行展示 IP、UA 匹配率和分布', /label: 'IP 数量'/.test(js) && /label: 'UA 匹配率'/.test(js) && /label: 'User-Agent'/.test(js) && /userAgentTags\(t\.user_agents\)/.test(js));
 }
 
 (async () => {
