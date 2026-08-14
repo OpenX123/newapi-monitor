@@ -106,13 +106,14 @@ function testFormatters() {
   const slice = app.slice(app.indexOf('function formatUSD'), app.indexOf('function formatNumber'));
   const config = { quotaPerUnit: 500000 };
   const escapeHtml = text => String(text).replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  const { formatUSD, formatTokens, tokenUsageCell, userAgentTags } =
-    eval(`(function(){ ${slice} return { formatUSD, formatTokens, tokenUsageCell, userAgentTags }; })()`);
+  const { formatUSD, formatUSDValue, formatTokens, tokenUsageCell, userAgentTags } =
+    eval(`(function(){ ${slice} return { formatUSD, formatUSDValue, formatTokens, tokenUsageCell, userAgentTags }; })()`);
 
   equal('0 额度显示 $0', formatUSD(0), '$0');
   equal('500000 quota = $1', formatUSD(500000), '$1.00');
   equal('大额取整', formatUSD(500000000), '$1000');
   equal('小额保留精度', formatUSD(5000), '$0.01');
+  equal('Terra 成本直接按美元格式化', formatUSDValue(0.0015264), '$0.001526');
   check('极小额不显示成 $0', formatUSD(1).startsWith('$0.0000'), formatUSD(1));
   equal('token 千分位', formatTokens(1500), '1.5K');
   equal('token 百万', formatTokens(1234567), '1.23M');
@@ -182,6 +183,9 @@ function testUsageSemantics() {
   check('调用次数只统计真实请求（type 2/5）', /const REQUEST_LOGS = 'type IN \(2, 5\)'/.test(src));
   check('费用只对消费日志求和', /SUM\(quota\) FILTER \(WHERE type = 2\)/.test(src));
   check('token 用量只对消费日志求和且缓存不重复计入', /SUM\(COALESCE\(prompt_tokens, 0\) \+ COALESCE\(completion_tokens, 0\)\) FILTER \(WHERE type = 2\)/.test(src));
+  check('Sol 别名与 Terra 原名使用同一成本', /model_name IN \('gpt-5\.6-sol', 'gpt-5\.6-terra'\)/.test(src));
+  check('Terra 成本区分新输入、缓存读取和输出', /GREATEST\(prompt_tokens - cache_tokens, 0\) \* 0\.16 \+ cache_tokens \* 0\.016 \+ completion_tokens \* 0\.96/.test(src));
+  check('成本仅加入 Token 排行费用之后', /key: 'quota', label: '费用'[\s\S]{0,100}key: 'cost_usd', label: '成本'/.test(js));
   check('缓存 token 用正则提取而非 jsonb 强转', /SUBSTRING\(other FROM '"cache_tokens":\(\[0-9\]\+\)'\)/.test(src));
   check('报错分析不再把 other 整列传回 Node', !/SELECT id, created_at, type, content[\s\S]{0,200}channel_id, channel_name, other\s*\n\s*FROM logs/.test(src));
   check('报错明细有行数上限兜底', /LIMIT \$2/.test(src) && /ERROR_ROWS_LIMIT/.test(src));

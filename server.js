@@ -434,7 +434,7 @@ async function loadSavedConfig() {
 
 // ==================== Redis 缓存 ====================
 // 聚合结果结构变化时递增，避免升级后读到旧口径的缓存（v9：展示完整 User-Agent）
-const CACHE_SCHEMA_VERSION = 'v11';
+const CACHE_SCHEMA_VERSION = 'v12';
 function cacheKey(key) {
   return `${CONFIG.redisKeyPrefix}:${CACHE_SCHEMA_VERSION}:${key}`;
 }
@@ -925,7 +925,7 @@ const USAGE_AGG = `COUNT(*) as count,
       SUM(${CACHE_TOKENS_EXPR}) FILTER (WHERE type = 2) as cache_tokens`;
 
 function parseUsageRow(r) {
-  return {
+  const row = {
     ...r,
     count: parseInt(r.count) || 0,
     quota: parseInt(r.quota) || 0,
@@ -936,6 +936,11 @@ function parseUsageRow(r) {
     ip_count: parseInt(r.ip_count) || 0,
     clients: Array.isArray(r.clients) ? r.clients : [],
   };
+  if (r.cost_usd !== undefined) {
+    row.cost_usd = parseFloat(r.cost_usd) || 0;
+    row.cost_priced_calls = parseInt(r.cost_priced_calls) || 0;
+  }
+  return row;
 }
 
 async function fetchLogsSinceId(lastLogId, minCreatedAt = 0) {
@@ -1214,6 +1219,11 @@ const ROLLUP_USAGE_AGG = `SUM(call_count) as count,
       SUM(completion_tokens) as completion_tokens,
       SUM(total_tokens) as total_tokens,
       SUM(cache_tokens) as cache_tokens`;
+// 两个中转站的 gpt-5.6-sol 都实际落到 Terra；缓存写入按普通新输入计费。
+const TERRA_COST_AGG = `SUM(CASE WHEN model_name IN ('gpt-5.6-sol', 'gpt-5.6-terra') THEN
+        (GREATEST(prompt_tokens - cache_tokens, 0) * 0.16 + cache_tokens * 0.016 + completion_tokens * 0.96) / 1000000.0
+        ELSE 0 END) as cost_usd,
+      SUM(CASE WHEN model_name IN ('gpt-5.6-sol', 'gpt-5.6-terra') THEN usage_count ELSE 0 END) as cost_priced_calls`;
 
 function getUsageSource(range) {
   const ts = getRangeTs(range);
@@ -1298,9 +1308,10 @@ async function getAggregation(range, dimension) {
   };
   const d = dims[dimension] || dims.token;
   const select = d.select;
+  const costAgg = dimension === 'token' ? `, ${TERRA_COST_AGG}` : '';
   const result = await pool.query(`
     WITH source AS MATERIALIZED (${source.sql})
-    SELECT ${select}, ${ROLLUP_USAGE_AGG}
+    SELECT ${select}, ${ROLLUP_USAGE_AGG}${costAgg}
     FROM source GROUP BY ${d.group} ORDER BY count DESC
   `, source.params);
   const rows = result.rows.map(parseUsageRow);

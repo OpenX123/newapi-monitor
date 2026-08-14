@@ -30,7 +30,9 @@ function formatTime(ts) {
 // logs.quota 是 NewAPI 内部计费单位（默认 500000 = $1），面板一律换算成美元展示
 function formatUSD(q) {
   const unit = (config && config.quotaPerUnit) || 500000;
-  const usd = (q || 0) / unit;
+  return formatUSDValue((q || 0) / unit);
+}
+function formatUSDValue(usd) {
   if (!usd) return '$0';
   if (usd >= 100) return '$' + usd.toFixed(0);
   if (usd >= 1) return '$' + usd.toFixed(2);
@@ -86,6 +88,7 @@ const COLUMNS = {
     { key: 'ip_count', label: 'IP 数量', sortable: true },
     { key: 'username', label: '用户', sortable: true },
     { key: 'quota', label: '费用', sortable: true },
+    { key: 'cost_usd', label: '成本', sortable: true },
     { key: 'models', label: '模型分布', sortable: false },
     { key: 'user_agents', label: '完整 User-Agent 请求头', sortable: false },
     { key: 'action', label: '操作', sortable: false },
@@ -267,6 +270,9 @@ function renderTokenRow(t, i, limit) {
     .map(([m,c]) => `<span class="model-tag">${m}×${c}</span>`).join('') : '';
   const status = tokenStatuses[t.token_id];
   const isEnabled = status !== 2;
+  const cost = t.cost_priced_calls > 0
+    ? `<span title="仅按 Terra 成本计入 ${t.cost_priced_calls.toLocaleString()} 次 Sol/Terra 调用">${formatUSDValue(t.cost_usd)}</span>`
+    : '--';
   return `
     <tr class="${overLimit && !isWl ? 'over-limit' : ''}">
       <td>${i+1}</td>
@@ -276,6 +282,7 @@ function renderTokenRow(t, i, limit) {
       <td>${t.ip_count || 0}</td>
       <td>${t.username}${isWl ? ' <span class="wl-badge"><svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>' : ''}</td>
       <td>${formatUSD(t.quota)}</td>
+      <td>${cost}</td>
       <td><div class="model-tags">${models}</div></td>
       <td class="user-agent-cell"><div class="model-tags">${userAgentTags(t.user_agents)}</div></td>
       <td>
