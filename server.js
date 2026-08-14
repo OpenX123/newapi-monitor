@@ -1817,13 +1817,13 @@ async function pollAndCheck() {
     const prevCursor = await cacheGetJson('state:cursor');
     const nowCursor = await getLatestLogCursor();
     const todaySnapshotEnvelope = await readCacheEnvelope('snapshot:today');
-    await ensureRecentUsageRollup();
 
     const metricsLastId = parseInt(await getKV('metrics:last_log_id')) || 0;
     if (metricsLastId && metricsLastId < nowCursor.maxId) {
       await cacheLogMetrics(await fetchLogsSinceId(metricsLastId));
     }
     await setKV('metrics:last_log_id', nowCursor.maxId);
+    await ensureRecentUsageRollup();
 
     if (prevCursor && prevCursor.maxId && prevCursor.maxId < nowCursor.maxId) {
       const rows = await fetchLogsSinceId(prevCursor.maxId);
