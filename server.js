@@ -334,10 +334,38 @@ async function initDB() {
       user_agent TEXT NOT NULL,
       matched_delta_seconds INTEGER NOT NULL,
       cache_tokens BIGINT NOT NULL DEFAULT 0,
+      trace_type TEXT NOT NULL DEFAULT '',
       created_at INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())::INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS monitor_usage_rollups (
+      bucket_start INTEGER NOT NULL,
+      dimension_hash TEXT NOT NULL,
+      token_id BIGINT NOT NULL DEFAULT 0,
+      token_name TEXT NOT NULL DEFAULT '',
+      username TEXT NOT NULL DEFAULT '',
+      user_id BIGINT NOT NULL DEFAULT 0,
+      model_name TEXT NOT NULL DEFAULT '',
+      grp TEXT NOT NULL DEFAULT '',
+      channel_id BIGINT NOT NULL DEFAULT 0,
+      channel_name TEXT NOT NULL DEFAULT '',
+      ip TEXT NOT NULL DEFAULT '',
+      user_agent TEXT NOT NULL DEFAULT '',
+      call_count BIGINT NOT NULL DEFAULT 0,
+      usage_count BIGINT NOT NULL DEFAULT 0,
+      quota BIGINT NOT NULL DEFAULT 0,
+      prompt_tokens BIGINT NOT NULL DEFAULT 0,
+      completion_tokens BIGINT NOT NULL DEFAULT 0,
+      total_tokens DOUBLE PRECISION NOT NULL DEFAULT 0,
+      cache_tokens BIGINT NOT NULL DEFAULT 0,
+      first_at INTEGER NOT NULL,
+      last_at INTEGER NOT NULL,
+      PRIMARY KEY (bucket_start, dimension_hash)
     );
   `);
   await pool.query('ALTER TABLE monitor_log_user_agents ADD COLUMN IF NOT EXISTS cache_tokens BIGINT NOT NULL DEFAULT 0');
+  await pool.query("ALTER TABLE monitor_log_user_agents ADD COLUMN IF NOT EXISTS trace_type TEXT NOT NULL DEFAULT ''");
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_monitor_usage_rollups_bucket ON monitor_usage_rollups (bucket_start)');
   await pool.query('ALTER TABLE monitor_actions ADD COLUMN IF NOT EXISTS action_meta JSONB');
   // 告警冷却查询（按 action + subject + 时间）每分钟对每个活跃 Token 执行一次，没有索引会全表扫
   await pool.query(`
@@ -932,6 +960,7 @@ async function fetchLogsSinceId(lastLogId, minCreatedAt = 0) {
     completion_tokens: parseInt(r.completion_tokens) || 0,
     cache_tokens: extractCacheTokens(r.other),
     user_agent: extractUserAgent(r.other),
+    trace_type: extractTraceType(r.other),
   }));
 }
 
@@ -947,17 +976,29 @@ function extractUserAgent(other) {
   try { return JSON.parse(`"${m[1]}"`); } catch { return ''; }
 }
 
-async function cacheUserAgents(rows) {
-  const entries = rows.filter(row => row.type === 2 && row.user_agent).map(row => [row.id, row.user_agent, row.cache_tokens]);
-  if (!entries.length) return;
-  const values = [];
-  const params = [];
-  for (const [id, userAgent, cacheTokens] of entries) {
-    const offset = params.length;
-    params.push(id, userAgent, cacheTokens);
-    values.push(`($${offset + 1}, $${offset + 2}, 0, $${offset + 3})`);
+function extractTraceType(other) {
+  const json = parseOtherJson(other);
+  const affinity = json?.admin_info?.channel_affinity || {};
+  const signal = `${affinity.reason || ''} ${affinity.override_template?.rule_name || ''}`.toLowerCase();
+  if (signal.includes('claude cli trace')) return 'claude cli trace';
+  if (signal.includes('codex cli trace')) return 'codex cli trace';
+  if (affinity.key_path === 'metadata.user_id') return 'key_path:metadata.user_id';
+  if (affinity.key_path === 'prompt_cache_key') return 'key_path:prompt_cache_key';
+  return '';
+}
+
+async function cacheLogMetrics(rows) {
+  const entries = rows.map(row => [row.id, row.user_agent || '', row.cache_tokens, row.trace_type]);
+  for (let i = 0; i < entries.length; i += 500) {
+    const values = [];
+    const params = [];
+    for (const [id, userAgent, cacheTokens, traceType] of entries.slice(i, i + 500)) {
+      const offset = params.length;
+      params.push(id, userAgent, cacheTokens, traceType);
+      values.push(`($${offset + 1}, $${offset + 2}, 0, $${offset + 3}, $${offset + 4})`);
+    }
+    await pool.query(`INSERT INTO monitor_log_user_agents (log_id, user_agent, matched_delta_seconds, cache_tokens, trace_type) VALUES ${values.join(',')} ON CONFLICT (log_id) DO UPDATE SET user_agent = CASE WHEN EXCLUDED.user_agent <> '' THEN EXCLUDED.user_agent ELSE monitor_log_user_agents.user_agent END, cache_tokens = EXCLUDED.cache_tokens, trace_type = EXCLUDED.trace_type`, params);
   }
-  await pool.query(`INSERT INTO monitor_log_user_agents (log_id, user_agent, matched_delta_seconds, cache_tokens) VALUES ${values.join(',')} ON CONFLICT (log_id) DO UPDATE SET cache_tokens = EXCLUDED.cache_tokens`, params);
 }
 
 function upsertRecentLogs(existing, rows, limit = 100) {
@@ -1036,9 +1077,16 @@ async function getTodayAggregation() {
   const totalRes = await pool.query(`SELECT COUNT(*) as cnt FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS}`, [ts]);
   const total = parseInt(totalRes.rows[0].cnt);
   const tokensRes = await pool.query(`
-    SELECT token_id, token_name, username, user_id, ${USAGE_AGG}
-    FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS}
-    GROUP BY token_id, token_name, username, user_id ORDER BY count DESC
+    SELECT l.token_id, l.token_name, l.username, l.user_id,
+      COUNT(*) as count,
+      SUM(l.quota) FILTER (WHERE l.type = 2) as quota,
+      SUM(l.prompt_tokens) FILTER (WHERE l.type = 2) as prompt_tokens,
+      SUM(l.completion_tokens) FILTER (WHERE l.type = 2) as completion_tokens,
+      SUM(COALESCE(l.prompt_tokens, 0) + COALESCE(l.completion_tokens, 0) + COALESCE(m.cache_tokens, 0) * 0.6) FILTER (WHERE l.type = 2) as total_tokens,
+      SUM(COALESCE(m.cache_tokens, 0)) FILTER (WHERE l.type = 2) as cache_tokens
+    FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
+    WHERE l.created_at >= $1 AND l.${REQUEST_LOGS}
+    GROUP BY l.token_id, l.token_name, l.username, l.user_id ORDER BY count DESC
   `, [ts]);
   const tokens = tokensRes.rows.map(parseUsageRow);
 
@@ -1124,41 +1172,18 @@ async function getScriptTraceStatsForFilter(filterCol, filterVal, ts) {
 
 async function getScriptDisableCandidates(ts) {
   const { rows } = await pool.query(`
-    WITH filtered AS (
-      SELECT
-        token_id, token_name, username, user_id, model_name,
-        CASE
-          WHEN other IS NOT NULL AND other <> '' AND LEFT(other, 1) = '{' THEN other::jsonb
-          ELSE '{}'::jsonb
-        END AS other_json
-      FROM logs
-      WHERE created_at >= $1 AND ${REQUEST_LOGS}
-    ),
-    labeled AS (
-      SELECT
-        token_id, token_name, username, user_id, model_name,
-        CASE
-          WHEN LOWER(COALESCE(other_json->'admin_info'->'channel_affinity'->>'reason', '')) LIKE '%claude cli trace%'
-            OR LOWER(COALESCE(other_json->'admin_info'->'channel_affinity'->'override_template'->>'rule_name', '')) LIKE '%claude cli trace%' THEN 'claude cli trace'
-          WHEN LOWER(COALESCE(other_json->'admin_info'->'channel_affinity'->>'reason', '')) LIKE '%codex cli trace%'
-            OR LOWER(COALESCE(other_json->'admin_info'->'channel_affinity'->'override_template'->>'rule_name', '')) LIKE '%codex cli trace%' THEN 'codex cli trace'
-          WHEN COALESCE(other_json->'admin_info'->'channel_affinity'->>'key_path', '') = 'metadata.user_id' THEN 'key_path:metadata.user_id'
-          WHEN COALESCE(other_json->'admin_info'->'channel_affinity'->>'key_path', '') = 'prompt_cache_key' THEN 'key_path:prompt_cache_key'
-          ELSE NULL
-        END AS trace_type
-      FROM filtered
-    )
     SELECT
-      token_id, token_name, username, user_id,
+      l.token_id, l.token_name, l.username, l.user_id,
       COUNT(*) AS total_calls,
-      COUNT(*) FILTER (WHERE trace_type IS NOT NULL) AS flagged_calls,
-      COUNT(*) FILTER (WHERE trace_type = 'claude cli trace' OR LOWER(COALESCE(model_name, '')) LIKE '%claude%') AS claude_calls,
-      COUNT(*) FILTER (WHERE trace_type = 'codex cli trace' OR LOWER(COALESCE(model_name, '')) ~ '(gpt|codex)') AS gpt_calls,
-      COALESCE(JSON_AGG(DISTINCT trace_type) FILTER (WHERE trace_type IS NOT NULL), '[]'::json) AS trace_types
-    FROM labeled
-    GROUP BY token_id, token_name, username, user_id
-    HAVING COUNT(*) FILTER (WHERE trace_type = 'claude cli trace' OR LOWER(COALESCE(model_name, '')) LIKE '%claude%') >= $2
-        OR COUNT(*) FILTER (WHERE trace_type = 'codex cli trace' OR LOWER(COALESCE(model_name, '')) ~ '(gpt|codex)') >= $3
+      COUNT(*) FILTER (WHERE COALESCE(m.trace_type, '') <> '') AS flagged_calls,
+      COUNT(*) FILTER (WHERE m.trace_type = 'claude cli trace' OR LOWER(COALESCE(l.model_name, '')) LIKE '%claude%') AS claude_calls,
+      COUNT(*) FILTER (WHERE m.trace_type = 'codex cli trace' OR LOWER(COALESCE(l.model_name, '')) ~ '(gpt|codex)') AS gpt_calls,
+      COALESCE(JSON_AGG(DISTINCT m.trace_type) FILTER (WHERE COALESCE(m.trace_type, '') <> ''), '[]'::json) AS trace_types
+    FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
+    WHERE l.created_at >= $1 AND l.${REQUEST_LOGS}
+    GROUP BY l.token_id, l.token_name, l.username, l.user_id
+    HAVING COUNT(*) FILTER (WHERE m.trace_type = 'claude cli trace' OR LOWER(COALESCE(l.model_name, '')) LIKE '%claude%') >= $2
+        OR COUNT(*) FILTER (WHERE m.trace_type = 'codex cli trace' OR LOWER(COALESCE(l.model_name, '')) ~ '(gpt|codex)') >= $3
     ORDER BY flagged_calls DESC, total_calls DESC
   `, [ts, CONFIG.scriptClaudeAlertCalls, CONFIG.scriptGptAlertCalls]);
 
@@ -1185,8 +1210,85 @@ async function getScriptDisableCandidates(ts) {
   }).filter(r => r.eligible);
 }
 
-async function getAggregation(range, dimension) {
+const ROLLUP_USAGE_AGG = `SUM(call_count) as count,
+      SUM(quota) as quota,
+      SUM(prompt_tokens) as prompt_tokens,
+      SUM(completion_tokens) as completion_tokens,
+      SUM(total_tokens) as total_tokens,
+      SUM(cache_tokens) as cache_tokens`;
+
+function getUsageSource(range) {
   const ts = getRangeTs(range);
+  const today = getRangeTs('today');
+  return {
+    params: [ts, today],
+    sql: `
+      SELECT token_id, token_name, username, user_id, ip, model_name, grp AS "group", channel_id, channel_name,
+        user_agent, bucket_start, call_count, usage_count, quota, prompt_tokens, completion_tokens,
+        total_tokens, cache_tokens, first_at, last_at
+      FROM monitor_usage_rollups WHERE bucket_start >= $1 AND bucket_start < $2
+      UNION ALL
+      SELECT l.token_id, COALESCE(l.token_name, ''), COALESCE(l.username, ''), COALESCE(l.user_id, 0), COALESCE(l.ip, ''),
+        COALESCE(l.model_name, ''), COALESCE(l."group", ''), COALESCE(l.channel_id, 0), COALESCE(l.channel_name, ''),
+        CASE WHEN l.type = 2 THEN COALESCE(m.user_agent, '') ELSE '' END,
+        (l.created_at / 3600) * 3600, 1, CASE WHEN l.type = 2 THEN 1 ELSE 0 END,
+        CASE WHEN l.type = 2 THEN COALESCE(l.quota, 0) ELSE 0 END,
+        CASE WHEN l.type = 2 THEN COALESCE(l.prompt_tokens, 0) ELSE 0 END,
+        CASE WHEN l.type = 2 THEN COALESCE(l.completion_tokens, 0) ELSE 0 END,
+        CASE WHEN l.type = 2 THEN COALESCE(l.prompt_tokens, 0) + COALESCE(l.completion_tokens, 0) + COALESCE(m.cache_tokens, 0) * 0.6 ELSE 0 END,
+        CASE WHEN l.type = 2 THEN COALESCE(m.cache_tokens, 0) ELSE 0 END,
+        l.created_at, l.created_at
+      FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
+      WHERE l.created_at >= GREATEST($1, $2) AND l.${REQUEST_LOGS}`,
+  };
+}
+
+async function buildUsageRollupDay(dayStart) {
+  await pool.query(`
+    INSERT INTO monitor_usage_rollups (
+      bucket_start, dimension_hash, token_id, token_name, username, user_id, model_name, grp,
+      channel_id, channel_name, ip, user_agent, call_count, usage_count, quota, prompt_tokens,
+      completion_tokens, total_tokens, cache_tokens, first_at, last_at
+    )
+    SELECT (l.created_at / 3600) * 3600,
+      MD5(CONCAT_WS(CHR(31), COALESCE(l.token_id, 0), COALESCE(l.token_name, ''), COALESCE(l.username, ''),
+        COALESCE(l.user_id, 0), COALESCE(l.model_name, ''), COALESCE(l."group", ''), COALESCE(l.channel_id, 0),
+        COALESCE(l.channel_name, ''), COALESCE(l.ip, ''), CASE WHEN l.type = 2 THEN COALESCE(m.user_agent, '') ELSE '' END)),
+      COALESCE(l.token_id, 0), COALESCE(l.token_name, ''), COALESCE(l.username, ''), COALESCE(l.user_id, 0),
+      COALESCE(l.model_name, ''), COALESCE(l."group", ''), COALESCE(l.channel_id, 0), COALESCE(l.channel_name, ''),
+      COALESCE(l.ip, ''), CASE WHEN l.type = 2 THEN COALESCE(m.user_agent, '') ELSE '' END,
+      COUNT(*), COUNT(*) FILTER (WHERE l.type = 2),
+      COALESCE(SUM(l.quota) FILTER (WHERE l.type = 2), 0),
+      COALESCE(SUM(l.prompt_tokens) FILTER (WHERE l.type = 2), 0),
+      COALESCE(SUM(l.completion_tokens) FILTER (WHERE l.type = 2), 0),
+      COALESCE(SUM(COALESCE(l.prompt_tokens, 0) + COALESCE(l.completion_tokens, 0) + COALESCE(m.cache_tokens, 0) * 0.6) FILTER (WHERE l.type = 2), 0),
+      COALESCE(SUM(m.cache_tokens) FILTER (WHERE l.type = 2), 0), MIN(l.created_at), MAX(l.created_at)
+    FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
+    WHERE l.created_at >= $1 AND l.created_at < $2 AND l.${REQUEST_LOGS}
+    GROUP BY (l.created_at / 3600) * 3600, COALESCE(l.token_id, 0), COALESCE(l.token_name, ''),
+      COALESCE(l.username, ''), COALESCE(l.user_id, 0), COALESCE(l.model_name, ''), COALESCE(l."group", ''),
+      COALESCE(l.channel_id, 0), COALESCE(l.channel_name, ''), COALESCE(l.ip, ''),
+      CASE WHEN l.type = 2 THEN COALESCE(m.user_agent, '') ELSE '' END
+    ON CONFLICT (bucket_start, dimension_hash) DO UPDATE SET
+      call_count = EXCLUDED.call_count, usage_count = EXCLUDED.usage_count, quota = EXCLUDED.quota,
+      prompt_tokens = EXCLUDED.prompt_tokens, completion_tokens = EXCLUDED.completion_tokens,
+      total_tokens = EXCLUDED.total_tokens, cache_tokens = EXCLUDED.cache_tokens,
+      first_at = EXCLUDED.first_at, last_at = EXCLUDED.last_at
+  `, [dayStart, dayStart + 86400]);
+}
+
+async function ensureRecentUsageRollup() {
+  const start = getRangeTs('30d');
+  const today = getRangeTs('today');
+  const { rows } = await pool.query('SELECT DISTINCT bucket_start FROM monitor_usage_rollups WHERE bucket_start >= $1 AND bucket_start < $2', [start, today]);
+  const existing = new Set(rows.map(row => start + Math.floor((Number(row.bucket_start) - start) / 86400) * 86400));
+  for (let day = start; day < today; day += 86400) {
+    if (!existing.has(day)) { await buildUsageRollupDay(day); break; }
+  }
+}
+
+async function getAggregation(range, dimension) {
+  const source = getUsageSource(range);
   const dims = {
     token: { group: 'token_id, token_name, username, user_id', select: `token_id, token_name, username, user_id,
       COUNT(DISTINCT NULLIF(ip, '')) as ip_count` },
@@ -1194,25 +1296,22 @@ async function getAggregation(range, dimension) {
     model: { group: 'model_name', select: 'model_name' },
     group: { group: '"group"', select: '"group" as grp' },
     channel: { group: 'channel_id, channel_name', select: 'channel_id as channel, channel_name' },
-    ip: { group: "COALESCE(NULLIF(ip, ''), '(未记录)')", select: "COALESCE(NULLIF(ip, ''), '(未记录)') as ip, COUNT(DISTINCT username) as user_count, COUNT(DISTINCT token_id) as token_count, MIN(created_at) as first_at, MAX(created_at) as last_at" },
+    ip: { group: "COALESCE(NULLIF(ip, ''), '(未记录)')", select: "COALESCE(NULLIF(ip, ''), '(未记录)') as ip, COUNT(DISTINCT username) as user_count, COUNT(DISTINCT token_id) as token_count, MIN(first_at) as first_at, MAX(last_at) as last_at" },
   };
   const d = dims[dimension] || dims.token;
-  const source = `SELECT l.token_id, l.token_name, l.username, l.user_id, l.ip, l.model_name, l."group", l.channel_id, l.channel_name, l.type, l.quota, l.prompt_tokens, l.completion_tokens, COALESCE(m.cache_tokens, 0) AS monitor_cache_tokens FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id WHERE l.created_at >= $1 AND ${REQUEST_LOGS}`;
   const select = d.select;
-  const usageAgg = USAGE_AGG.replaceAll(CACHE_TOKENS_EXPR, 'monitor_cache_tokens');
   const result = await pool.query(`
-    WITH source AS MATERIALIZED (${source})
-    SELECT ${select}, ${usageAgg}
+    WITH source AS MATERIALIZED (${source.sql})
+    SELECT ${select}, ${ROLLUP_USAGE_AGG}
     FROM source GROUP BY ${d.group} ORDER BY count DESC
-  `, [ts]);
+  `, source.params);
   const rows = result.rows.map(parseUsageRow);
   if (dimension === 'token') {
     const uaRes = await pool.query(`
-      SELECT l.token_id, m.user_agent, COUNT(*) AS count
-      FROM logs l JOIN monitor_log_user_agents m ON m.log_id = l.id
-      WHERE l.created_at >= $1 AND l.type = 2
-      GROUP BY l.token_id, m.user_agent
-    `, [ts]);
+      WITH source AS MATERIALIZED (${source.sql})
+      SELECT token_id, user_agent, SUM(usage_count) AS count FROM source
+      WHERE user_agent <> '' GROUP BY token_id, user_agent
+    `, source.params);
     const byToken = new Map();
     for (const r of uaRes.rows) {
       if (!r.user_agent) continue;
@@ -1226,25 +1325,25 @@ async function getAggregation(range, dimension) {
       row.user_agents = [...counts].map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count);
     }
   }
-  const totalRes = await pool.query(`SELECT COUNT(*) as cnt FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS}`, [ts]);
-  const total = parseInt(totalRes.rows[0].cnt);
+  const total = rows.reduce((sum, row) => sum + row.count, 0);
   return { rows, total };
 }
 
 async function getHourlyTrend(range) {
-  const ts = getRangeTs(range);
+  const source = getUsageSource(range);
   const labelExpr = range === 'today'
-    ? "LPAD(EXTRACT(HOUR FROM TO_TIMESTAMP(created_at) AT TIME ZONE $2)::TEXT, 2, '0') || ':00'"
-    : "TO_CHAR(TO_TIMESTAMP(created_at) AT TIME ZONE $2, 'MM-DD HH24') || 'h'";
+    ? "LPAD(EXTRACT(HOUR FROM TO_TIMESTAMP(bucket_start) AT TIME ZONE $3)::TEXT, 2, '0') || ':00'"
+    : "TO_CHAR(TO_TIMESTAMP(bucket_start) AT TIME ZONE $3, 'MM-DD HH24') || 'h'";
   const res = await pool.query(`
+    WITH source AS MATERIALIZED (${source.sql})
     SELECT ${labelExpr} as label,
-      COUNT(*) as count,
-      SUM(quota) FILTER (WHERE type = 2) as quota,
-      SUM(COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0) + (${CACHE_TOKENS_EXPR} * 0.6)) FILTER (WHERE type = 2) as total_tokens,
+      SUM(call_count) as count,
+      SUM(quota) as quota,
+      SUM(total_tokens) as total_tokens,
       COUNT(DISTINCT token_id) as active_tokens,
       COUNT(DISTINCT username) as active_users
-    FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS} GROUP BY label ORDER BY label
-  `, [ts, CONFIG.timezone]);
+    FROM source GROUP BY bucket_start, label ORDER BY bucket_start
+  `, [...source.params, CONFIG.timezone]);
   return res.rows.map(r => ({
     label: r.label,
     count: parseInt(r.count),
@@ -1256,27 +1355,31 @@ async function getHourlyTrend(range) {
 }
 
 async function getDistribution(range) {
-  const ts = getRangeTs(range);
+  const source = getUsageSource(range);
   // 模型分布 TOP 10
   const modelRes = await pool.query(`
-    SELECT model_name, ${USAGE_AGG}
-    FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS} GROUP BY model_name ORDER BY count DESC LIMIT 10
-  `, [ts]);
+    WITH source AS MATERIALIZED (${source.sql})
+    SELECT model_name, ${ROLLUP_USAGE_AGG}
+    FROM source GROUP BY model_name ORDER BY count DESC LIMIT 10
+  `, source.params);
   // 用户分布 TOP 10（按调用次数）
   const userRes = await pool.query(`
-    SELECT username, ${USAGE_AGG}
-    FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS} GROUP BY username ORDER BY count DESC LIMIT 10
-  `, [ts]);
+    WITH source AS MATERIALIZED (${source.sql})
+    SELECT username, ${ROLLUP_USAGE_AGG}
+    FROM source GROUP BY username ORDER BY count DESC LIMIT 10
+  `, source.params);
   // 用户 token 用量 TOP 10（调用次数少但吃 token 的用户不会被漏掉）
   const userTokenRes = await pool.query(`
-    SELECT username, ${USAGE_AGG}
-    FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS} GROUP BY username ORDER BY total_tokens DESC NULLS LAST LIMIT 10
-  `, [ts]);
+    WITH source AS MATERIALIZED (${source.sql})
+    SELECT username, ${ROLLUP_USAGE_AGG}
+    FROM source GROUP BY username ORDER BY total_tokens DESC NULLS LAST LIMIT 10
+  `, source.params);
   // Token/Key 分布 TOP 10
   const tokenRes = await pool.query(`
-    SELECT token_id, token_name, username, ${USAGE_AGG}
-    FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS} GROUP BY token_id, token_name, username ORDER BY count DESC LIMIT 10
-  `, [ts]);
+    WITH source AS MATERIALIZED (${source.sql})
+    SELECT token_id, token_name, username, ${ROLLUP_USAGE_AGG}
+    FROM source GROUP BY token_id, token_name, username ORDER BY count DESC LIMIT 10
+  `, source.params);
   return {
     models: modelRes.rows.map(parseUsageRow),
     users: userRes.rows.map(parseUsageRow),
@@ -1714,10 +1817,17 @@ async function pollAndCheck() {
     const prevCursor = await cacheGetJson('state:cursor');
     const nowCursor = await getLatestLogCursor();
     const todaySnapshotEnvelope = await readCacheEnvelope('snapshot:today');
+    await ensureRecentUsageRollup();
+
+    const metricsLastId = parseInt(await getKV('metrics:last_log_id')) || 0;
+    if (metricsLastId && metricsLastId < nowCursor.maxId) {
+      await cacheLogMetrics(await fetchLogsSinceId(metricsLastId));
+    }
+    await setKV('metrics:last_log_id', nowCursor.maxId);
 
     if (prevCursor && prevCursor.maxId && prevCursor.maxId < nowCursor.maxId) {
       const rows = await fetchLogsSinceId(prevCursor.maxId);
-      await cacheUserAgents(rows);
+      await cacheLogMetrics(rows);
       if (todaySnapshotEnvelope && prevCursor.anchor === nowCursor.anchor && rows.length > 0 && todaySnapshotEnvelope.value) {
         const statData = await fetchStatData();
         latestSnapshot = mergeTodaySnapshot(todaySnapshotEnvelope.value, rows.filter(r => r.created_at >= startOfDayUnix));

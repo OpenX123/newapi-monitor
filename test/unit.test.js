@@ -197,8 +197,12 @@ function testUsageSemantics() {
   check('客户端识别覆盖常见四类', ['Claude', 'Codex', 'OpenCode', 'Trae'].every(client => src.includes(client)));
   check('客户端优先读取真实 User-Agent，Trace 仅作兜底', /CLIENT_USER_AGENT_EXPR/.test(src) && /'user_agent'/.test(src) && /CLIENT_SIGNAL_EXPR/.test(src));
   check('Token 排行按用量、次数、IP 排列且 UA 紧邻分析', /key: 'total_tokens'[\s\S]*key: 'count'[\s\S]*key: 'ip_count'[\s\S]*key: 'user_agents'[\s\S]*key: 'action'/.test(js) && /userAgentTags\(t\.user_agents\)/.test(js));
-  const extractUserAgent = eval(`(function(){ ${extract('function extractUserAgent(', '\nasync function cacheUserAgents(')} return extractUserAgent; })()`);
+  const extractUserAgent = eval(`(function(){ ${extract('function extractUserAgent(', '\nfunction extractTraceType(')} return extractUserAgent; })()`);
   equal('User-Agent 增量缓存保留转义字符', extractUserAgent('{"user_agent":"client \\\"quoted\\\""}'), 'client "quoted"');
+  check('7/30 天统计读取小时汇总并只直查今天', /FROM monitor_usage_rollups WHERE bucket_start >= \$1 AND bucket_start < \$2/.test(src) && /l\.created_at >= GREATEST\(\$1, \$2\)/.test(src));
+  check('脚本识别读取增量 trace 字段而非解析整列 JSON', /m\.trace_type = 'claude cli trace'/.test(src) && !/async function getScriptDisableCandidates[\s\S]{0,1800}other::jsonb/.test(src));
+  const { metrics } = require('../backfill-usage-rollups');
+  equal('增量指标识别 Trace 与缓存 Token', metrics('{"cache_tokens":600,"admin_info":{"channel_affinity":{"reason":"Claude CLI Trace"}}}'), { userAgent: '', cacheTokens: 600, traceType: 'claude cli trace' });
   const { parseAccessLine } = require('../backfill-user-agents');
   const access = parseAccessLine('42.48.83.151 - - [14/Aug/2026:09:13:54 +0800] "POST /v1/messages?beta=true HTTP/1.1" 200 1632 "-" "claude-cli/2.1.89 (external, cli)" "-"');
   check('访问日志能提取 IP、接口与完整 UA', access?.ip === '42.48.83.151' && access.path === '/v1/messages' && access.userAgent === 'claude-cli/2.1.89 (external, cli)');

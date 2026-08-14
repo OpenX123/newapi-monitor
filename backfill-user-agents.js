@@ -29,8 +29,8 @@ async function main() {
     INSERT INTO monitor_log_user_agents (log_id, user_agent, matched_delta_seconds, cache_tokens)
     SELECT l.id, SUBSTRING(l.other FROM '"user_agent":"([^"\\\\]*)"'), 0, COALESCE(NULLIF(SUBSTRING(l.other FROM '"cache_tokens":([0-9]+)'), '')::bigint, 0)
     FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
-    WHERE l.created_at >= $1 AND l.type = 2 AND l.other LIKE '%"user_agent"%' AND m.log_id IS NULL
-    ON CONFLICT (log_id) DO NOTHING
+    WHERE l.created_at >= $1 AND l.type = 2 AND l.other LIKE '%"user_agent"%' AND (m.log_id IS NULL OR m.user_agent = '')
+    ON CONFLICT (log_id) DO UPDATE SET user_agent = EXCLUDED.user_agent
   `, [since]) : { rowCount: 0 };
   if (apply) await pool.query(`
     UPDATE monitor_log_user_agents m
@@ -40,7 +40,7 @@ async function main() {
   const { rows: logs } = await pool.query(`
     SELECT l.id, l.created_at, l.ip, SUBSTRING(l.other FROM '"request_path":"([^"\\\\]*)"') AS request_path
     FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
-    WHERE l.created_at >= $1 AND l.type = 2 AND l.other NOT LIKE '%"user_agent"%' AND m.log_id IS NULL
+    WHERE l.created_at >= $1 AND l.type = 2 AND l.other NOT LIKE '%"user_agent"%' AND (m.log_id IS NULL OR m.user_agent = '')
     ORDER BY l.created_at
   `, [since]);
 
@@ -81,7 +81,7 @@ async function main() {
       params.push(...row);
       values.push(`($${offset + 1}, $${offset + 2}, $${offset + 3})`);
     }
-    await pool.query(`INSERT INTO monitor_log_user_agents (log_id, user_agent, matched_delta_seconds) VALUES ${values.join(',')} ON CONFLICT (log_id) DO NOTHING`, params);
+    await pool.query(`INSERT INTO monitor_log_user_agents (log_id, user_agent, matched_delta_seconds) VALUES ${values.join(',')} ON CONFLICT (log_id) DO UPDATE SET user_agent = EXCLUDED.user_agent, matched_delta_seconds = EXCLUDED.matched_delta_seconds`, params);
   }
   } finally {
     await pool.end();
