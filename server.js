@@ -929,6 +929,7 @@ async function fetchLogsSinceId(lastLogId, minCreatedAt = 0) {
     prompt_tokens: parseInt(r.prompt_tokens) || 0,
     completion_tokens: parseInt(r.completion_tokens) || 0,
     cache_tokens: extractCacheTokens(r.other),
+    user_agent: extractUserAgent(r.other),
   }));
 }
 
@@ -936,6 +937,25 @@ async function fetchLogsSinceId(lastLogId, minCreatedAt = 0) {
 function extractCacheTokens(other) {
   const m = /"cache_tokens":([0-9]+)/.exec(other || '');
   return m ? parseInt(m[1]) || 0 : 0;
+}
+
+function extractUserAgent(other) {
+  const m = /"user_agent":"((?:\\.|[^"\\])*)"/.exec(other || '');
+  if (!m) return '';
+  try { return JSON.parse(`"${m[1]}"`); } catch { return ''; }
+}
+
+async function cacheUserAgents(rows) {
+  const entries = rows.filter(row => row.type === 2 && row.user_agent).map(row => [row.id, row.user_agent]);
+  if (!entries.length) return;
+  const values = [];
+  const params = [];
+  for (const [id, userAgent] of entries) {
+    const offset = params.length;
+    params.push(id, userAgent);
+    values.push(`($${offset + 1}, $${offset + 2}, 0)`);
+  }
+  await pool.query(`INSERT INTO monitor_log_user_agents (log_id, user_agent, matched_delta_seconds) VALUES ${values.join(',')} ON CONFLICT (log_id) DO NOTHING`, params);
 }
 
 function upsertRecentLogs(existing, rows, limit = 100) {
@@ -1185,12 +1205,10 @@ async function getAggregation(range, dimension) {
   const rows = result.rows.map(parseUsageRow);
   if (dimension === 'token') {
     const uaRes = await pool.query(`
-      SELECT token_id, user_agent, COUNT(*) AS count FROM (
-        SELECT l.token_id, COALESCE(${USER_AGENT_EXPR}, m.user_agent) AS user_agent
-        FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
-        WHERE l.created_at >= $1 AND l.type = 2
-      ) matched WHERE user_agent IS NOT NULL
-      GROUP BY token_id, user_agent
+      SELECT l.token_id, m.user_agent, COUNT(*) AS count
+      FROM logs l JOIN monitor_log_user_agents m ON m.log_id = l.id
+      WHERE l.created_at >= $1 AND l.type = 2
+      GROUP BY l.token_id, m.user_agent
     `, [ts]);
     const byToken = new Map();
     for (const r of uaRes.rows) {
@@ -1694,9 +1712,10 @@ async function pollAndCheck() {
     const nowCursor = await getLatestLogCursor();
     const todaySnapshotEnvelope = await readCacheEnvelope('snapshot:today');
 
-    if (todaySnapshotEnvelope && prevCursor && prevCursor.maxId && prevCursor.anchor === nowCursor.anchor && prevCursor.maxId < nowCursor.maxId) {
-      const rows = await fetchLogsSinceId(prevCursor.maxId, startOfDayUnix);
-      if (rows.length > 0 && todaySnapshotEnvelope.value) {
+    if (prevCursor && prevCursor.maxId && prevCursor.maxId < nowCursor.maxId) {
+      const rows = await fetchLogsSinceId(prevCursor.maxId);
+      await cacheUserAgents(rows);
+      if (todaySnapshotEnvelope && prevCursor.anchor === nowCursor.anchor && rows.length > 0 && todaySnapshotEnvelope.value) {
         const statData = await fetchStatData();
         latestSnapshot = mergeTodaySnapshot(todaySnapshotEnvelope.value, rows.filter(r => r.created_at >= startOfDayUnix));
         latestSnapshot.time = Date.now();
@@ -2212,12 +2231,10 @@ app.get('/api/user-analysis', async (req, res) => {
     const models = modelRes.rows.map(parseUsageRow);
 
     const uaRes = await pool.query(`
-      SELECT user_agent, COUNT(*) AS count FROM (
-        SELECT COALESCE(${USER_AGENT_EXPR}, m.user_agent) AS user_agent
-        FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
-        WHERE l.${filterCol} = $1 AND l.created_at >= $2 AND l.type = 2
-      ) matched WHERE user_agent IS NOT NULL
-      GROUP BY user_agent ORDER BY count DESC
+      SELECT m.user_agent, COUNT(*) AS count
+      FROM logs l JOIN monitor_log_user_agents m ON m.log_id = l.id
+      WHERE l.${filterCol} = $1 AND l.created_at >= $2 AND l.type = 2
+      GROUP BY m.user_agent ORDER BY count DESC
     `, [filterVal, ts]);
     const uaCounts = new Map();
     for (const r of uaRes.rows) {

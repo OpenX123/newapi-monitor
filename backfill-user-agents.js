@@ -25,6 +25,13 @@ async function main() {
   const { Pool } = require('pg');
   const pool = new Pool({ connectionString: process.env.DATABASE_URL });
   try {
+  const direct = apply ? await pool.query(`
+    INSERT INTO monitor_log_user_agents (log_id, user_agent, matched_delta_seconds)
+    SELECT l.id, SUBSTRING(l.other FROM '"user_agent":"([^"\\\\]*)"'), 0
+    FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
+    WHERE l.created_at >= $1 AND l.type = 2 AND l.other LIKE '%"user_agent"%' AND m.log_id IS NULL
+    ON CONFLICT (log_id) DO NOTHING
+  `, [since]) : { rowCount: 0 };
   const { rows: logs } = await pool.query(`
     SELECT l.id, l.created_at, l.ip, SUBSTRING(l.other FROM '"request_path":"([^"\\\\]*)"') AS request_path
     FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
@@ -58,7 +65,7 @@ async function main() {
     matched.push([String(log.id), best.entry.userAgent, best.delta]);
   }
 
-  console.log(JSON.stringify({ hours, missing: logs.length, matched: matched.length, coverage: logs.length ? +(matched.length * 100 / logs.length).toFixed(1) : 100, apply }));
+  console.log(JSON.stringify({ hours, direct: direct.rowCount, missing: logs.length, matched: matched.length, coverage: logs.length ? +(matched.length * 100 / logs.length).toFixed(1) : 100, apply }));
   if (!apply || matched.length === 0) return;
   for (let i = 0; i < matched.length; i += 500) {
     const chunk = matched.slice(i, i + 500);
