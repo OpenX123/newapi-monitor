@@ -2260,6 +2260,43 @@ app.get('/api/error-analysis', async (req, res) => {
   }
 });
 
+const USER_REQUEST_PAGE_SIZE = 3;
+
+async function getUserAnalysisRequests(filterCol, filterVal, ts, page = 1) {
+  const safePage = Math.min(10000, Math.max(1, parseInt(page) || 1));
+  const result = await pool.query(`
+    SELECT id, created_at, model_name, ip, request_id, COALESCE(other_json->>'user_agent', backfill_user_agent) AS user_agent,
+      COALESCE((${CLIENT_EXPR}), backfill_user_agent) AS client, other_json->'request_body' AS request_body
+    FROM (
+      SELECT l.id, l.created_at, l.model_name, l.ip, l.request_id, ${SAFE_OTHER_JSON_EXPR.replaceAll('other', 'l.other')} AS other_json,
+        m.user_agent AS backfill_user_agent
+      FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
+      WHERE l.${filterCol} = $1 AND l.created_at >= $2 AND l.type = 2
+      ORDER BY l.created_at DESC LIMIT $3 OFFSET $4
+    ) recent ORDER BY created_at DESC
+  `, [filterVal, ts, USER_REQUEST_PAGE_SIZE, (safePage - 1) * USER_REQUEST_PAGE_SIZE]);
+  return result.rows.map(r => ({
+    ...r,
+    id: String(r.id),
+    created_at: parseInt(r.created_at) || 0,
+  }));
+}
+
+app.get('/api/user-analysis/requests', async (req, res) => {
+  const { username, token_id, range, page } = req.query;
+  if (!username && !token_id) return res.json({ success: false, message: '缺少 username 或 token_id' });
+  const filterCol = username ? 'username' : 'token_id';
+  const filterVal = username ? username : parseInt(token_id);
+  const safePage = Math.min(10000, Math.max(1, parseInt(page) || 1));
+  try {
+    const items = await getUserAnalysisRequests(filterCol, filterVal, getRangeTs(range || 'today'), safePage);
+    res.json({ success: true, data: { items, page: safePage, pageSize: USER_REQUEST_PAGE_SIZE } });
+  } catch (err) {
+    console.error('请求明细查询错误:', err.message);
+    res.json({ success: false, message: err.message });
+  }
+});
+
 app.get('/api/user-analysis', async (req, res) => {
   const { username, token_id, token_name, range } = req.query;
   if (!username && !token_id) return res.json({ success: false, message: '缺少 username 或 token_id' });
@@ -2271,7 +2308,7 @@ app.get('/api/user-analysis', async (req, res) => {
   try {
     // 1. 基本统计
     const basicRes = await pool.query(`
-      SELECT COUNT(*) as total_calls, COUNT(DISTINCT token_id) as token_count,
+      SELECT COUNT(*) as total_calls, COUNT(*) FILTER (WHERE type = 2) as request_count, COUNT(DISTINCT token_id) as token_count,
         COUNT(DISTINCT model_name) as model_count, user_id,
         COUNT(DISTINCT NULLIF(ip, '')) as ip_count,
         ARRAY_REMOVE(ARRAY_AGG(DISTINCT NULLIF(ip, '')), NULL) as ips,
@@ -2285,6 +2322,7 @@ app.get('/api/user-analysis', async (req, res) => {
     if (basicRes.rows.length === 0) return res.json({ success: true, data: null });
     const basic = basicRes.rows[0];
     basic.total_calls = parseInt(basic.total_calls);
+    basic.request_count = parseInt(basic.request_count) || 0;
     basic.total_quota = parseInt(basic.total_quota) || 0;
     basic.total_prompt = parseInt(basic.total_prompt) || 0;
     basic.total_completion = parseInt(basic.total_completion) || 0;
@@ -2366,22 +2404,7 @@ app.get('/api/user-analysis', async (req, res) => {
     const userAgents = [...uaCounts].map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count);
 
     // 5. 最近请求明细（请求体从网关审计副本读取，历史日志可能没有）
-    const recentRequestsRes = await pool.query(`
-      SELECT id, created_at, model_name, ip, request_id, COALESCE(other_json->>'user_agent', backfill_user_agent) AS user_agent,
-        COALESCE((${CLIENT_EXPR}), backfill_user_agent) AS client, other_json->'request_body' AS request_body
-      FROM (
-        SELECT l.id, l.created_at, l.model_name, l.ip, l.request_id, ${SAFE_OTHER_JSON_EXPR.replaceAll('other', 'l.other')} AS other_json,
-          m.user_agent AS backfill_user_agent
-        FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
-        WHERE l.${filterCol} = $1 AND l.created_at >= $2 AND l.type = 2
-        ORDER BY l.created_at DESC LIMIT 20
-      ) recent ORDER BY created_at DESC
-    `, [filterVal, ts]);
-    const recentRequests = recentRequestsRes.rows.map(r => ({
-      ...r,
-      id: String(r.id),
-      created_at: parseInt(r.created_at) || 0,
-    }));
+    const recentRequests = await getUserAnalysisRequests(filterCol, filterVal, ts);
 
     // 6. 并发检测
     const concurRes = await pool.query(`
@@ -2522,7 +2545,8 @@ app.get('/api/user-analysis', async (req, res) => {
     res.json({ success: true, data: {
       username: username || token_name || token_id, basic, ips, hourly, intervals, intervalTimeline,
       models, userAgents,
-      recentRequests, concurrentPoints, streaks, sessions, weekday,
+      recentRequests, recentRequestsPage: { page: 1, pageSize: USER_REQUEST_PAGE_SIZE, total: basic.request_count },
+      concurrentPoints, streaks, sessions, weekday,
       nightCalls, nightPct: +(nightPct * 100).toFixed(1),
       activeHours, nightActiveHours, dayActiveHours, density,
       scriptSignals,

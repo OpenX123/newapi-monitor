@@ -1163,6 +1163,39 @@ analysisModal.addEventListener('click', e => { if (e.target === analysisModal) a
 
 let analysisCharts = [];
 function destroyAnalysisCharts() { analysisCharts.forEach(c => c.destroy()); analysisCharts = []; }
+let analysisRequestQuery = '';
+let analysisRequestTotal = 0;
+
+function renderAnalysisRequests(items, page, pageSize, total) {
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const requests = (items || []).map((req, index) => {
+    const body = req.request_body == null ? '该历史请求未记录请求体' : typeof req.request_body === 'string' ? req.request_body : JSON.stringify(req.request_body, null, 2);
+    return `<details class="request-item" ${index === 0 ? 'open' : ''}>
+      <summary><strong>${formatTime(req.created_at)}</strong><span class="request-ip">${escapeHtml(req.ip || 'IP 未记录')}</span><span>${escapeHtml(req.client || '客户端未知')}</span><span>${escapeHtml(req.model_name || '-')}</span></summary>
+      <div class="request-meta">请求 ID：${escapeHtml(req.request_id || '-')} · 日志 ID：${escapeHtml(req.id || '-')}<br>User-Agent：${escapeHtml(req.user_agent || '-')}</div>
+      <pre class="request-body">${escapeHtml(body)}</pre>
+    </details>`;
+  }).join('') || '<div class="dim">暂无请求</div>';
+  return `<div class="request-list">${requests}</div>
+    <div class="pagination">
+      <button class="page-btn" onclick="loadAnalysisRequests(${page - 1})" ${page <= 1 ? 'disabled' : ''}>上一页</button>
+      <span class="page-info">第 ${total ? page : 0} / ${totalPages} 页 · 共 ${total} 条</span>
+      <button class="page-btn" onclick="loadAnalysisRequests(${page + 1})" ${page >= totalPages ? 'disabled' : ''}>下一页</button>
+    </div>`;
+}
+
+async function loadAnalysisRequests(page) {
+  const el = document.querySelector('#analysisRequests');
+  if (!el || !analysisRequestQuery) return;
+  el.innerHTML = '<div class="loading">正在加载请求明细...</div>';
+  try {
+    const res = await api(`/api/user-analysis/requests?${analysisRequestQuery}&page=${page}`);
+    if (!res.success || !res.data) throw new Error(res.message || '未知错误');
+    el.innerHTML = renderAnalysisRequests(res.data.items, res.data.page, res.data.pageSize, analysisRequestTotal);
+  } catch (err) {
+    el.innerHTML = `<div class="loading">请求明细加载失败：${escapeHtml(err.message)}</div>`;
+  }
+}
 
 async function analyzeItem(type, value, displayName) {
   document.getElementById('modalTitle').textContent = `${type === 'user' ? '用户' : 'Token'}分析：${displayName}`;
@@ -1177,6 +1210,8 @@ async function analyzeItem(type, value, displayName) {
     return;
   }
   const d = res.data;
+  analysisRequestQuery = `${query}&range=${encodeURIComponent(currentRange)}`;
+  analysisRequestTotal = d.recentRequestsPage?.total || 0;
   const b = d.basic;
   const cacheHitPct = b.total_cache > 0
     ? b.total_cache / (b.total_prompt + b.total_cache) * 100
@@ -1289,14 +1324,7 @@ async function analyzeItem(type, value, displayName) {
 
   html += `<div class="analysis-card full">
     <h4>🧾 最近请求明细</h4>
-    <div class="request-list">${(d.recentRequests || []).map((req, index) => {
-      const body = req.request_body == null ? '该历史请求未记录请求体' : typeof req.request_body === 'string' ? req.request_body : JSON.stringify(req.request_body, null, 2);
-      return `<details class="request-item" ${index === 0 ? 'open' : ''}>
-        <summary><strong>${formatTime(req.created_at)}</strong><span class="request-ip">${escapeHtml(req.ip || 'IP 未记录')}</span><span>${escapeHtml(req.client || '客户端未知')}</span><span>${escapeHtml(req.model_name || '-')}</span></summary>
-        <div class="request-meta">请求 ID：${escapeHtml(req.request_id || '-')} · 日志 ID：${escapeHtml(req.id || '-')}<br>User-Agent：${escapeHtml(req.user_agent || '-')}</div>
-        <pre class="request-body">${escapeHtml(body)}</pre>
-      </details>`;
-    }).join('') || '<div class="dim">暂无请求</div>'}</div>
+    <div id="analysisRequests">${renderAnalysisRequests(d.recentRequests, d.recentRequestsPage?.page || 1, d.recentRequestsPage?.pageSize || 3, analysisRequestTotal)}</div>
   </div>`;
 
   // === Chart.js 图表区 ===
