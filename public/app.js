@@ -81,13 +81,13 @@ const COLUMNS = {
   token: [
     { key: '#', label: '#', sortable: false },
     { key: 'token_name', label: 'Token', sortable: true },
-    { key: 'username', label: '用户', sortable: true },
-    { key: 'ip_count', label: 'IP 数量', sortable: true },
-    { key: 'user_agents', label: '完整 User-Agent 请求头', sortable: false },
-    { key: 'count', label: '调用次数', sortable: true },
     { key: 'total_tokens', label: 'Token 用量', sortable: true },
+    { key: 'count', label: '调用次数', sortable: true },
+    { key: 'ip_count', label: 'IP 数量', sortable: true },
+    { key: 'username', label: '用户', sortable: true },
     { key: 'quota', label: '费用', sortable: true },
     { key: 'models', label: '模型分布', sortable: false },
+    { key: 'user_agents', label: '完整 User-Agent 请求头', sortable: false },
     { key: 'action', label: '操作', sortable: false },
   ],
   user: [
@@ -271,13 +271,13 @@ function renderTokenRow(t, i, limit) {
     <tr class="${overLimit && !isWl ? 'over-limit' : ''}">
       <td>${i+1}</td>
       <td><strong>${t.token_name || '-'}</strong><br><span class="dim">ID: ${t.token_id}</span></td>
-      <td>${t.username}${isWl ? ' <span class="wl-badge"><svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>' : ''}</td>
-      <td>${t.ip_count || 0}</td>
-      <td class="user-agent-cell"><div class="model-tags">${userAgentTags(t.user_agents)}</div></td>
-      <td><div class="count-bar"><span>${t.count}</span><div class="count-bar-bg"><div class="count-bar-fill ${overLimit?'danger':''}" style="width:${pct}%"></div></div></div></td>
       ${tokenUsageCell(t)}
+      <td><div class="count-bar"><span>${t.count}</span><div class="count-bar-bg"><div class="count-bar-fill ${overLimit?'danger':''}" style="width:${pct}%"></div></div></div></td>
+      <td>${t.ip_count || 0}</td>
+      <td>${t.username}${isWl ? ' <span class="wl-badge"><svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>' : ''}</td>
       <td>${formatUSD(t.quota)}</td>
       <td><div class="model-tags">${models}</div></td>
+      <td class="user-agent-cell"><div class="model-tags">${userAgentTags(t.user_agents)}</div></td>
       <td>
         <button class="btn-analyze" onclick="analyzeItem('token', ${t.token_id}, '${(t.token_name || t.token_id).toString().replace(/'/g, "\\'")}')">分析</button>
       </td>

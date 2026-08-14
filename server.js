@@ -328,6 +328,13 @@ async function initDB() {
       key TEXT PRIMARY KEY,
       value TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS monitor_log_user_agents (
+      log_id BIGINT PRIMARY KEY,
+      user_agent TEXT NOT NULL,
+      matched_delta_seconds INTEGER NOT NULL,
+      created_at INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())::INTEGER
+    );
   `);
   await pool.query('ALTER TABLE monitor_actions ADD COLUMN IF NOT EXISTS action_meta JSONB');
   // 告警冷却查询（按 action + subject + 时间）每分钟对每个活跃 Token 执行一次，没有索引会全表扫
@@ -397,7 +404,7 @@ async function loadSavedConfig() {
 
 // ==================== Redis 缓存 ====================
 // 聚合结果结构变化时递增，避免升级后读到旧口径的缓存（v9：展示完整 User-Agent）
-const CACHE_SCHEMA_VERSION = 'v9';
+const CACHE_SCHEMA_VERSION = 'v10';
 function cacheKey(key) {
   return `${CONFIG.redisKeyPrefix}:${CACHE_SCHEMA_VERSION}:${key}`;
 }
@@ -1178,9 +1185,11 @@ async function getAggregation(range, dimension) {
   const rows = result.rows.map(parseUsageRow);
   if (dimension === 'token') {
     const uaRes = await pool.query(`
-      SELECT token_id, ${USER_AGENT_EXPR} AS user_agent, COUNT(*) AS count
-      FROM logs
-      WHERE created_at >= $1 AND type = 2 AND other LIKE '%"user_agent"%'
+      SELECT token_id, user_agent, COUNT(*) AS count FROM (
+        SELECT l.token_id, COALESCE(${USER_AGENT_EXPR}, m.user_agent) AS user_agent
+        FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
+        WHERE l.created_at >= $1 AND l.type = 2
+      ) matched WHERE user_agent IS NOT NULL
       GROUP BY token_id, user_agent
     `, [ts]);
     const byToken = new Map();
@@ -2203,8 +2212,11 @@ app.get('/api/user-analysis', async (req, res) => {
     const models = modelRes.rows.map(parseUsageRow);
 
     const uaRes = await pool.query(`
-      SELECT ${USER_AGENT_EXPR} AS user_agent, COUNT(*) AS count
-      FROM logs WHERE ${filterCol} = $1 AND created_at >= $2 AND type = 2 AND other LIKE '%"user_agent"%'
+      SELECT user_agent, COUNT(*) AS count FROM (
+        SELECT COALESCE(${USER_AGENT_EXPR}, m.user_agent) AS user_agent
+        FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
+        WHERE l.${filterCol} = $1 AND l.created_at >= $2 AND l.type = 2
+      ) matched WHERE user_agent IS NOT NULL
       GROUP BY user_agent ORDER BY count DESC
     `, [filterVal, ts]);
     const uaCounts = new Map();
@@ -2216,12 +2228,14 @@ app.get('/api/user-analysis', async (req, res) => {
 
     // 5. 最近请求明细（请求体从网关审计副本读取，历史日志可能没有）
     const recentRequestsRes = await pool.query(`
-      SELECT id, created_at, model_name, ip, request_id, other_json->>'user_agent' AS user_agent,
-        (${CLIENT_EXPR}) AS client, other_json->'request_body' AS request_body
+      SELECT id, created_at, model_name, ip, request_id, COALESCE(other_json->>'user_agent', backfill_user_agent) AS user_agent,
+        COALESCE((${CLIENT_EXPR}), backfill_user_agent) AS client, other_json->'request_body' AS request_body
       FROM (
-        SELECT id, created_at, model_name, ip, request_id, ${SAFE_OTHER_JSON_EXPR} AS other_json
-        FROM logs WHERE ${filterCol} = $1 AND created_at >= $2 AND type = 2
-        ORDER BY created_at DESC LIMIT 20
+        SELECT l.id, l.created_at, l.model_name, l.ip, l.request_id, ${SAFE_OTHER_JSON_EXPR.replaceAll('other', 'l.other')} AS other_json,
+          m.user_agent AS backfill_user_agent
+        FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
+        WHERE l.${filterCol} = $1 AND l.created_at >= $2 AND l.type = 2
+        ORDER BY l.created_at DESC LIMIT 20
       ) recent ORDER BY created_at DESC
     `, [filterVal, ts]);
     const recentRequests = recentRequestsRes.rows.map(r => ({

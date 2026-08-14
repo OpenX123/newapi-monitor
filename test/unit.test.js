@@ -196,7 +196,10 @@ function testUsageSemantics() {
   check('Token 聚合返回 IP 和完整 UA 次数', /ip_count/.test(src) && /user_agents/.test(src) && !/ua_match_rate/.test(src));
   check('客户端识别覆盖常见四类', ['Claude', 'Codex', 'OpenCode', 'Trae'].every(client => src.includes(client)));
   check('客户端优先读取真实 User-Agent，Trace 仅作兜底', /CLIENT_USER_AGENT_EXPR/.test(src) && /'user_agent'/.test(src) && /CLIENT_SIGNAL_EXPR/.test(src));
-  check('Token 排行展示 IP 和完整 User-Agent', /label: 'IP 数量'/.test(js) && /label: '完整 User-Agent 请求头'/.test(js) && !/label: 'UA 匹配率'/.test(js) && /userAgentTags\(t\.user_agents\)/.test(js));
+  check('Token 排行按用量、次数、IP 排列且 UA 紧邻分析', /key: 'total_tokens'[\s\S]*key: 'count'[\s\S]*key: 'ip_count'[\s\S]*key: 'user_agents'[\s\S]*key: 'action'/.test(js) && /userAgentTags\(t\.user_agents\)/.test(js));
+  const { parseAccessLine } = require('../backfill-user-agents');
+  const access = parseAccessLine('42.48.83.151 - - [14/Aug/2026:09:13:54 +0800] "POST /v1/messages?beta=true HTTP/1.1" 200 1632 "-" "claude-cli/2.1.89 (external, cli)" "-"');
+  check('访问日志能提取 IP、接口与完整 UA', access?.ip === '42.48.83.151' && access.path === '/v1/messages' && access.userAgent === 'claude-cli/2.1.89 (external, cli)');
 }
 
 (async () => {
