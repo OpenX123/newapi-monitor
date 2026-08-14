@@ -26,12 +26,17 @@ async function main() {
   const pool = new Pool({ connectionString: process.env.DATABASE_URL });
   try {
   const direct = apply ? await pool.query(`
-    INSERT INTO monitor_log_user_agents (log_id, user_agent, matched_delta_seconds)
-    SELECT l.id, SUBSTRING(l.other FROM '"user_agent":"([^"\\\\]*)"'), 0
+    INSERT INTO monitor_log_user_agents (log_id, user_agent, matched_delta_seconds, cache_tokens)
+    SELECT l.id, SUBSTRING(l.other FROM '"user_agent":"([^"\\\\]*)"'), 0, COALESCE(NULLIF(SUBSTRING(l.other FROM '"cache_tokens":([0-9]+)'), '')::bigint, 0)
     FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
     WHERE l.created_at >= $1 AND l.type = 2 AND l.other LIKE '%"user_agent"%' AND m.log_id IS NULL
     ON CONFLICT (log_id) DO NOTHING
   `, [since]) : { rowCount: 0 };
+  if (apply) await pool.query(`
+    UPDATE monitor_log_user_agents m
+    SET cache_tokens = COALESCE(NULLIF(SUBSTRING(l.other FROM '"cache_tokens":([0-9]+)'), '')::bigint, 0)
+    FROM logs l WHERE l.id = m.log_id AND l.created_at >= $1 AND l.type = 2
+  `, [since]);
   const { rows: logs } = await pool.query(`
     SELECT l.id, l.created_at, l.ip, SUBSTRING(l.other FROM '"request_path":"([^"\\\\]*)"') AS request_path
     FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id

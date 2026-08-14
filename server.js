@@ -333,9 +333,11 @@ async function initDB() {
       log_id BIGINT PRIMARY KEY,
       user_agent TEXT NOT NULL,
       matched_delta_seconds INTEGER NOT NULL,
+      cache_tokens BIGINT NOT NULL DEFAULT 0,
       created_at INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())::INTEGER
     );
   `);
+  await pool.query('ALTER TABLE monitor_log_user_agents ADD COLUMN IF NOT EXISTS cache_tokens BIGINT NOT NULL DEFAULT 0');
   await pool.query('ALTER TABLE monitor_actions ADD COLUMN IF NOT EXISTS action_meta JSONB');
   // 告警冷却查询（按 action + subject + 时间）每分钟对每个活跃 Token 执行一次，没有索引会全表扫
   await pool.query(`
@@ -946,16 +948,16 @@ function extractUserAgent(other) {
 }
 
 async function cacheUserAgents(rows) {
-  const entries = rows.filter(row => row.type === 2 && row.user_agent).map(row => [row.id, row.user_agent]);
+  const entries = rows.filter(row => row.type === 2 && row.user_agent).map(row => [row.id, row.user_agent, row.cache_tokens]);
   if (!entries.length) return;
   const values = [];
   const params = [];
-  for (const [id, userAgent] of entries) {
+  for (const [id, userAgent, cacheTokens] of entries) {
     const offset = params.length;
-    params.push(id, userAgent);
-    values.push(`($${offset + 1}, $${offset + 2}, 0)`);
+    params.push(id, userAgent, cacheTokens);
+    values.push(`($${offset + 1}, $${offset + 2}, 0, $${offset + 3})`);
   }
-  await pool.query(`INSERT INTO monitor_log_user_agents (log_id, user_agent, matched_delta_seconds) VALUES ${values.join(',')} ON CONFLICT (log_id) DO NOTHING`, params);
+  await pool.query(`INSERT INTO monitor_log_user_agents (log_id, user_agent, matched_delta_seconds, cache_tokens) VALUES ${values.join(',')} ON CONFLICT (log_id) DO UPDATE SET cache_tokens = EXCLUDED.cache_tokens`, params);
 }
 
 function upsertRecentLogs(existing, rows, limit = 100) {
@@ -1195,11 +1197,12 @@ async function getAggregation(range, dimension) {
     ip: { group: "COALESCE(NULLIF(ip, ''), '(未记录)')", select: "COALESCE(NULLIF(ip, ''), '(未记录)') as ip, COUNT(DISTINCT username) as user_count, COUNT(DISTINCT token_id) as token_count, MIN(created_at) as first_at, MAX(created_at) as last_at" },
   };
   const d = dims[dimension] || dims.token;
-  const source = `SELECT * FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS}`;
+  const source = `SELECT l.token_id, l.token_name, l.username, l.user_id, l.ip, l.model_name, l."group", l.channel_id, l.channel_name, l.type, l.quota, l.prompt_tokens, l.completion_tokens, COALESCE(m.cache_tokens, 0) AS monitor_cache_tokens FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id WHERE l.created_at >= $1 AND ${REQUEST_LOGS}`;
   const select = d.select;
+  const usageAgg = USAGE_AGG.replaceAll(CACHE_TOKENS_EXPR, 'monitor_cache_tokens');
   const result = await pool.query(`
     WITH source AS MATERIALIZED (${source})
-    SELECT ${select}, ${USAGE_AGG}
+    SELECT ${select}, ${usageAgg}
     FROM source GROUP BY ${d.group} ORDER BY count DESC
   `, [ts]);
   const rows = result.rows.map(parseUsageRow);
