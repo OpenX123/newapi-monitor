@@ -434,7 +434,7 @@ async function loadSavedConfig() {
 
 // ==================== Redis 缓存 ====================
 // 聚合结果结构变化时递增，避免升级后读到旧口径的缓存（v9：展示完整 User-Agent）
-const CACHE_SCHEMA_VERSION = 'v10';
+const CACHE_SCHEMA_VERSION = 'v11';
 function cacheKey(key) {
   return `${CONFIG.redisKeyPrefix}:${CACHE_SCHEMA_VERSION}:${key}`;
 }
@@ -879,10 +879,8 @@ async function getOrBuildCached(key, range, builder, ttlSeconds = CONFIG.cacheTt
 //   调用次数 → 真实 API 请求（成功 2 + 失败 5）
 //   费用 / token → 仅消费日志（2）
 const REQUEST_LOGS = 'type IN (2, 5)';
-// logs.prompt_tokens 已经包含缓存读取 token（已用真实计费公式核对：
-// quota = ((prompt - cache) * model_ratio + cache * model_ratio * cache_ratio
-//          + completion * model_ratio * completion_ratio) * group_ratio），
-// 面板按运营口径逐条请求计入 60% 缓存读取：prompt + completion + cache * 0.6。
+// OpenAI 口径：prompt/input tokens 已包含 cached tokens；缓存只是输入的拆分项。
+// 因此总 Token = prompt + completion，不能再次叠加缓存读取。
 // 缓存 token 用正则从 other 文本里取，避免 other 非法 JSON 或非整数值导致整条聚合报错。
 const CACHE_TOKENS_EXPR = `COALESCE(NULLIF(SUBSTRING(other FROM '"cache_tokens":([0-9]+)'), '')::bigint, 0)`;
 const USER_AGENT_EXPR = `NULLIF(SUBSTRING(other FROM '"user_agent":"([^"\\\\]*)"'), '')`;
@@ -923,7 +921,7 @@ const USAGE_AGG = `COUNT(*) as count,
       SUM(quota) FILTER (WHERE type = 2) as quota,
       SUM(prompt_tokens) FILTER (WHERE type = 2) as prompt_tokens,
       SUM(completion_tokens) FILTER (WHERE type = 2) as completion_tokens,
-      SUM(COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0) + (${CACHE_TOKENS_EXPR} * 0.6)) FILTER (WHERE type = 2) as total_tokens,
+      SUM(COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0)) FILTER (WHERE type = 2) as total_tokens,
       SUM(${CACHE_TOKENS_EXPR}) FILTER (WHERE type = 2) as cache_tokens`;
 
 function parseUsageRow(r) {
@@ -1048,7 +1046,7 @@ function mergeTodaySnapshot(snapshot, rows) {
       token.quota += row.quota || 0;
       token.prompt_tokens += row.prompt_tokens || 0;
       token.completion_tokens += row.completion_tokens || 0;
-      token.total_tokens += (row.prompt_tokens || 0) + (row.completion_tokens || 0) + (row.cache_tokens || 0) * 0.6;
+      token.total_tokens += (row.prompt_tokens || 0) + (row.completion_tokens || 0);
       token.cache_tokens += row.cache_tokens || 0;
     }
     if (row.model_name) token.models[row.model_name] = (token.models[row.model_name] || 0) + 1;
@@ -1082,7 +1080,7 @@ async function getTodayAggregation() {
       SUM(l.quota) FILTER (WHERE l.type = 2) as quota,
       SUM(l.prompt_tokens) FILTER (WHERE l.type = 2) as prompt_tokens,
       SUM(l.completion_tokens) FILTER (WHERE l.type = 2) as completion_tokens,
-      SUM(COALESCE(l.prompt_tokens, 0) + COALESCE(l.completion_tokens, 0) + COALESCE(m.cache_tokens, 0) * 0.6) FILTER (WHERE l.type = 2) as total_tokens,
+      SUM(COALESCE(l.prompt_tokens, 0) + COALESCE(l.completion_tokens, 0)) FILTER (WHERE l.type = 2) as total_tokens,
       SUM(COALESCE(m.cache_tokens, 0)) FILTER (WHERE l.type = 2) as cache_tokens
     FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
     WHERE l.created_at >= $1 AND l.${REQUEST_LOGS}
@@ -1235,7 +1233,7 @@ function getUsageSource(range) {
         CASE WHEN l.type = 2 THEN COALESCE(l.quota, 0) ELSE 0 END,
         CASE WHEN l.type = 2 THEN COALESCE(l.prompt_tokens, 0) ELSE 0 END,
         CASE WHEN l.type = 2 THEN COALESCE(l.completion_tokens, 0) ELSE 0 END,
-        CASE WHEN l.type = 2 THEN COALESCE(l.prompt_tokens, 0) + COALESCE(l.completion_tokens, 0) + COALESCE(m.cache_tokens, 0) * 0.6 ELSE 0 END,
+        CASE WHEN l.type = 2 THEN COALESCE(l.prompt_tokens, 0) + COALESCE(l.completion_tokens, 0) ELSE 0 END,
         CASE WHEN l.type = 2 THEN COALESCE(m.cache_tokens, 0) ELSE 0 END,
         l.created_at, l.created_at
       FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
@@ -1261,7 +1259,7 @@ async function buildUsageRollupDay(dayStart) {
       COALESCE(SUM(l.quota) FILTER (WHERE l.type = 2), 0),
       COALESCE(SUM(l.prompt_tokens) FILTER (WHERE l.type = 2), 0),
       COALESCE(SUM(l.completion_tokens) FILTER (WHERE l.type = 2), 0),
-      COALESCE(SUM(COALESCE(l.prompt_tokens, 0) + COALESCE(l.completion_tokens, 0) + COALESCE(m.cache_tokens, 0) * 0.6) FILTER (WHERE l.type = 2), 0),
+      COALESCE(SUM(COALESCE(l.prompt_tokens, 0) + COALESCE(l.completion_tokens, 0)) FILTER (WHERE l.type = 2), 0),
       COALESCE(SUM(m.cache_tokens) FILTER (WHERE l.type = 2), 0), MIN(l.created_at), MAX(l.created_at)
     FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
     WHERE l.created_at >= $1 AND l.created_at < $2 AND l.${REQUEST_LOGS}
@@ -2062,7 +2060,7 @@ async function runRealtimeRules() {
         COUNT(*) FILTER (WHERE created_at >= $1) AS cur_calls,
         COUNT(*) FILTER (WHERE created_at <  $1) AS prev_calls,
         COALESCE(SUM(quota) FILTER (WHERE created_at >= $1 AND type = 2), 0) AS cur_quota,
-        COALESCE(SUM(COALESCE(prompt_tokens,0) + COALESCE(completion_tokens,0) + (${CACHE_TOKENS_EXPR} * 0.6)) FILTER (WHERE created_at >= $1 AND type = 2), 0) AS cur_tokens,
+        COALESCE(SUM(COALESCE(prompt_tokens,0) + COALESCE(completion_tokens,0)) FILTER (WHERE created_at >= $1 AND type = 2), 0) AS cur_tokens,
         COUNT(DISTINCT ip) FILTER (WHERE created_at >= $1 AND COALESCE(ip, '') <> '') AS cur_ips
       FROM logs WHERE created_at >= $2 AND ${REQUEST_LOGS}
       GROUP BY token_id, token_name, username, user_id
@@ -2283,7 +2281,7 @@ app.get('/api/user-analysis', async (req, res) => {
     basic.ip_count = parseInt(basic.ip_count) || 0;
     const ips = Array.isArray(basic.ips) ? basic.ips : [];
     delete basic.ips;
-    basic.total_tokens = basic.total_prompt + basic.total_completion + basic.total_cache * 0.6;
+    basic.total_tokens = basic.total_prompt + basic.total_completion;
     const scriptTraceStats = await getScriptTraceStatsForFilter(filterCol, filterVal, ts);
     const autoDisableWindowStats = filterCol === 'token_id'
       ? await getScriptTraceStatsForFilter(filterCol, filterVal, Math.floor(Date.now() / 1000) - 86400)

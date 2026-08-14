@@ -118,9 +118,9 @@ function testFormatters() {
   equal('token 百万', formatTokens(1234567), '1.23M');
   equal('token 十亿', formatTokens(12345678901), '12.35B');
 
-  const cell = tokenUsageCell({ total_tokens: 1360, prompt_tokens: 900, completion_tokens: 100, cache_tokens: 600 });
+  const cell = tokenUsageCell({ total_tokens: 1000, prompt_tokens: 900, completion_tokens: 100, cache_tokens: 600 });
   check('有缓存时拆出「入 + 缓存」', cell.includes('缓存'), '');
-  check('缓存按 60% 重复计入总量', cell.includes('1,360'), '');
+  check('缓存不重复计入总量', cell.includes('1,000'), '');
   const noCache = tokenUsageCell({ total_tokens: 1000, prompt_tokens: 900, completion_tokens: 100, cache_tokens: 0 });
   check('无缓存时不显示缓存段', !noCache.includes('缓存'), '');
   check('User-Agent 次数渲染为标签', userAgentTags([{ name: 'undici', count: 202 }]).includes('undici ×202'));
@@ -181,7 +181,7 @@ function testUsageSemantics() {
   const js = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
   check('调用次数只统计真实请求（type 2/5）', /const REQUEST_LOGS = 'type IN \(2, 5\)'/.test(src));
   check('费用只对消费日志求和', /SUM\(quota\) FILTER \(WHERE type = 2\)/.test(src));
-  check('token 用量只对消费日志求和且缓存按 60% 计入', /SUM\(COALESCE\(prompt_tokens, 0\) \+ COALESCE\(completion_tokens, 0\) \+ \(\$\{CACHE_TOKENS_EXPR\} \* 0\.6\)\) FILTER \(WHERE type = 2\)/.test(src));
+  check('token 用量只对消费日志求和且缓存不重复计入', /SUM\(COALESCE\(prompt_tokens, 0\) \+ COALESCE\(completion_tokens, 0\)\) FILTER \(WHERE type = 2\)/.test(src));
   check('缓存 token 用正则提取而非 jsonb 强转', /SUBSTRING\(other FROM '"cache_tokens":\(\[0-9\]\+\)'\)/.test(src));
   check('报错分析不再把 other 整列传回 Node', !/SELECT id, created_at, type, content[\s\S]{0,200}channel_id, channel_name, other\s*\n\s*FROM logs/.test(src));
   check('报错明细有行数上限兜底', /LIMIT \$2/.test(src) && /ERROR_ROWS_LIMIT/.test(src));
