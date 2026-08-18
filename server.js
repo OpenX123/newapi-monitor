@@ -433,8 +433,8 @@ async function loadSavedConfig() {
 }
 
 // ==================== Redis 缓存 ====================
-// 聚合结果结构变化时递增，避免升级后读到旧口径的缓存（v14：GPT / Claude 输入拆分）
-const CACHE_SCHEMA_VERSION = 'v14';
+// 聚合结果结构变化时递增，避免升级后读到旧口径的缓存（v15：GPT / Claude 缓存明细）
+const CACHE_SCHEMA_VERSION = 'v15';
 function cacheKey(key) {
   return `${CONFIG.redisKeyPrefix}:${CACHE_SCHEMA_VERSION}:${key}`;
 }
@@ -894,6 +894,10 @@ const RAW_GPT_INPUT_TOKENS_EXPR = `CASE WHEN ${GPT_MODEL_EXPR} THEN ${RAW_INPUT_
 const RAW_CLAUDE_INPUT_TOKENS_EXPR = `CASE WHEN ${CLAUDE_MODEL_EXPR} THEN ${RAW_INPUT_TOKENS_EXPR} ELSE 0 END`;
 const ROLLUP_GPT_INPUT_TOKENS_EXPR = `CASE WHEN ${GPT_MODEL_EXPR} THEN ${ROLLUP_INPUT_TOKENS_EXPR} ELSE 0 END`;
 const ROLLUP_CLAUDE_INPUT_TOKENS_EXPR = `CASE WHEN ${CLAUDE_MODEL_EXPR} THEN ${ROLLUP_INPUT_TOKENS_EXPR} ELSE 0 END`;
+const RAW_GPT_CACHE_TOKENS_EXPR = `CASE WHEN ${GPT_MODEL_EXPR} THEN ${CACHE_TOKENS_EXPR} ELSE 0 END`;
+const RAW_CLAUDE_CACHE_TOKENS_EXPR = `CASE WHEN ${CLAUDE_MODEL_EXPR} THEN ${CACHE_TOKENS_EXPR} ELSE 0 END`;
+const ROLLUP_GPT_CACHE_TOKENS_EXPR = `CASE WHEN ${GPT_MODEL_EXPR} THEN COALESCE(cache_tokens, 0) ELSE 0 END`;
+const ROLLUP_CLAUDE_CACHE_TOKENS_EXPR = `CASE WHEN ${CLAUDE_MODEL_EXPR} THEN COALESCE(cache_tokens, 0) ELSE 0 END`;
 const GPT_CACHE_WEIGHTS = Object.freeze({ 'gpt-5.6-sol': 0.1, 'gpt-5.6-terra': 0.1, 'gpt-5.6-luna': 0.1 });
 function weightedInputTokens(promptTokens, cacheTokens, modelName) {
   const prompt = Math.max(0, Number(promptTokens) || 0);
@@ -943,7 +947,9 @@ const USAGE_AGG = `COUNT(*) as count,
       SUM(${CACHE_TOKENS_EXPR}) FILTER (WHERE type = 2) as cache_tokens,
       SUM(${RAW_INPUT_TOKENS_EXPR}) FILTER (WHERE type = 2) as input_tokens,
       SUM(${RAW_GPT_INPUT_TOKENS_EXPR}) FILTER (WHERE type = 2) as gpt_input_tokens,
-      SUM(${RAW_CLAUDE_INPUT_TOKENS_EXPR}) FILTER (WHERE type = 2) as claude_input_tokens`;
+      SUM(${RAW_CLAUDE_INPUT_TOKENS_EXPR}) FILTER (WHERE type = 2) as claude_input_tokens,
+      SUM(${RAW_GPT_CACHE_TOKENS_EXPR}) FILTER (WHERE type = 2) as gpt_cache_tokens,
+      SUM(${RAW_CLAUDE_CACHE_TOKENS_EXPR}) FILTER (WHERE type = 2) as claude_cache_tokens`;
 
 function parseUsageRow(r) {
   const row = {
@@ -959,6 +965,8 @@ function parseUsageRow(r) {
       : weightedInputTokens(r.prompt_tokens, r.cache_tokens, r.model_name),
     gpt_input_tokens: parseFloat(r.gpt_input_tokens) || 0,
     claude_input_tokens: parseFloat(r.claude_input_tokens) || 0,
+    gpt_cache_tokens: parseInt(r.gpt_cache_tokens) || 0,
+    claude_cache_tokens: parseInt(r.claude_cache_tokens) || 0,
     ip_count: parseInt(r.ip_count) || 0,
     clients: Array.isArray(r.clients) ? r.clients : [],
   };
@@ -1053,6 +1061,8 @@ function mergeTodaySnapshot(snapshot, rows) {
     input_tokens: parseFloat(t.input_tokens) || 0,
     gpt_input_tokens: parseFloat(t.gpt_input_tokens) || 0,
     claude_input_tokens: parseFloat(t.claude_input_tokens) || 0,
+    gpt_cache_tokens: parseInt(t.gpt_cache_tokens) || 0,
+    claude_cache_tokens: parseInt(t.claude_cache_tokens) || 0,
     models: t.models || {},
   }]));
 
@@ -1073,6 +1083,8 @@ function mergeTodaySnapshot(snapshot, rows) {
         input_tokens: 0,
         gpt_input_tokens: 0,
         claude_input_tokens: 0,
+        gpt_cache_tokens: 0,
+        claude_cache_tokens: 0,
         models: {},
       });
     }
@@ -1089,6 +1101,8 @@ function mergeTodaySnapshot(snapshot, rows) {
       token.input_tokens += familyInput;
       if (/(gpt|codex)/i.test(row.model_name || '')) token.gpt_input_tokens += familyInput;
       if (/claude/i.test(row.model_name || '')) token.claude_input_tokens += familyInput;
+      if (/(gpt|codex)/i.test(row.model_name || '')) token.gpt_cache_tokens += row.cache_tokens || 0;
+      if (/claude/i.test(row.model_name || '')) token.claude_cache_tokens += row.cache_tokens || 0;
     }
     if (row.model_name) token.models[row.model_name] = (token.models[row.model_name] || 0) + 1;
   }
@@ -1133,7 +1147,11 @@ async function getTodayAggregation() {
       SUM(CASE WHEN LOWER(COALESCE(l.model_name, '')) LIKE '%claude%' THEN
         GREATEST(COALESCE(l.prompt_tokens, 0) - COALESCE(m.cache_tokens, 0), 0)
           + COALESCE(m.cache_tokens, 0) * CASE WHEN LOWER(COALESCE(l.model_name, '')) IN ('gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna') THEN 0.1 ELSE 0.2 END
-        ELSE 0 END) FILTER (WHERE l.type = 2) as claude_input_tokens
+        ELSE 0 END) FILTER (WHERE l.type = 2) as claude_input_tokens,
+      SUM(CASE WHEN LOWER(COALESCE(l.model_name, '')) ~ '(gpt|codex)' THEN COALESCE(m.cache_tokens, 0) ELSE 0 END)
+        FILTER (WHERE l.type = 2) as gpt_cache_tokens,
+      SUM(CASE WHEN LOWER(COALESCE(l.model_name, '')) LIKE '%claude%' THEN COALESCE(m.cache_tokens, 0) ELSE 0 END)
+        FILTER (WHERE l.type = 2) as claude_cache_tokens
     FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
     WHERE l.created_at >= $1 AND l.${REQUEST_LOGS}
     GROUP BY l.token_id, l.token_name, l.username, l.user_id ORDER BY input_tokens DESC NULLS LAST
@@ -1268,7 +1286,9 @@ const ROLLUP_USAGE_AGG = `SUM(call_count) as count,
       SUM(cache_tokens) as cache_tokens,
       SUM(${ROLLUP_INPUT_TOKENS_EXPR}) as input_tokens,
       SUM(${ROLLUP_GPT_INPUT_TOKENS_EXPR}) as gpt_input_tokens,
-      SUM(${ROLLUP_CLAUDE_INPUT_TOKENS_EXPR}) as claude_input_tokens`;
+      SUM(${ROLLUP_CLAUDE_INPUT_TOKENS_EXPR}) as claude_input_tokens,
+      SUM(${ROLLUP_GPT_CACHE_TOKENS_EXPR}) as gpt_cache_tokens,
+      SUM(${ROLLUP_CLAUDE_CACHE_TOKENS_EXPR}) as claude_cache_tokens`;
 // 两个中转站的 gpt-5.6-sol 都实际落到 Terra；缓存写入按普通新输入计费。
 const TERRA_COST_AGG = `SUM(CASE WHEN model_name IN ('gpt-5.6-sol', 'gpt-5.6-terra') THEN
         (GREATEST(prompt_tokens - cache_tokens, 0) * 0.16 + cache_tokens * 0.016 + completion_tokens * 0.96) / 1000000.0

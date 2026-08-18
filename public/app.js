@@ -74,8 +74,17 @@ function tokenUsageCell(r) {
     <br><span class="dim">${detail}</span>
   </td>`;
 }
+function tokenFamilyCell(label, r, prefix, cacheWeight) {
+  const input = Number(r[`${prefix}_input_tokens`]) || 0;
+  const cache = Number(r[`${prefix}_cache_tokens`]) || 0;
+  const fresh = Math.max(0, input - cache * cacheWeight);
+  const detail = cache > 0
+    ? `新 ${formatTokens(fresh)} + 缓存 ${formatTokens(cache)} × ${cacheWeight * 100}%`
+    : '无缓存读取';
+  return `<td title="${label} 输入折算 ${input.toLocaleString()} tokens\n${detail}"><strong>${formatTokens(input)}</strong><br><span class="dim">${detail}</span></td>`;
+}
 function tokenFamilyCells(r) {
-  return `<td>${formatTokens(r.gpt_input_tokens || 0)}</td><td>${formatTokens(r.claude_input_tokens || 0)}</td>`;
+  return tokenFamilyCell('GPT', r, 'gpt', 0.1) + tokenFamilyCell('Claude', r, 'claude', 0.2);
 }
 function userAgentTags(userAgents) {
   const values = Array.isArray(userAgents) ? userAgents : [];
