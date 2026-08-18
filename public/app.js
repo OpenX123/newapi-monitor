@@ -74,6 +74,9 @@ function tokenUsageCell(r) {
     <br><span class="dim">${detail}</span>
   </td>`;
 }
+function tokenFamilyCells(r) {
+  return `<td>${formatTokens(r.gpt_input_tokens || 0)}</td><td>${formatTokens(r.claude_input_tokens || 0)}</td>`;
+}
 function userAgentTags(userAgents) {
   const values = Array.isArray(userAgents) ? userAgents : [];
   return values.length
@@ -93,6 +96,8 @@ const COLUMNS = {
     { key: '#', label: '#', sortable: false },
     { key: 'token_name', label: 'Token', sortable: true },
     { key: 'input_tokens', label: '输入 Token（折算）', sortable: true },
+    { key: 'gpt_input_tokens', label: 'GPT 输入', sortable: true },
+    { key: 'claude_input_tokens', label: 'Claude 输入', sortable: true },
     { key: 'count', label: '调用次数', sortable: true },
     { key: 'ip_count', label: 'IP 数量', sortable: true },
     { key: 'username', label: '用户', sortable: true },
@@ -287,6 +292,7 @@ function renderTokenRow(t, i, limit) {
       <td>${i+1}</td>
       <td><strong>${t.token_name || '-'}</strong><br><span class="dim">ID: ${t.token_id}</span></td>
       ${tokenUsageCell(t)}
+      ${tokenFamilyCells(t)}
       <td><div class="count-bar"><span>${t.count}</span><div class="count-bar-bg"><div class="count-bar-fill ${overLimit?'danger':''}" style="width:${pct}%"></div></div></div></td>
       <td>${t.ip_count || 0}</td>
       <td>${t.username}${isWl ? ' <span class="wl-badge"><svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>' : ''}</td>

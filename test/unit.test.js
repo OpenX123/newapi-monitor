@@ -106,8 +106,8 @@ function testFormatters() {
   const slice = app.slice(app.indexOf('function formatUSD'), app.indexOf('function formatNumber'));
   const config = { quotaPerUnit: 500000 };
   const escapeHtml = text => String(text).replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  const { formatUSD, formatUSDValue, formatTokens, weightedInputTokens, tokenUsageCell, userAgentTags } =
-    eval(`(function(){ ${slice} return { formatUSD, formatUSDValue, formatTokens, weightedInputTokens, tokenUsageCell, userAgentTags }; })()`);
+  const { formatUSD, formatUSDValue, formatTokens, weightedInputTokens, tokenUsageCell, tokenFamilyCells, userAgentTags } =
+    eval(`(function(){ ${slice} return { formatUSD, formatUSDValue, formatTokens, weightedInputTokens, tokenUsageCell, tokenFamilyCells, userAgentTags }; })()`);
 
   equal('0 额度显示 $0', formatUSD(0), '$0');
   equal('500000 quota = $1', formatUSD(500000), '$1.00');
@@ -124,6 +124,7 @@ function testFormatters() {
   const cell = tokenUsageCell({ total_tokens: 1000, prompt_tokens: 900, completion_tokens: 100, cache_tokens: 600 });
   check('有缓存时拆出「入 + 缓存」', cell.includes('缓存'), '');
   check('排序展示输入折算 Token', cell.includes('420'), '');
+  check('GPT 与 Claude 输入分栏', tokenFamilyCells({ gpt_input_tokens: 123, claude_input_tokens: 456 }).includes('123') && tokenFamilyCells({ gpt_input_tokens: 123, claude_input_tokens: 456 }).includes('456'));
   check('缓存不重复计入总量', cell.includes('1,000'), '');
   const noCache = tokenUsageCell({ total_tokens: 1000, prompt_tokens: 900, completion_tokens: 100, cache_tokens: 0 });
   check('无缓存时不显示缓存段', !noCache.includes('缓存'), '');
@@ -190,6 +191,7 @@ function testUsageSemantics() {
   check('Terra 成本区分新输入、缓存读取和输出', /GREATEST\(prompt_tokens - cache_tokens, 0\) \* 0\.16 \+ cache_tokens \* 0\.016 \+ completion_tokens \* 0\.96/.test(src));
   check('成本仅加入 Token 排行费用之后', /key: 'quota', label: '费用'[\s\S]{0,100}key: 'cost_usd', label: '成本'/.test(js));
   check('输入排行区分普通20%与 GPT官方缓存比', /input_tokens/.test(src) && /THEN 0\.1 ELSE 0\.2/.test(src) && /key: 'input_tokens'/.test(js));
+  check('Token 行拆出 GPT 与 Claude 输入', /gpt_input_tokens/.test(src) && /claude_input_tokens/.test(src) && /key: 'gpt_input_tokens'/.test(js) && /key: 'claude_input_tokens'/.test(js));
   check('缓存 token 用正则提取而非 jsonb 强转', /SUBSTRING\(other FROM '"cache_tokens":\(\[0-9\]\+\)'\)/.test(src));
   check('报错分析不再把 other 整列传回 Node', !/SELECT id, created_at, type, content[\s\S]{0,200}channel_id, channel_name, other\s*\n\s*FROM logs/.test(src));
   check('报错明细有行数上限兜底', /LIMIT \$2/.test(src) && /ERROR_ROWS_LIMIT/.test(src));
