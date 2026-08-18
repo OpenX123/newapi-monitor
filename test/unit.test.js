@@ -106,8 +106,8 @@ function testFormatters() {
   const slice = app.slice(app.indexOf('function formatUSD'), app.indexOf('function formatNumber'));
   const config = { quotaPerUnit: 500000 };
   const escapeHtml = text => String(text).replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  const { formatUSD, formatUSDValue, formatTokens, tokenUsageCell, userAgentTags } =
-    eval(`(function(){ ${slice} return { formatUSD, formatUSDValue, formatTokens, tokenUsageCell, userAgentTags }; })()`);
+  const { formatUSD, formatUSDValue, formatTokens, weightedInputTokens, tokenUsageCell, userAgentTags } =
+    eval(`(function(){ ${slice} return { formatUSD, formatUSDValue, formatTokens, weightedInputTokens, tokenUsageCell, userAgentTags }; })()`);
 
   equal('0 额度显示 $0', formatUSD(0), '$0');
   equal('500000 quota = $1', formatUSD(500000), '$1.00');
@@ -118,9 +118,12 @@ function testFormatters() {
   equal('token 千分位', formatTokens(1500), '1.5K');
   equal('token 百万', formatTokens(1234567), '1.23M');
   equal('token 十亿', formatTokens(12345678901), '12.35B');
+  equal('普通模型缓存按20%折算', weightedInputTokens({ prompt_tokens: 900, cache_tokens: 600 }), 420);
+  equal('GPT缓存按官方价格比10%折算', weightedInputTokens({ model_name: 'gpt-5.6-sol', prompt_tokens: 900, cache_tokens: 600 }), 360);
 
   const cell = tokenUsageCell({ total_tokens: 1000, prompt_tokens: 900, completion_tokens: 100, cache_tokens: 600 });
   check('有缓存时拆出「入 + 缓存」', cell.includes('缓存'), '');
+  check('排序展示输入折算 Token', cell.includes('420'), '');
   check('缓存不重复计入总量', cell.includes('1,000'), '');
   const noCache = tokenUsageCell({ total_tokens: 1000, prompt_tokens: 900, completion_tokens: 100, cache_tokens: 0 });
   check('无缓存时不显示缓存段', !noCache.includes('缓存'), '');
@@ -186,6 +189,7 @@ function testUsageSemantics() {
   check('Sol 别名与 Terra 原名使用同一成本', /model_name IN \('gpt-5\.6-sol', 'gpt-5\.6-terra'\)/.test(src));
   check('Terra 成本区分新输入、缓存读取和输出', /GREATEST\(prompt_tokens - cache_tokens, 0\) \* 0\.16 \+ cache_tokens \* 0\.016 \+ completion_tokens \* 0\.96/.test(src));
   check('成本仅加入 Token 排行费用之后', /key: 'quota', label: '费用'[\s\S]{0,100}key: 'cost_usd', label: '成本'/.test(js));
+  check('输入排行区分普通20%与 GPT官方缓存比', /input_tokens/.test(src) && /THEN 0\.1 ELSE 0\.2/.test(src) && /key: 'input_tokens'/.test(js));
   check('缓存 token 用正则提取而非 jsonb 强转', /SUBSTRING\(other FROM '"cache_tokens":\(\[0-9\]\+\)'\)/.test(src));
   check('报错分析不再把 other 整列传回 Node', !/SELECT id, created_at, type, content[\s\S]{0,200}channel_id, channel_name, other\s*\n\s*FROM logs/.test(src));
   check('报错明细有行数上限兜底', /LIMIT \$2/.test(src) && /ERROR_ROWS_LIMIT/.test(src));
@@ -201,7 +205,7 @@ function testUsageSemantics() {
   check('Token 聚合返回 IP 和完整 UA 次数', /ip_count/.test(src) && /user_agents/.test(src) && !/ua_match_rate/.test(src));
   check('客户端识别覆盖常见四类', ['Claude', 'Codex', 'OpenCode', 'Trae'].every(client => src.includes(client)));
   check('客户端优先读取真实 User-Agent，Trace 仅作兜底', /CLIENT_USER_AGENT_EXPR/.test(src) && /'user_agent'/.test(src) && /CLIENT_SIGNAL_EXPR/.test(src));
-  check('Token 排行按用量、次数、IP 排列且 UA 紧邻分析', /key: 'total_tokens'[\s\S]*key: 'count'[\s\S]*key: 'ip_count'[\s\S]*key: 'user_agents'[\s\S]*key: 'action'/.test(js) && /userAgentTags\(t\.user_agents\)/.test(js));
+  check('Token 排行按输入折算、次数、IP 排列且 UA 紧邻分析', /key: 'input_tokens'[\s\S]*key: 'count'[\s\S]*key: 'ip_count'[\s\S]*key: 'user_agents'[\s\S]*key: 'action'/.test(js) && /userAgentTags\(t\.user_agents\)/.test(js));
   const extractUserAgent = eval(`(function(){ ${extract('function extractUserAgent(', '\nfunction extractTraceType(')} return extractUserAgent; })()`);
   equal('User-Agent 增量缓存保留转义字符', extractUserAgent('{"user_agent":"client \\\"quoted\\\""}'), 'client "quoted"');
   check('7/30 天统计读取小时汇总并只直查今天', /FROM monitor_usage_rollups WHERE bucket_start >= \$1 AND bucket_start < \$2/.test(src) && /l\.created_at >= GREATEST\(\$1, \$2\)/.test(src));

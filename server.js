@@ -433,8 +433,8 @@ async function loadSavedConfig() {
 }
 
 // ==================== Redis 缓存 ====================
-// 聚合结果结构变化时递增，避免升级后读到旧口径的缓存（v9：展示完整 User-Agent）
-const CACHE_SCHEMA_VERSION = 'v12';
+// 聚合结果结构变化时递增，避免升级后读到旧口径的缓存（v13：输入 Token 折算）
+const CACHE_SCHEMA_VERSION = 'v13';
 function cacheKey(key) {
   return `${CONFIG.redisKeyPrefix}:${CACHE_SCHEMA_VERSION}:${key}`;
 }
@@ -883,6 +883,18 @@ const REQUEST_LOGS = 'type IN (2, 5)';
 // 因此总 Token = prompt + completion，不能再次叠加缓存读取。
 // 缓存 token 用正则从 other 文本里取，避免 other 非法 JSON 或非整数值导致整条聚合报错。
 const CACHE_TOKENS_EXPR = `COALESCE(NULLIF(SUBSTRING(other FROM '"cache_tokens":([0-9]+)'), '')::bigint, 0)`;
+// 输入 Token 排序：普通模型缓存按套餐 20% 折算，GPT-5.6 按官方 cached/input 价格比 10% 折算。
+// ponytail: 只维护有不同官方缓存比的明确别名；新型号出现时再补这里。
+const GPT_CACHE_WEIGHT_EXPR = `CASE WHEN LOWER(COALESCE(model_name, '')) IN ('gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna') THEN 0.1 ELSE 0.2 END`;
+const RAW_INPUT_TOKENS_EXPR = `GREATEST(COALESCE(prompt_tokens, 0) - ${CACHE_TOKENS_EXPR}, 0) + ${CACHE_TOKENS_EXPR} * ${GPT_CACHE_WEIGHT_EXPR}`;
+const ROLLUP_INPUT_TOKENS_EXPR = `GREATEST(COALESCE(prompt_tokens, 0) - COALESCE(cache_tokens, 0), 0) + COALESCE(cache_tokens, 0) * ${GPT_CACHE_WEIGHT_EXPR}`;
+const GPT_CACHE_WEIGHTS = Object.freeze({ 'gpt-5.6-sol': 0.1, 'gpt-5.6-terra': 0.1, 'gpt-5.6-luna': 0.1 });
+function weightedInputTokens(promptTokens, cacheTokens, modelName) {
+  const prompt = Math.max(0, Number(promptTokens) || 0);
+  const cache = Math.max(0, Number(cacheTokens) || 0);
+  const weight = GPT_CACHE_WEIGHTS[String(modelName || '').toLowerCase()] ?? 0.2;
+  return Math.max(prompt - cache, 0) + cache * weight;
+}
 const USER_AGENT_EXPR = `NULLIF(SUBSTRING(other FROM '"user_agent":"([^"\\\\]*)"'), '')`;
 const SAFE_OTHER_JSON_EXPR = `(CASE
         WHEN other NOT LIKE '%"user_agent"%' AND other NOT LIKE '%"request_body"%' AND other NOT LIKE '%"channel_affinity"%' THEN '{}'::jsonb
@@ -922,7 +934,8 @@ const USAGE_AGG = `COUNT(*) as count,
       SUM(prompt_tokens) FILTER (WHERE type = 2) as prompt_tokens,
       SUM(completion_tokens) FILTER (WHERE type = 2) as completion_tokens,
       SUM(COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0)) FILTER (WHERE type = 2) as total_tokens,
-      SUM(${CACHE_TOKENS_EXPR}) FILTER (WHERE type = 2) as cache_tokens`;
+      SUM(${CACHE_TOKENS_EXPR}) FILTER (WHERE type = 2) as cache_tokens,
+      SUM(${RAW_INPUT_TOKENS_EXPR}) FILTER (WHERE type = 2) as input_tokens`;
 
 function parseUsageRow(r) {
   const row = {
@@ -933,6 +946,9 @@ function parseUsageRow(r) {
     completion_tokens: parseInt(r.completion_tokens) || 0,
     total_tokens: parseFloat(r.total_tokens) || 0,
     cache_tokens: parseInt(r.cache_tokens) || 0,
+    input_tokens: r.input_tokens != null
+      ? parseFloat(r.input_tokens) || 0
+      : weightedInputTokens(r.prompt_tokens, r.cache_tokens, r.model_name),
     ip_count: parseInt(r.ip_count) || 0,
     clients: Array.isArray(r.clients) ? r.clients : [],
   };
@@ -1024,6 +1040,7 @@ function mergeTodaySnapshot(snapshot, rows) {
     completion_tokens: parseInt(t.completion_tokens) || 0,
     total_tokens: parseFloat(t.total_tokens) || 0,
     cache_tokens: parseInt(t.cache_tokens) || 0,
+    input_tokens: parseFloat(t.input_tokens) || 0,
     models: t.models || {},
   }]));
 
@@ -1041,6 +1058,7 @@ function mergeTodaySnapshot(snapshot, rows) {
         completion_tokens: 0,
         total_tokens: 0,
         cache_tokens: 0,
+        input_tokens: 0,
         models: {},
       });
     }
@@ -1053,6 +1071,7 @@ function mergeTodaySnapshot(snapshot, rows) {
       token.completion_tokens += row.completion_tokens || 0;
       token.total_tokens += (row.prompt_tokens || 0) + (row.completion_tokens || 0);
       token.cache_tokens += row.cache_tokens || 0;
+      token.input_tokens += weightedInputTokens(row.prompt_tokens, row.cache_tokens, row.model_name);
     }
     if (row.model_name) token.models[row.model_name] = (token.models[row.model_name] || 0) + 1;
   }
@@ -1065,7 +1084,7 @@ function mergeTodaySnapshot(snapshot, rows) {
       ...t,
       models: Object.fromEntries(topModels),
     };
-  }).sort((a, b) => b.count - a.count);
+  }).sort((a, b) => b.input_tokens - a.input_tokens || b.count - a.count);
 
   return {
     ...snapshot,
@@ -1086,10 +1105,13 @@ async function getTodayAggregation() {
       SUM(l.prompt_tokens) FILTER (WHERE l.type = 2) as prompt_tokens,
       SUM(l.completion_tokens) FILTER (WHERE l.type = 2) as completion_tokens,
       SUM(COALESCE(l.prompt_tokens, 0) + COALESCE(l.completion_tokens, 0)) FILTER (WHERE l.type = 2) as total_tokens,
-      SUM(COALESCE(m.cache_tokens, 0)) FILTER (WHERE l.type = 2) as cache_tokens
+      SUM(COALESCE(m.cache_tokens, 0)) FILTER (WHERE l.type = 2) as cache_tokens,
+      SUM(GREATEST(COALESCE(l.prompt_tokens, 0) - COALESCE(m.cache_tokens, 0), 0)
+        + COALESCE(m.cache_tokens, 0) * CASE WHEN LOWER(COALESCE(l.model_name, '')) IN ('gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna') THEN 0.1 ELSE 0.2 END)
+        FILTER (WHERE l.type = 2) as input_tokens
     FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
     WHERE l.created_at >= $1 AND l.${REQUEST_LOGS}
-    GROUP BY l.token_id, l.token_name, l.username, l.user_id ORDER BY count DESC
+    GROUP BY l.token_id, l.token_name, l.username, l.user_id ORDER BY input_tokens DESC NULLS LAST
   `, [ts]);
   const tokens = tokensRes.rows.map(parseUsageRow);
 
@@ -1218,7 +1240,8 @@ const ROLLUP_USAGE_AGG = `SUM(call_count) as count,
       SUM(prompt_tokens) as prompt_tokens,
       SUM(completion_tokens) as completion_tokens,
       SUM(total_tokens) as total_tokens,
-      SUM(cache_tokens) as cache_tokens`;
+      SUM(cache_tokens) as cache_tokens,
+      SUM(${ROLLUP_INPUT_TOKENS_EXPR}) as input_tokens`;
 // 两个中转站的 gpt-5.6-sol 都实际落到 Terra；缓存写入按普通新输入计费。
 const TERRA_COST_AGG = `SUM(CASE WHEN model_name IN ('gpt-5.6-sol', 'gpt-5.6-terra') THEN
         (GREATEST(prompt_tokens - cache_tokens, 0) * 0.16 + cache_tokens * 0.016 + completion_tokens * 0.96) / 1000000.0
@@ -1312,7 +1335,7 @@ async function getAggregation(range, dimension) {
   const result = await pool.query(`
     WITH source AS MATERIALIZED (${source.sql})
     SELECT ${select}, ${ROLLUP_USAGE_AGG}${costAgg}
-    FROM source GROUP BY ${d.group} ORDER BY count DESC
+    FROM source GROUP BY ${d.group} ORDER BY ${dimension === 'ip' ? 'count' : 'input_tokens'} DESC NULLS LAST
   `, source.params);
   const rows = result.rows.map(parseUsageRow);
   if (dimension === 'token') {
@@ -1381,7 +1404,7 @@ async function getDistribution(range) {
   const userTokenRes = await pool.query(`
     WITH source AS MATERIALIZED (${source.sql})
     SELECT username, ${ROLLUP_USAGE_AGG}
-    FROM source GROUP BY username ORDER BY total_tokens DESC NULLS LAST LIMIT 10
+    FROM source GROUP BY username ORDER BY input_tokens DESC NULLS LAST LIMIT 10
   `, source.params);
   // Token/Key 分布 TOP 10
   const tokenRes = await pool.query(`

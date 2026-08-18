@@ -3,7 +3,7 @@ let config = {};
 let whitelistIds = new Set();
 let currentRange = 'today';
 let currentDim = 'token';
-let currentSort = { key: 'count', dir: 'desc' };
+let currentSort = { key: 'input_tokens', dir: 'desc' };
 let currentData = [];
 let currentPage = 1;
 const pageSize = 20;
@@ -48,20 +48,29 @@ function formatTokens(n) {
   if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
   return n.toLocaleString();
 }
-// OpenAI 的缓存读取已包含在输入中；这里只拆分展示，不重复计入总量。
+const GPT_CACHE_WEIGHTS = { 'gpt-5.6-sol': 0.1, 'gpt-5.6-terra': 0.1, 'gpt-5.6-luna': 0.1 };
+function weightedInputTokens(r) {
+  if (r.input_tokens != null) return Number(r.input_tokens) || 0;
+  const prompt = Math.max(0, Number(r.prompt_tokens) || 0);
+  const cache = Math.max(0, Number(r.cache_tokens) || 0);
+  const weight = GPT_CACHE_WEIGHTS[String(r.model_name || '').toLowerCase()] ?? 0.2;
+  return Math.max(prompt - cache, 0) + cache * weight;
+}
+// 输入 Token 排序：普通模型缓存按 20% 折算，GPT-5.6 按官方 cached/input 价格比 10% 折算。
 function tokenUsageCell(r) {
   const cache = r.cache_tokens || 0;
   const total = r.total_tokens != null ? r.total_tokens : (r.prompt_tokens || 0) + (r.completion_tokens || 0);
-  const fresh = Math.max(0, (r.prompt_tokens || 0) - cache);
+  const input = weightedInputTokens(r);
   const detail = cache > 0
-    ? `入 ${formatTokens(fresh)} + 缓存 ${formatTokens(cache)} / 出 ${formatTokens(r.completion_tokens)}`
-    : `入 ${formatTokens(r.prompt_tokens)} / 出 ${formatTokens(r.completion_tokens)}`;
-  const title = `总计 ${(total || 0).toLocaleString()} tokens`
+    ? `输入折算 ${formatTokens(input)} · 缓存 ${formatTokens(cache)} / 出 ${formatTokens(r.completion_tokens)}`
+    : `输入 ${formatTokens(input)} / 出 ${formatTokens(r.completion_tokens)}`;
+  const title = `输入折算 ${(input || 0).toLocaleString()} tokens`
+    + `\n原始总计 ${(total || 0).toLocaleString()} tokens`
     + `\n输入 ${(r.prompt_tokens || 0).toLocaleString()}`
     + (cache > 0 ? `（其中缓存读取 ${cache.toLocaleString()}）` : '')
     + `\n输出 ${(r.completion_tokens || 0).toLocaleString()}`;
   return `<td title="${title}">
-    <strong>${formatTokens(total)}</strong>
+    <strong>${formatTokens(input)}</strong>
     <br><span class="dim">${detail}</span>
   </td>`;
 }
@@ -83,7 +92,7 @@ const COLUMNS = {
   token: [
     { key: '#', label: '#', sortable: false },
     { key: 'token_name', label: 'Token', sortable: true },
-    { key: 'total_tokens', label: 'Token 用量', sortable: true },
+    { key: 'input_tokens', label: '输入 Token（折算）', sortable: true },
     { key: 'count', label: '调用次数', sortable: true },
     { key: 'ip_count', label: 'IP 数量', sortable: true },
     { key: 'username', label: '用户', sortable: true },
@@ -98,7 +107,7 @@ const COLUMNS = {
     { key: 'username', label: '用户', sortable: true },
     { key: 'token_count', label: 'Token数', sortable: true },
     { key: 'count', label: '调用次数', sortable: true },
-    { key: 'total_tokens', label: 'Token 用量', sortable: true },
+    { key: 'input_tokens', label: '输入 Token（折算）', sortable: true },
     { key: 'quota', label: '费用', sortable: true },
     { key: 'action', label: '操作', sortable: false },
   ],
@@ -106,21 +115,21 @@ const COLUMNS = {
     { key: '#', label: '#' },
     { key: 'model_name', label: '模型', sortable: true },
     { key: 'count', label: '调用次数', sortable: true },
-    { key: 'total_tokens', label: 'Token 用量', sortable: true },
+    { key: 'input_tokens', label: '输入 Token（折算）', sortable: true },
     { key: 'quota', label: '费用', sortable: true },
   ],
   group: [
     { key: '#', label: '#' },
     { key: 'grp', label: '分组', sortable: true },
     { key: 'count', label: '调用次数', sortable: true },
-    { key: 'total_tokens', label: 'Token 用量', sortable: true },
+    { key: 'input_tokens', label: '输入 Token（折算）', sortable: true },
     { key: 'quota', label: '费用', sortable: true },
   ],
   channel: [
     { key: '#', label: '#' },
     { key: 'channel_name', label: '渠道', sortable: true },
     { key: 'count', label: '调用次数', sortable: true },
-    { key: 'total_tokens', label: 'Token 用量', sortable: true },
+    { key: 'input_tokens', label: '输入 Token（折算）', sortable: true },
     { key: 'quota', label: '费用', sortable: true },
   ],
   ip: [
@@ -455,18 +464,18 @@ function renderTrend(trendData, distData) {
 
   // 5. 用户 Token 用量排名 (水平柱状)
   if (distData.users_by_tokens || distData.users) {
-    const u = [...(distData.users_by_tokens || distData.users)].sort((a, b) => (b.total_tokens || 0) - (a.total_tokens || 0));
+    const u = [...(distData.users_by_tokens || distData.users)].sort((a, b) => weightedInputTokens(b) - weightedInputTokens(a));
     const opts = barOpts('y');
     opts.plugins = {
       ...(opts.plugins || {}),
       tooltip: { callbacks: {
-        label: ctx => `Token 用量: ${(u[ctx.dataIndex].total_tokens || 0).toLocaleString()} · 费用: ${formatUSD(u[ctx.dataIndex].quota)}`,
+        label: ctx => `输入折算 Token: ${weightedInputTokens(u[ctx.dataIndex]).toLocaleString()} · 费用: ${formatUSD(u[ctx.dataIndex].quota)}`,
       } },
     };
     charts.push(new Chart(document.getElementById('userQuotaRankChart').getContext('2d'), {
       type: 'bar',
       data: { labels: u.map(x => x.username), datasets: [{
-        label: 'Token 用量', data: u.map(x => x.total_tokens || 0),
+        label: '输入 Token（折算）', data: u.map(weightedInputTokens),
         backgroundColor: COLORS.map(c => c + 'cc'), borderRadius: 4,
       }] },
       options: opts,
@@ -946,7 +955,7 @@ document.querySelectorAll('.sub-tab').forEach(tab => {
     document.querySelectorAll('.sub-tab').forEach(t => t.classList.remove('active'));
     tab.classList.add('active');
     currentDim = tab.dataset.dim;
-    currentSort = { key: 'count', dir: 'desc' };
+    currentSort = currentDim === 'ip' ? { key: 'count', dir: 'desc' } : { key: 'input_tokens', dir: 'desc' };
     currentPage = 1;
     loadDashboard();
   });

@@ -68,8 +68,8 @@ async function run(name, sql, params = []) {
       SUM(COALESCE(prompt_tokens,0) + COALESCE(completion_tokens,0)) FILTER (WHERE type = 2) as total_tokens,
       COUNT(DISTINCT token_id) as active_tokens, COUNT(DISTINCT username) as active_users
     FROM logs WHERE created_at >= ${TS} AND ${REQUEST_LOGS} GROUP BY label ORDER BY label LIMIT 3`);
-  await run('用户 token 用量 TOP', `SELECT username, ${USAGE_AGG}
-    FROM logs WHERE created_at >= ${TS} AND ${REQUEST_LOGS} GROUP BY username ORDER BY total_tokens DESC NULLS LAST LIMIT 3`);
+  await run('用户输入 token 用量 TOP', `SELECT username, ${USAGE_AGG}
+    FROM logs WHERE created_at >= ${TS} AND ${REQUEST_LOGS} GROUP BY username ORDER BY input_tokens DESC NULLS LAST LIMIT 3`);
   await run('快照模型分布（窗口函数，非 N+1）', `WITH ranked AS (
       SELECT token_id, model_name, COUNT(*) AS cnt,
         ROW_NUMBER() OVER (PARTITION BY token_id ORDER BY COUNT(*) DESC) AS rn
