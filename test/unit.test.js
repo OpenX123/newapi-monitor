@@ -122,14 +122,13 @@ function testFormatters() {
   equal('GPT缓存按官方价格比10%折算', weightedInputTokens({ model_name: 'gpt-5.6-sol', prompt_tokens: 900, cache_tokens: 600 }), 360);
 
   const cell = tokenUsageCell({ total_tokens: 1000, prompt_tokens: 900, completion_tokens: 100, cache_tokens: 600 });
-  check('有缓存时拆出「入 + 缓存」', cell.includes('缓存'), '');
-  check('排序展示输入折算 Token', cell.includes('420'), '');
+  check('总 Token 列显示总量', cell.includes('1,000') && !cell.includes('420'), '');
+  check('总 Token 列显示缓存命中率', cell.includes('缓存命中率 40.0%'), '');
   const familyCells = tokenFamilyCells({ gpt_input_tokens: 123, claude_input_tokens: 456, gpt_cache_tokens: 100, claude_cache_tokens: 200 });
   check('GPT 与 Claude 输入分栏', familyCells.includes('123') && familyCells.includes('456'));
-  check('GPT 分栏显示缓存明细', familyCells.includes('缓存') && familyCells.includes('10%'));
-  check('缓存不重复计入总量', cell.includes('1,000'), '');
+  check('GPT/Claude 分栏隐藏缓存折算比例', familyCells.includes('缓存') && !familyCells.includes('10%') && !familyCells.includes('20%'));
   const noCache = tokenUsageCell({ total_tokens: 1000, prompt_tokens: 900, completion_tokens: 100, cache_tokens: 0 });
-  check('无缓存时不显示缓存段', !noCache.includes('缓存'), '');
+  check('无缓存时命中率显示为 0%', noCache.includes('缓存命中率 0.0%'), '');
   check('User-Agent 次数渲染为标签', userAgentTags([{ name: 'undici', count: 202 }]).includes('undici ×202'));
   check('User-Agent 名称按 HTML 文本安全展示', userAgentTags([{ name: '<script>', count: 1 }]).includes('&lt;script&gt;'));
 }
@@ -194,6 +193,8 @@ function testUsageSemantics() {
   check('成本仅加入 Token 排行费用之后', /key: 'quota', label: '费用'[\s\S]{0,100}key: 'cost_usd', label: '成本'/.test(js));
   check('输入排行区分普通20%与 GPT官方缓存比', /input_tokens/.test(src) && /THEN 0\.1 ELSE 0\.2/.test(src) && /key: 'input_tokens'/.test(js));
   check('Token 行拆出 GPT 与 Claude 输入及缓存', /gpt_input_tokens/.test(src) && /claude_input_tokens/.test(src) && /gpt_cache_tokens/.test(src) && /claude_cache_tokens/.test(src) && /key: 'gpt_input_tokens'/.test(js) && /key: 'claude_input_tokens'/.test(js));
+  check('排行表按总 Token 展示并排序', /currentSort = \{ key: 'total_tokens'/.test(js) && /key: 'total_tokens', label: '总 Token'/.test(js));
+  check('GPT/Claude 表头去掉输入', /key: 'gpt_input_tokens', label: 'GPT'/.test(js) && /key: 'claude_input_tokens', label: 'Claude'/.test(js));
   check('缓存 token 用正则提取而非 jsonb 强转', /SUBSTRING\(other FROM '"cache_tokens":\(\[0-9\]\+\)'\)/.test(src));
   check('报错分析不再把 other 整列传回 Node', !/SELECT id, created_at, type, content[\s\S]{0,200}channel_id, channel_name, other\s*\n\s*FROM logs/.test(src));
   check('报错分析跳过不兼容的 Unicode 转义', /REPLACE\(other, chr\(92\) \|\| 'u0000', ''\) IS JSON/.test(src) && /REPLACE\(other, chr\(92\) \|\| 'u0000', ''\)::jsonb/.test(src));
@@ -210,7 +211,7 @@ function testUsageSemantics() {
   check('Token 聚合返回 IP 和完整 UA 次数', /ip_count/.test(src) && /user_agents/.test(src) && !/ua_match_rate/.test(src));
   check('客户端识别覆盖常见四类', ['Claude', 'Codex', 'OpenCode', 'Trae'].every(client => src.includes(client)));
   check('客户端优先读取真实 User-Agent，Trace 仅作兜底', /CLIENT_USER_AGENT_EXPR/.test(src) && /'user_agent'/.test(src) && /CLIENT_SIGNAL_EXPR/.test(src));
-  check('Token 排行按输入折算、次数、IP 排列且 UA 紧邻分析', /key: 'input_tokens'[\s\S]*key: 'count'[\s\S]*key: 'ip_count'[\s\S]*key: 'user_agents'[\s\S]*key: 'action'/.test(js) && /userAgentTags\(t\.user_agents\)/.test(js));
+  check('Token 排行按总 Token、次数、IP 排列且 UA 紧邻分析', /key: 'total_tokens'[\s\S]*key: 'count'[\s\S]*key: 'ip_count'[\s\S]*key: 'user_agents'[\s\S]*key: 'action'/.test(js) && /userAgentTags\(t\.user_agents\)/.test(js));
   const extractUserAgent = eval(`(function(){ ${extract('function extractUserAgent(', '\nfunction extractTraceType(')} return extractUserAgent; })()`);
   equal('User-Agent 增量缓存保留转义字符', extractUserAgent('{"user_agent":"client \\\"quoted\\\""}'), 'client "quoted"');
   check('7/30 天统计读取小时汇总并只直查今天', /FROM monitor_usage_rollups WHERE bucket_start >= \$1 AND bucket_start < \$2/.test(src) && /l\.created_at >= GREATEST\(\$1, \$2\)/.test(src));

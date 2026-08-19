@@ -3,7 +3,7 @@ let config = {};
 let whitelistIds = new Set();
 let currentRange = 'today';
 let currentDim = 'token';
-let currentSort = { key: 'input_tokens', dir: 'desc' };
+let currentSort = { key: 'total_tokens', dir: 'desc' };
 let currentData = [];
 let currentPage = 1;
 const pageSize = 20;
@@ -56,21 +56,19 @@ function weightedInputTokens(r) {
   const weight = GPT_CACHE_WEIGHTS[String(r.model_name || '').toLowerCase()] ?? 0.2;
   return Math.max(prompt - cache, 0) + cache * weight;
 }
-// 输入 Token 排序：普通模型缓存按 20% 折算，GPT-5.6 按官方 cached/input 价格比 10% 折算。
 function tokenUsageCell(r) {
   const cache = r.cache_tokens || 0;
   const total = r.total_tokens != null ? r.total_tokens : (r.prompt_tokens || 0) + (r.completion_tokens || 0);
-  const input = weightedInputTokens(r);
-  const detail = cache > 0
-    ? `输入折算 ${formatTokens(input)} · 缓存 ${formatTokens(cache)} / 出 ${formatTokens(r.completion_tokens)}`
-    : `输入 ${formatTokens(input)} / 出 ${formatTokens(r.completion_tokens)}`;
-  const title = `输入折算 ${(input || 0).toLocaleString()} tokens`
-    + `\n原始总计 ${(total || 0).toLocaleString()} tokens`
-    + `\n输入 ${(r.prompt_tokens || 0).toLocaleString()}`
+  const prompt = r.prompt_tokens || 0;
+  const cacheHitPct = prompt + cache > 0 ? cache / (prompt + cache) * 100 : 0;
+  const detail = `缓存命中率 ${cacheHitPct.toFixed(1)}%`;
+  const title = `总 Token ${(total || 0).toLocaleString()} tokens`
+    + `\n缓存命中率 ${cacheHitPct.toFixed(1)}%`
+    + `\n输入 ${prompt.toLocaleString()}`
     + (cache > 0 ? `（其中缓存读取 ${cache.toLocaleString()}）` : '')
     + `\n输出 ${(r.completion_tokens || 0).toLocaleString()}`;
   return `<td title="${title}">
-    <strong>${formatTokens(input)}</strong>
+    <strong>${formatTokens(total)}</strong>
     <br><span class="dim">${detail}</span>
   </td>`;
 }
@@ -79,9 +77,9 @@ function tokenFamilyCell(label, r, prefix, cacheWeight) {
   const cache = Number(r[`${prefix}_cache_tokens`]) || 0;
   const fresh = Math.max(0, input - cache * cacheWeight);
   const detail = cache > 0
-    ? `新 ${formatTokens(fresh)} + 缓存 ${formatTokens(cache)} × ${cacheWeight * 100}%`
+    ? `新 ${formatTokens(fresh)} + 缓存 ${formatTokens(cache)}`
     : '无缓存读取';
-  return `<td title="${label} 输入折算 ${input.toLocaleString()} tokens\n${detail}"><strong>${formatTokens(input)}</strong><br><span class="dim">${detail}</span></td>`;
+  return `<td title="${label} ${input.toLocaleString()} tokens\n${detail}"><strong>${formatTokens(input)}</strong><br><span class="dim">${detail}</span></td>`;
 }
 function tokenFamilyCells(r) {
   return tokenFamilyCell('GPT', r, 'gpt', 0.1) + tokenFamilyCell('Claude', r, 'claude', 0.2);
@@ -104,9 +102,9 @@ const COLUMNS = {
   token: [
     { key: '#', label: '#', sortable: false },
     { key: 'token_name', label: 'Token', sortable: true },
-    { key: 'input_tokens', label: '输入 Token（折算）', sortable: true },
-    { key: 'gpt_input_tokens', label: 'GPT 输入', sortable: true },
-    { key: 'claude_input_tokens', label: 'Claude 输入', sortable: true },
+    { key: 'total_tokens', label: '总 Token', sortable: true },
+    { key: 'gpt_input_tokens', label: 'GPT', sortable: true },
+    { key: 'claude_input_tokens', label: 'Claude', sortable: true },
     { key: 'count', label: '调用次数', sortable: true },
     { key: 'ip_count', label: 'IP 数量', sortable: true },
     { key: 'username', label: '用户', sortable: true },
@@ -121,7 +119,7 @@ const COLUMNS = {
     { key: 'username', label: '用户', sortable: true },
     { key: 'token_count', label: 'Token数', sortable: true },
     { key: 'count', label: '调用次数', sortable: true },
-    { key: 'input_tokens', label: '输入 Token（折算）', sortable: true },
+    { key: 'total_tokens', label: '总 Token', sortable: true },
     { key: 'quota', label: '费用', sortable: true },
     { key: 'action', label: '操作', sortable: false },
   ],
@@ -129,21 +127,21 @@ const COLUMNS = {
     { key: '#', label: '#' },
     { key: 'model_name', label: '模型', sortable: true },
     { key: 'count', label: '调用次数', sortable: true },
-    { key: 'input_tokens', label: '输入 Token（折算）', sortable: true },
+    { key: 'total_tokens', label: '总 Token', sortable: true },
     { key: 'quota', label: '费用', sortable: true },
   ],
   group: [
     { key: '#', label: '#' },
     { key: 'grp', label: '分组', sortable: true },
     { key: 'count', label: '调用次数', sortable: true },
-    { key: 'input_tokens', label: '输入 Token（折算）', sortable: true },
+    { key: 'total_tokens', label: '总 Token', sortable: true },
     { key: 'quota', label: '费用', sortable: true },
   ],
   channel: [
     { key: '#', label: '#' },
     { key: 'channel_name', label: '渠道', sortable: true },
     { key: 'count', label: '调用次数', sortable: true },
-    { key: 'input_tokens', label: '输入 Token（折算）', sortable: true },
+    { key: 'total_tokens', label: '总 Token', sortable: true },
     { key: 'quota', label: '费用', sortable: true },
   ],
   ip: [
