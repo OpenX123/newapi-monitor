@@ -1530,7 +1530,11 @@ async function getErrorAnalysis(range) {
         WITH parsed AS (
           SELECT id, created_at, type, content, username, token_name, token_id, model_name,
             channel_id, channel_name,
-            CASE WHEN other IS JSON THEN other::jsonb ELSE '{}'::jsonb END AS oj
+            CASE
+              WHEN REPLACE(other, chr(92) || 'u0000', '') IS JSON
+              THEN REPLACE(other, chr(92) || 'u0000', '')::jsonb
+              ELSE '{}'::jsonb
+            END AS oj
           FROM logs
           WHERE created_at >= $1
             AND (type = 5 OR (type = 2 AND other IS NOT NULL AND other <> '' AND LEFT(other, 1) = '{'))
