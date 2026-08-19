@@ -196,6 +196,7 @@ function testUsageSemantics() {
   check('Token 行拆出 GPT 与 Claude 输入及缓存', /gpt_input_tokens/.test(src) && /claude_input_tokens/.test(src) && /gpt_cache_tokens/.test(src) && /claude_cache_tokens/.test(src) && /key: 'gpt_input_tokens'/.test(js) && /key: 'claude_input_tokens'/.test(js));
   check('缓存 token 用正则提取而非 jsonb 强转', /SUBSTRING\(other FROM '"cache_tokens":\(\[0-9\]\+\)'\)/.test(src));
   check('报错分析不再把 other 整列传回 Node', !/SELECT id, created_at, type, content[\s\S]{0,200}channel_id, channel_name, other\s*\n\s*FROM logs/.test(src));
+  check('报错分析跳过非法 JSON', /CASE WHEN other IS JSON THEN other::jsonb ELSE '\{\}'::jsonb END AS oj/.test(src));
   check('报错明细有行数上限兜底', /LIMIT \$2/.test(src) && /ERROR_ROWS_LIMIT/.test(src));
   check('聚合缓存带版本号', /CACHE_SCHEMA_VERSION/.test(src));
   check('脚本告警同时按模型名统计 Claude/GPT', /model_name[\s\S]{0,180}claude_calls[\s\S]{0,180}gpt_calls/.test(src));
