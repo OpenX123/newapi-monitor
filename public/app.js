@@ -60,7 +60,9 @@ function tokenUsageCell(r) {
   const cache = r.cache_tokens || 0;
   const total = r.total_tokens != null ? r.total_tokens : (r.prompt_tokens || 0) + (r.completion_tokens || 0);
   const prompt = r.prompt_tokens || 0;
-  const cacheHitPct = prompt + cache > 0 ? cache / (prompt + cache) * 100 : 0;
+  const fresh = r.fresh_input_tokens != null ? Math.max(Number(r.fresh_input_tokens) || 0, 0) : Math.max(prompt - cache, 0);
+  const input = fresh + cache;
+  const cacheHitPct = input > 0 ? cache / input * 100 : 0;
   const detail = `缓存命中率 ${cacheHitPct.toFixed(1)}%`;
   const title = `总 Token ${(total || 0).toLocaleString()} tokens`
     + `\n缓存命中率 ${cacheHitPct.toFixed(1)}%`
@@ -1235,9 +1237,8 @@ async function analyzeItem(type, value, displayName) {
   analysisRequestQuery = `${query}&range=${encodeURIComponent(currentRange)}`;
   analysisRequestTotal = d.recentRequestsPage?.total || 0;
   const b = d.basic;
-  const cacheHitPct = b.total_cache > 0
-    ? b.total_cache / (b.total_prompt + b.total_cache) * 100
-    : 0;
+  const totalInput = (b.total_fresh_input || 0) + (b.total_cache || 0);
+  const cacheHitPct = totalInput > 0 ? b.total_cache / totalInput * 100 : 0;
   const sc = d.score;
   const level = sc.value >= 14 ? 'high' : sc.value >= 8 ? 'mid' : 'low';
   const verdict = sc.value >= 14 ? '⛔ 极大概率是脚本' : sc.value >= 8 ? '⚠️ 较大可能是脚本' : sc.value >= 4 ? '🟡 有部分脚本特征' : '✅ 看起来像正常用户';

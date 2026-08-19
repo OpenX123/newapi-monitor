@@ -121,9 +121,9 @@ function testFormatters() {
   equal('普通模型缓存按20%折算', weightedInputTokens({ prompt_tokens: 900, cache_tokens: 600 }), 420);
   equal('GPT缓存按官方价格比10%折算', weightedInputTokens({ model_name: 'gpt-5.6-sol', prompt_tokens: 900, cache_tokens: 600 }), 360);
 
-  const cell = tokenUsageCell({ total_tokens: 1000, prompt_tokens: 900, completion_tokens: 100, cache_tokens: 600 });
+  const cell = tokenUsageCell({ total_tokens: 1000, prompt_tokens: 900, completion_tokens: 100, fresh_input_tokens: 300, cache_tokens: 600 });
   check('总 Token 列显示总量', cell.includes('1,000') && !cell.includes('420'), '');
-  check('总 Token 列显示缓存命中率', cell.includes('缓存命中率 40.0%'), '');
+  check('总 Token 列显示缓存命中率', cell.includes('缓存命中率 66.7%'), '');
   const familyCells = tokenFamilyCells({ gpt_input_tokens: 123, claude_input_tokens: 456, gpt_cache_tokens: 100, claude_cache_tokens: 200 });
   check('GPT 与 Claude 输入分栏', familyCells.includes('123') && familyCells.includes('456'));
   check('GPT/Claude 分栏隐藏缓存折算比例', familyCells.includes('缓存') && !familyCells.includes('10%') && !familyCells.includes('20%'));
@@ -202,7 +202,7 @@ function testUsageSemantics() {
   check('聚合缓存带版本号', /CACHE_SCHEMA_VERSION/.test(src));
   check('脚本告警同时按模型名统计 Claude/GPT', /model_name[\s\S]{0,180}claude_calls[\s\S]{0,180}gpt_calls/.test(src));
   check('非聚焦告警可分别关闭', /CONFIG\.alertUsageAnomaly && triggers\.length/.test(src) && /CONFIG\.alertDailyLimit && t\.count/.test(src));
-  check('缓存命中率以新输入加缓存为分母', /total_cache \/ \(b\.total_prompt \+ b\.total_cache\)/.test(js));
+  check('缓存命中率使用逐请求新输入加缓存为分母', /total_fresh_input/.test(src) && /b\.total_fresh_input/.test(js));
   check('用户分析返回并展示 IP 分布', /ip_count/.test(src) && /d\.ips/.test(js));
   check('用户分析返回并展示最近请求体', /recentRequests/.test(src) && /request_body/.test(src) && /最近请求明细/.test(js));
   check('请求明细固定三条并独立分页查询', /USER_REQUEST_PAGE_SIZE = 3/.test(src) && /LIMIT \$3 OFFSET \$4/.test(src) && /\/api\/user-analysis\/requests/.test(src) && /loadAnalysisRequests/.test(js));

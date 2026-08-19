@@ -358,6 +358,7 @@ async function initDB() {
       completion_tokens BIGINT NOT NULL DEFAULT 0,
       total_tokens DOUBLE PRECISION NOT NULL DEFAULT 0,
       cache_tokens BIGINT NOT NULL DEFAULT 0,
+      fresh_input_tokens BIGINT NOT NULL DEFAULT 0,
       first_at INTEGER NOT NULL,
       last_at INTEGER NOT NULL,
       PRIMARY KEY (bucket_start, dimension_hash)
@@ -365,6 +366,7 @@ async function initDB() {
   `);
   await pool.query('ALTER TABLE monitor_log_user_agents ADD COLUMN IF NOT EXISTS cache_tokens BIGINT NOT NULL DEFAULT 0');
   await pool.query("ALTER TABLE monitor_log_user_agents ADD COLUMN IF NOT EXISTS trace_type TEXT NOT NULL DEFAULT ''");
+  await pool.query('ALTER TABLE monitor_usage_rollups ADD COLUMN IF NOT EXISTS fresh_input_tokens BIGINT NOT NULL DEFAULT 0');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_monitor_usage_rollups_bucket ON monitor_usage_rollups (bucket_start)');
   await pool.query('ALTER TABLE monitor_actions ADD COLUMN IF NOT EXISTS action_meta JSONB');
   // 告警冷却查询（按 action + subject + 时间）每分钟对每个活跃 Token 执行一次，没有索引会全表扫
@@ -888,6 +890,7 @@ const CACHE_TOKENS_EXPR = `COALESCE(NULLIF(SUBSTRING(other FROM '"cache_tokens":
 const GPT_CACHE_WEIGHT_EXPR = `CASE WHEN LOWER(COALESCE(model_name, '')) IN ('gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna') THEN 0.1 ELSE 0.2 END`;
 const RAW_INPUT_TOKENS_EXPR = `GREATEST(COALESCE(prompt_tokens, 0) - ${CACHE_TOKENS_EXPR}, 0) + ${CACHE_TOKENS_EXPR} * ${GPT_CACHE_WEIGHT_EXPR}`;
 const ROLLUP_INPUT_TOKENS_EXPR = `GREATEST(COALESCE(prompt_tokens, 0) - COALESCE(cache_tokens, 0), 0) + COALESCE(cache_tokens, 0) * ${GPT_CACHE_WEIGHT_EXPR}`;
+const RAW_FRESH_INPUT_TOKENS_EXPR = `GREATEST(COALESCE(prompt_tokens, 0) - ${CACHE_TOKENS_EXPR}, 0)`;
 const GPT_MODEL_EXPR = `LOWER(COALESCE(model_name, '')) ~ '(gpt|codex)'`;
 const CLAUDE_MODEL_EXPR = `LOWER(COALESCE(model_name, '')) LIKE '%claude%'`;
 const RAW_GPT_INPUT_TOKENS_EXPR = `CASE WHEN ${GPT_MODEL_EXPR} THEN ${RAW_INPUT_TOKENS_EXPR} ELSE 0 END`;
@@ -945,6 +948,7 @@ const USAGE_AGG = `COUNT(*) as count,
       SUM(completion_tokens) FILTER (WHERE type = 2) as completion_tokens,
       SUM(COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0)) FILTER (WHERE type = 2) as total_tokens,
       SUM(${CACHE_TOKENS_EXPR}) FILTER (WHERE type = 2) as cache_tokens,
+      SUM(${RAW_FRESH_INPUT_TOKENS_EXPR}) FILTER (WHERE type = 2) as fresh_input_tokens,
       SUM(${RAW_INPUT_TOKENS_EXPR}) FILTER (WHERE type = 2) as input_tokens,
       SUM(${RAW_GPT_INPUT_TOKENS_EXPR}) FILTER (WHERE type = 2) as gpt_input_tokens,
       SUM(${RAW_CLAUDE_INPUT_TOKENS_EXPR}) FILTER (WHERE type = 2) as claude_input_tokens,
@@ -960,6 +964,7 @@ function parseUsageRow(r) {
     completion_tokens: parseInt(r.completion_tokens) || 0,
     total_tokens: parseFloat(r.total_tokens) || 0,
     cache_tokens: parseInt(r.cache_tokens) || 0,
+    fresh_input_tokens: parseInt(r.fresh_input_tokens) || 0,
     input_tokens: r.input_tokens != null
       ? parseFloat(r.input_tokens) || 0
       : weightedInputTokens(r.prompt_tokens, r.cache_tokens, r.model_name),
@@ -1137,6 +1142,7 @@ async function getTodayAggregation() {
       SUM(l.completion_tokens) FILTER (WHERE l.type = 2) as completion_tokens,
       SUM(COALESCE(l.prompt_tokens, 0) + COALESCE(l.completion_tokens, 0)) FILTER (WHERE l.type = 2) as total_tokens,
       SUM(COALESCE(m.cache_tokens, 0)) FILTER (WHERE l.type = 2) as cache_tokens,
+      SUM(GREATEST(COALESCE(l.prompt_tokens, 0) - COALESCE(m.cache_tokens, 0), 0)) FILTER (WHERE l.type = 2) as fresh_input_tokens,
       SUM(GREATEST(COALESCE(l.prompt_tokens, 0) - COALESCE(m.cache_tokens, 0), 0)
         + COALESCE(m.cache_tokens, 0) * CASE WHEN LOWER(COALESCE(l.model_name, '')) IN ('gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna') THEN 0.1 ELSE 0.2 END)
         FILTER (WHERE l.type = 2) as input_tokens,
@@ -1284,6 +1290,7 @@ const ROLLUP_USAGE_AGG = `SUM(call_count) as count,
       SUM(completion_tokens) as completion_tokens,
       SUM(total_tokens) as total_tokens,
       SUM(cache_tokens) as cache_tokens,
+      SUM(fresh_input_tokens) as fresh_input_tokens,
       SUM(${ROLLUP_INPUT_TOKENS_EXPR}) as input_tokens,
       SUM(${ROLLUP_GPT_INPUT_TOKENS_EXPR}) as gpt_input_tokens,
       SUM(${ROLLUP_CLAUDE_INPUT_TOKENS_EXPR}) as claude_input_tokens,
@@ -1303,7 +1310,7 @@ function getUsageSource(range) {
     sql: `
       SELECT token_id, token_name, username, user_id, ip, model_name, grp AS "group", channel_id, channel_name,
         user_agent, bucket_start, call_count, usage_count, quota, prompt_tokens, completion_tokens,
-        total_tokens, cache_tokens, first_at, last_at
+        total_tokens, cache_tokens, fresh_input_tokens, first_at, last_at
       FROM monitor_usage_rollups WHERE bucket_start >= $1 AND bucket_start < $2
       UNION ALL
       SELECT l.token_id, COALESCE(l.token_name, ''), COALESCE(l.username, ''), COALESCE(l.user_id, 0), COALESCE(l.ip, ''),
@@ -1315,6 +1322,7 @@ function getUsageSource(range) {
         CASE WHEN l.type = 2 THEN COALESCE(l.completion_tokens, 0) ELSE 0 END,
         CASE WHEN l.type = 2 THEN COALESCE(l.prompt_tokens, 0) + COALESCE(l.completion_tokens, 0) ELSE 0 END,
         CASE WHEN l.type = 2 THEN COALESCE(m.cache_tokens, 0) ELSE 0 END,
+        CASE WHEN l.type = 2 THEN GREATEST(COALESCE(l.prompt_tokens, 0) - COALESCE(m.cache_tokens, 0), 0) ELSE 0 END,
         l.created_at, l.created_at
       FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
       WHERE l.created_at >= GREATEST($1, $2) AND l.${REQUEST_LOGS}`,
@@ -1326,7 +1334,7 @@ async function buildUsageRollupDay(dayStart) {
     INSERT INTO monitor_usage_rollups (
       bucket_start, dimension_hash, token_id, token_name, username, user_id, model_name, grp,
       channel_id, channel_name, ip, user_agent, call_count, usage_count, quota, prompt_tokens,
-      completion_tokens, total_tokens, cache_tokens, first_at, last_at
+      completion_tokens, total_tokens, cache_tokens, fresh_input_tokens, first_at, last_at
     )
     SELECT (l.created_at / 3600) * 3600,
       MD5(CONCAT_WS(CHR(31), COALESCE(l.token_id, 0), COALESCE(l.token_name, ''), COALESCE(l.username, ''),
@@ -1340,7 +1348,9 @@ async function buildUsageRollupDay(dayStart) {
       COALESCE(SUM(l.prompt_tokens) FILTER (WHERE l.type = 2), 0),
       COALESCE(SUM(l.completion_tokens) FILTER (WHERE l.type = 2), 0),
       COALESCE(SUM(COALESCE(l.prompt_tokens, 0) + COALESCE(l.completion_tokens, 0)) FILTER (WHERE l.type = 2), 0),
-      COALESCE(SUM(m.cache_tokens) FILTER (WHERE l.type = 2), 0), MIN(l.created_at), MAX(l.created_at)
+      COALESCE(SUM(m.cache_tokens) FILTER (WHERE l.type = 2), 0),
+      COALESCE(SUM(GREATEST(COALESCE(l.prompt_tokens, 0) - COALESCE(m.cache_tokens, 0), 0)) FILTER (WHERE l.type = 2), 0),
+      MIN(l.created_at), MAX(l.created_at)
     FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
     WHERE l.created_at >= $1 AND l.created_at < $2 AND l.${REQUEST_LOGS}
     GROUP BY (l.created_at / 3600) * 3600, COALESCE(l.token_id, 0), COALESCE(l.token_name, ''),
@@ -1351,6 +1361,7 @@ async function buildUsageRollupDay(dayStart) {
       call_count = EXCLUDED.call_count, usage_count = EXCLUDED.usage_count, quota = EXCLUDED.quota,
       prompt_tokens = EXCLUDED.prompt_tokens, completion_tokens = EXCLUDED.completion_tokens,
       total_tokens = EXCLUDED.total_tokens, cache_tokens = EXCLUDED.cache_tokens,
+      fresh_input_tokens = EXCLUDED.fresh_input_tokens,
       first_at = EXCLUDED.first_at, last_at = EXCLUDED.last_at
   `, [dayStart, dayStart + 86400]);
 }
@@ -2389,7 +2400,8 @@ app.get('/api/user-analysis', async (req, res) => {
         SUM(quota) FILTER (WHERE type = 2) as total_quota,
         SUM(prompt_tokens) FILTER (WHERE type = 2) as total_prompt,
         SUM(completion_tokens) FILTER (WHERE type = 2) as total_completion,
-        SUM(${CACHE_TOKENS_EXPR}) FILTER (WHERE type = 2) as total_cache
+        SUM(${CACHE_TOKENS_EXPR}) FILTER (WHERE type = 2) as total_cache,
+        SUM(${RAW_FRESH_INPUT_TOKENS_EXPR}) FILTER (WHERE type = 2) as total_fresh_input
       FROM logs WHERE ${filterCol} = $1 AND created_at >= $2 AND ${REQUEST_LOGS} GROUP BY user_id
     `, [filterVal, ts]);
     if (basicRes.rows.length === 0) return res.json({ success: true, data: null });
@@ -2400,6 +2412,7 @@ app.get('/api/user-analysis', async (req, res) => {
     basic.total_prompt = parseInt(basic.total_prompt) || 0;
     basic.total_completion = parseInt(basic.total_completion) || 0;
     basic.total_cache = parseInt(basic.total_cache) || 0;
+    basic.total_fresh_input = parseInt(basic.total_fresh_input) || 0;
     basic.ip_count = parseInt(basic.ip_count) || 0;
     const ips = Array.isArray(basic.ips) ? basic.ips : [];
     delete basic.ips;

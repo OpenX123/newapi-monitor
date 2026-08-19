@@ -50,7 +50,7 @@ async function buildDay(pool, from) {
     INSERT INTO monitor_usage_rollups (
       bucket_start, dimension_hash, token_id, token_name, username, user_id, model_name, grp,
       channel_id, channel_name, ip, user_agent, call_count, usage_count, quota, prompt_tokens,
-      completion_tokens, total_tokens, cache_tokens, first_at, last_at
+      completion_tokens, total_tokens, cache_tokens, fresh_input_tokens, first_at, last_at
     )
     SELECT (l.created_at / 3600) * 3600,
       MD5(CONCAT_WS(CHR(31), COALESCE(l.token_id, 0), COALESCE(l.token_name, ''), COALESCE(l.username, ''),
@@ -63,7 +63,9 @@ async function buildDay(pool, from) {
       COALESCE(SUM(l.quota) FILTER (WHERE l.type = 2), 0), COALESCE(SUM(l.prompt_tokens) FILTER (WHERE l.type = 2), 0),
       COALESCE(SUM(l.completion_tokens) FILTER (WHERE l.type = 2), 0),
       COALESCE(SUM(COALESCE(l.prompt_tokens, 0) + COALESCE(l.completion_tokens, 0)) FILTER (WHERE l.type = 2), 0),
-      COALESCE(SUM(m.cache_tokens) FILTER (WHERE l.type = 2), 0), MIN(l.created_at), MAX(l.created_at)
+      COALESCE(SUM(m.cache_tokens) FILTER (WHERE l.type = 2), 0),
+      COALESCE(SUM(GREATEST(COALESCE(l.prompt_tokens, 0) - COALESCE(m.cache_tokens, 0), 0)) FILTER (WHERE l.type = 2), 0),
+      MIN(l.created_at), MAX(l.created_at)
     FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
     WHERE l.created_at >= $1 AND l.created_at < $2 AND l.type IN (2, 5)
     GROUP BY (l.created_at / 3600) * 3600, COALESCE(l.token_id, 0), COALESCE(l.token_name, ''),
