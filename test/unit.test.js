@@ -126,7 +126,7 @@ function testFormatters() {
   check('总 Token 列显示缓存命中率', cell.includes('缓存命中率 66.7%'), '');
   const familyCells = tokenFamilyCells({ gpt_input_tokens: 123, claude_input_tokens: 456, gpt_cache_tokens: 100, claude_cache_tokens: 200 });
   check('GPT 与 Claude 输入分栏', familyCells.includes('123') && familyCells.includes('456'));
-  check('GPT/Claude 分栏隐藏缓存折算比例', familyCells.includes('缓存') && !familyCells.includes('10%') && !familyCells.includes('20%'));
+  check('GPT/Claude 分栏显示缓存折算比例', familyCells.includes('缓存') && familyCells.includes('10%') && familyCells.includes('20%'));
   const noCache = tokenUsageCell({ total_tokens: 1000, prompt_tokens: 900, completion_tokens: 100, cache_tokens: 0 });
   check('无缓存时命中率显示为 0%', noCache.includes('缓存命中率 0.0%'), '');
   check('User-Agent 次数渲染为标签', userAgentTags([{ name: 'undici', count: 202 }]).includes('undici ×202'));
@@ -185,9 +185,17 @@ function testUsageSemantics() {
   section('统计口径');
   const src = serverSource();
   const js = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+  const GPT_CACHE_WEIGHTS = Object.freeze({ 'gpt-5.6-sol': 0.1, 'gpt-5.6-terra': 0.1, 'gpt-5.6-luna': 0.1 });
+  const usageMath = eval(`(function(){ ${extract('function freshInputTokens(', '\nconst USER_AGENT_EXPR')} return { freshInputTokens, totalUsageTokens, weightedInputTokens }; })()`);
+  equal('Anthropic prompt 与缓存并列时不重复相减', usageMath.freshInputTokens(100, 300, 'anthropic'), 100);
+  equal('Anthropic 总量包含并列的缓存读取', usageMath.totalUsageTokens(100, 10, 300, 'anthropic'), 410);
+  equal('Anthropic 缓存按20%折算', usageMath.weightedInputTokens(100, 300, 'claude-opus-5', 'anthropic'), 160);
+  equal('OpenAI prompt 已含缓存时不重复相加', usageMath.totalUsageTokens(400, 10, 300, 'openai'), 410);
+  equal('截图行总 Token 回归', usageMath.totalUsageTokens(57428429, 733411, 191194202, 'anthropic'), 249356042);
+  equal('截图行 Claude 折算输入回归', usageMath.weightedInputTokens(57428429, 191194202, 'claude-opus-5', 'anthropic'), 95667269.4);
   check('调用次数只统计真实请求（type 2/5）', /const REQUEST_LOGS = 'type IN \(2, 5\)'/.test(src));
   check('费用只对消费日志求和', /SUM\(quota\) FILTER \(WHERE type = 2\)/.test(src));
-  check('token 用量只对消费日志求和且缓存不重复计入', /SUM\(COALESCE\(prompt_tokens, 0\) \+ COALESCE\(completion_tokens, 0\)\) FILTER \(WHERE type = 2\)/.test(src));
+  check('总 Token 按 usage semantic 区分缓存是否已包含', /RAW_TOTAL_TOKENS_EXPR/.test(src) && /ANTHROPIC_USAGE_EXPR/.test(src));
   check('Sol 别名与 Terra 原名使用同一成本', /model_name IN \('gpt-5\.6-sol', 'gpt-5\.6-terra'\)/.test(src));
   check('Terra 成本区分新输入、缓存读取和输出', /GREATEST\(prompt_tokens - cache_tokens, 0\) \* 0\.16 \+ cache_tokens \* 0\.016 \+ completion_tokens \* 0\.96/.test(src));
   check('成本仅加入 Token 排行费用之后', /key: 'quota', label: '费用'[\s\S]{0,100}key: 'cost_usd', label: '成本'/.test(js));

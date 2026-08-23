@@ -66,8 +66,8 @@ function tokenUsageCell(r) {
   const detail = `缓存命中率 ${cacheHitPct.toFixed(1)}%`;
   const title = `总 Token ${(total || 0).toLocaleString()} tokens`
     + `\n缓存命中率 ${cacheHitPct.toFixed(1)}%`
-    + `\n输入 ${prompt.toLocaleString()}`
-    + (cache > 0 ? `（其中缓存读取 ${cache.toLocaleString()}）` : '')
+    + `\n新输入 ${fresh.toLocaleString()}`
+    + (cache > 0 ? `\n缓存读取 ${cache.toLocaleString()}` : '')
     + `\n输出 ${(r.completion_tokens || 0).toLocaleString()}`;
   return `<td title="${title}">
     <strong>${formatTokens(total)}</strong>
@@ -79,7 +79,7 @@ function tokenFamilyCell(label, r, prefix, cacheWeight) {
   const cache = Number(r[`${prefix}_cache_tokens`]) || 0;
   const fresh = Math.max(0, input - cache * cacheWeight);
   const detail = cache > 0
-    ? `新 ${formatTokens(fresh)} + 缓存 ${formatTokens(cache)}`
+    ? `新 ${formatTokens(fresh)} + 缓存 ${formatTokens(cache)} × ${cacheWeight * 100}%`
     : '无缓存读取';
   return `<td title="${label} ${input.toLocaleString()} tokens\n${detail}"><strong>${formatTokens(input)}</strong><br><span class="dim">${detail}</span></td>`;
 }
@@ -827,13 +827,13 @@ async function loadLogs(page) {
   const current = new Set(items.map(r => String(r.id)));
   tbody.innerHTML = items.map(r => {
     const failed = r.type === 5;
-    const total = (r.prompt_tokens || 0) + (r.completion_tokens || 0);
+    const total = Number(r.total_tokens) || 0;
     const isNew = !isFirstRender && logsPage === 1 && !previous.has(String(r.id));
     return `<tr class="${isNew ? 'row-new' : ''}">
       <td>${formatTime(r.created_at)}</td><td>${r.ip || '-'}</td><td>${r.username}</td><td><span class="dim">#${r.token_id}</span> ${r.token_name || ''}</td>
       <td><span class="model-tag">${r.model_name}</span>${failed ? ' <span class="dim">失败</span>' : ''}</td>
       <td>${failed ? '-' : formatUSD(r.quota)}</td>
-      <td>${(r.prompt_tokens||0).toLocaleString()}${r.cache_tokens > 0 ? `<br><span class="dim">缓存 ${(r.cache_tokens).toLocaleString()}</span>` : ''}</td>
+      <td>${(r.fresh_input_tokens||0).toLocaleString()}${r.cache_tokens > 0 ? `<br><span class="dim">缓存 ${(r.cache_tokens).toLocaleString()}</span>` : ''}</td>
       <td>${(r.completion_tokens||0).toLocaleString()}</td>
       <td>${total.toLocaleString()}</td>
       <td>${r.channel_name || '-'}</td>
@@ -1291,7 +1291,7 @@ async function analyzeItem(type, value, displayName) {
     <div style="margin-top:10px;font-size:13px;color:var(--text-dim);line-height:1.8">
       Token数: ${b.token_count} · 模型数: ${b.model_count}<br>
       活跃: ${d.activeHours || '-'}h（夜${d.nightActiveHours || 0}+日${d.dayActiveHours || 0}） · 密度: ${d.density || '-'}次/h<br>
-      Token 用量: <strong>${(b.total_tokens || 0).toLocaleString()}</strong>（入 ${formatTokens(b.total_prompt)} / 出 ${formatTokens(b.total_completion)}）<br>
+      Token 用量: <strong>${(b.total_tokens || 0).toLocaleString()}</strong>（新 ${formatTokens(b.total_fresh_input)} / 缓存 ${formatTokens(b.total_cache)} / 出 ${formatTokens(b.total_completion)}）<br>
       ${b.total_cache ? `其中缓存读取: ${formatTokens(b.total_cache)}（缓存命中率 ${cacheHitPct.toFixed(1)}%）<br>` : ''}
       费用: ${formatUSD(b.total_quota)}
     </div>

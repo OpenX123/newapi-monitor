@@ -11,7 +11,19 @@ const { Pool } = require('pg');
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 const REQUEST_LOGS = constant('REQUEST_LOGS');
-const CACHE_TOKENS_EXPR = constant('CACHE_TOKENS_EXPR');
+const sqlExpressions = {};
+for (const name of [
+  'CACHE_TOKENS_EXPR', 'ANTHROPIC_USAGE_EXPR', 'GPT_CACHE_WEIGHT_EXPR',
+  'RAW_FRESH_INPUT_TOKENS_EXPR', 'RAW_TOTAL_TOKENS_EXPR', 'RAW_INPUT_TOKENS_EXPR',
+  'GPT_MODEL_EXPR', 'CLAUDE_MODEL_EXPR', 'RAW_GPT_INPUT_TOKENS_EXPR',
+  'RAW_CLAUDE_INPUT_TOKENS_EXPR', 'RAW_GPT_CACHE_TOKENS_EXPR',
+  'RAW_CLAUDE_CACHE_TOKENS_EXPR', 'USAGE_AGG',
+]) {
+  let value = constant(name);
+  for (const [key, replacement] of Object.entries(sqlExpressions)) value = value.replaceAll(`\${${key}}`, replacement);
+  sqlExpressions[name] = value;
+}
+const { CACHE_TOKENS_EXPR, RAW_FRESH_INPUT_TOKENS_EXPR, RAW_TOTAL_TOKENS_EXPR, USAGE_AGG } = sqlExpressions;
 const USER_AGENT_EXPR = constant('USER_AGENT_EXPR');
 const SAFE_OTHER_JSON_EXPR = constant('SAFE_OTHER_JSON_EXPR');
 const CLIENT_USER_AGENT_EXPR = constant('CLIENT_USER_AGENT_EXPR');
@@ -19,7 +31,6 @@ const CLIENT_SIGNAL_EXPR = constant('CLIENT_SIGNAL_EXPR');
 const CLIENT_EXPR = constant('CLIENT_EXPR')
   .replaceAll('${CLIENT_USER_AGENT_EXPR}', CLIENT_USER_AGENT_EXPR)
   .replaceAll('${CLIENT_SIGNAL_EXPR}', CLIENT_SIGNAL_EXPR);
-const USAGE_AGG = constant('USAGE_AGG').replace(/\$\{CACHE_TOKENS_EXPR\}/g, CACHE_TOKENS_EXPR);
 const TS = 'EXTRACT(EPOCH FROM NOW())::bigint - 86400';
 const TZ = 'Asia/Shanghai';
 
@@ -65,7 +76,7 @@ async function run(name, sql, params = []) {
   section('趋势 / 分布 / 快照');
   await run('每小时趋势', `SELECT LPAD(EXTRACT(HOUR FROM TO_TIMESTAMP(created_at) AT TIME ZONE '${TZ}')::TEXT, 2, '0') || ':00' as label,
       COUNT(*) as count, SUM(quota) FILTER (WHERE type = 2) as quota,
-      SUM(COALESCE(prompt_tokens,0) + COALESCE(completion_tokens,0)) FILTER (WHERE type = 2) as total_tokens,
+      SUM(${RAW_TOTAL_TOKENS_EXPR}) FILTER (WHERE type = 2) as total_tokens,
       COUNT(DISTINCT token_id) as active_tokens, COUNT(DISTINCT username) as active_users
     FROM logs WHERE created_at >= ${TS} AND ${REQUEST_LOGS} GROUP BY label ORDER BY label LIMIT 3`);
   await run('用户输入 token 用量 TOP', `SELECT username, ${USAGE_AGG}
@@ -78,7 +89,9 @@ async function run(name, sql, params = []) {
 
   section('明细与分析');
   await run('调用记录分页', `SELECT id, created_at, type, username, token_name, token_id, model_name, quota,
-      prompt_tokens, completion_tokens, ${CACHE_TOKENS_EXPR} as cache_tokens, channel_name, "group" as grp, ip
+      prompt_tokens, completion_tokens, ${CACHE_TOKENS_EXPR} as cache_tokens,
+      ${RAW_FRESH_INPUT_TOKENS_EXPR} as fresh_input_tokens, ${RAW_TOTAL_TOKENS_EXPR} as total_tokens,
+      channel_name, "group" as grp, ip
     FROM logs WHERE created_at >= ${TS} AND ${REQUEST_LOGS} ORDER BY created_at DESC LIMIT 3`);
   await run('报错分析（字段解析已下推 SQL）', errorAnalysisSql().replace('$1', TS).replace('$2', '1000'));
   await run('单用户行为分析', `SELECT COUNT(*) as total_calls, COUNT(DISTINCT token_id) as token_count,

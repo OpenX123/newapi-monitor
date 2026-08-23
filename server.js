@@ -435,8 +435,8 @@ async function loadSavedConfig() {
 }
 
 // ==================== Redis 缓存 ====================
-// 聚合结果结构变化时递增，避免升级后读到旧口径的缓存（v15：GPT / Claude 缓存明细）
-const CACHE_SCHEMA_VERSION = 'v15';
+// 聚合结果结构变化时递增，避免升级后读到旧口径的缓存（v16：区分 OpenAI / Anthropic 缓存语义）
+const CACHE_SCHEMA_VERSION = 'v16';
 function cacheKey(key) {
   return `${CONFIG.redisKeyPrefix}:${CACHE_SCHEMA_VERSION}:${key}`;
 }
@@ -881,16 +881,17 @@ async function getOrBuildCached(key, range, builder, ttlSeconds = CONFIG.cacheTt
 //   调用次数 → 真实 API 请求（成功 2 + 失败 5）
 //   费用 / token → 仅消费日志（2）
 const REQUEST_LOGS = 'type IN (2, 5)';
-// OpenAI 口径：prompt/input tokens 已包含 cached tokens；缓存只是输入的拆分项。
-// 因此总 Token = prompt + completion，不能再次叠加缓存读取。
 // 缓存 token 用正则从 other 文本里取，避免 other 非法 JSON 或非整数值导致整条聚合报错。
 const CACHE_TOKENS_EXPR = `COALESCE(NULLIF(SUBSTRING(other FROM '"cache_tokens":([0-9]+)'), '')::bigint, 0)`;
+const ANTHROPIC_USAGE_EXPR = `LOWER(COALESCE(NULLIF(SUBSTRING(other FROM '"usage_semantic":"([^"]+)"'), ''), '')) = 'anthropic'`;
 // 输入 Token 排序：普通模型缓存按套餐 20% 折算，GPT-5.6 按官方 cached/input 价格比 10% 折算。
 // ponytail: 只维护有不同官方缓存比的明确别名；新型号出现时再补这里。
 const GPT_CACHE_WEIGHT_EXPR = `CASE WHEN LOWER(COALESCE(model_name, '')) IN ('gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna') THEN 0.1 ELSE 0.2 END`;
-const RAW_INPUT_TOKENS_EXPR = `GREATEST(COALESCE(prompt_tokens, 0) - ${CACHE_TOKENS_EXPR}, 0) + ${CACHE_TOKENS_EXPR} * ${GPT_CACHE_WEIGHT_EXPR}`;
-const ROLLUP_INPUT_TOKENS_EXPR = `GREATEST(COALESCE(prompt_tokens, 0) - COALESCE(cache_tokens, 0), 0) + COALESCE(cache_tokens, 0) * ${GPT_CACHE_WEIGHT_EXPR}`;
-const RAW_FRESH_INPUT_TOKENS_EXPR = `GREATEST(COALESCE(prompt_tokens, 0) - ${CACHE_TOKENS_EXPR}, 0)`;
+// OpenAI 的 prompt 已包含缓存读取；Anthropic 的 input 与 cache_read 是并列字段。
+const RAW_FRESH_INPUT_TOKENS_EXPR = `CASE WHEN ${ANTHROPIC_USAGE_EXPR} THEN COALESCE(prompt_tokens, 0) ELSE GREATEST(COALESCE(prompt_tokens, 0) - ${CACHE_TOKENS_EXPR}, 0) END`;
+const RAW_TOTAL_TOKENS_EXPR = `COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0) + CASE WHEN ${ANTHROPIC_USAGE_EXPR} THEN ${CACHE_TOKENS_EXPR} ELSE 0 END`;
+const RAW_INPUT_TOKENS_EXPR = `${RAW_FRESH_INPUT_TOKENS_EXPR} + ${CACHE_TOKENS_EXPR} * ${GPT_CACHE_WEIGHT_EXPR}`;
+const ROLLUP_INPUT_TOKENS_EXPR = `COALESCE(fresh_input_tokens, 0) + COALESCE(cache_tokens, 0) * ${GPT_CACHE_WEIGHT_EXPR}`;
 const GPT_MODEL_EXPR = `LOWER(COALESCE(model_name, '')) ~ '(gpt|codex)'`;
 const CLAUDE_MODEL_EXPR = `LOWER(COALESCE(model_name, '')) LIKE '%claude%'`;
 const RAW_GPT_INPUT_TOKENS_EXPR = `CASE WHEN ${GPT_MODEL_EXPR} THEN ${RAW_INPUT_TOKENS_EXPR} ELSE 0 END`;
@@ -902,11 +903,21 @@ const RAW_CLAUDE_CACHE_TOKENS_EXPR = `CASE WHEN ${CLAUDE_MODEL_EXPR} THEN ${CACH
 const ROLLUP_GPT_CACHE_TOKENS_EXPR = `CASE WHEN ${GPT_MODEL_EXPR} THEN COALESCE(cache_tokens, 0) ELSE 0 END`;
 const ROLLUP_CLAUDE_CACHE_TOKENS_EXPR = `CASE WHEN ${CLAUDE_MODEL_EXPR} THEN COALESCE(cache_tokens, 0) ELSE 0 END`;
 const GPT_CACHE_WEIGHTS = Object.freeze({ 'gpt-5.6-sol': 0.1, 'gpt-5.6-terra': 0.1, 'gpt-5.6-luna': 0.1 });
-function weightedInputTokens(promptTokens, cacheTokens, modelName) {
+function freshInputTokens(promptTokens, cacheTokens, usageSemantic) {
   const prompt = Math.max(0, Number(promptTokens) || 0);
   const cache = Math.max(0, Number(cacheTokens) || 0);
+  return String(usageSemantic || '').toLowerCase() === 'anthropic' ? prompt : Math.max(prompt - cache, 0);
+}
+function totalUsageTokens(promptTokens, completionTokens, cacheTokens, usageSemantic) {
+  const prompt = Math.max(0, Number(promptTokens) || 0);
+  const completion = Math.max(0, Number(completionTokens) || 0);
+  const cache = Math.max(0, Number(cacheTokens) || 0);
+  return prompt + completion + (String(usageSemantic || '').toLowerCase() === 'anthropic' ? cache : 0);
+}
+function weightedInputTokens(promptTokens, cacheTokens, modelName, usageSemantic) {
+  const cache = Math.max(0, Number(cacheTokens) || 0);
   const weight = GPT_CACHE_WEIGHTS[String(modelName || '').toLowerCase()] ?? 0.2;
-  return Math.max(prompt - cache, 0) + cache * weight;
+  return freshInputTokens(promptTokens, cache, usageSemantic) + cache * weight;
 }
 const USER_AGENT_EXPR = `NULLIF(SUBSTRING(other FROM '"user_agent":"([^"\\\\]*)"'), '')`;
 const SAFE_OTHER_JSON_EXPR = `(CASE
@@ -946,7 +957,7 @@ const USAGE_AGG = `COUNT(*) as count,
       SUM(quota) FILTER (WHERE type = 2) as quota,
       SUM(prompt_tokens) FILTER (WHERE type = 2) as prompt_tokens,
       SUM(completion_tokens) FILTER (WHERE type = 2) as completion_tokens,
-      SUM(COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0)) FILTER (WHERE type = 2) as total_tokens,
+      SUM(${RAW_TOTAL_TOKENS_EXPR}) FILTER (WHERE type = 2) as total_tokens,
       SUM(${CACHE_TOKENS_EXPR}) FILTER (WHERE type = 2) as cache_tokens,
       SUM(${RAW_FRESH_INPUT_TOKENS_EXPR}) FILTER (WHERE type = 2) as fresh_input_tokens,
       SUM(${RAW_INPUT_TOKENS_EXPR}) FILTER (WHERE type = 2) as input_tokens,
@@ -1001,6 +1012,7 @@ async function fetchLogsSinceId(lastLogId, minCreatedAt = 0) {
     prompt_tokens: parseInt(r.prompt_tokens) || 0,
     completion_tokens: parseInt(r.completion_tokens) || 0,
     cache_tokens: extractCacheTokens(r.other),
+    usage_semantic: extractUsageSemantic(r.other),
     user_agent: extractUserAgent(r.other),
     trace_type: extractTraceType(r.other),
   }));
@@ -1010,6 +1022,10 @@ async function fetchLogsSinceId(lastLogId, minCreatedAt = 0) {
 function extractCacheTokens(other) {
   const m = /"cache_tokens":([0-9]+)/.exec(other || '');
   return m ? parseInt(m[1]) || 0 : 0;
+}
+
+function extractUsageSemantic(other) {
+  return String(parseOtherJson(other)?.usage_semantic || '').toLowerCase();
 }
 
 function extractUserAgent(other) {
@@ -1063,6 +1079,7 @@ function mergeTodaySnapshot(snapshot, rows) {
     completion_tokens: parseInt(t.completion_tokens) || 0,
     total_tokens: parseFloat(t.total_tokens) || 0,
     cache_tokens: parseInt(t.cache_tokens) || 0,
+    fresh_input_tokens: parseInt(t.fresh_input_tokens) || 0,
     input_tokens: parseFloat(t.input_tokens) || 0,
     gpt_input_tokens: parseFloat(t.gpt_input_tokens) || 0,
     claude_input_tokens: parseFloat(t.claude_input_tokens) || 0,
@@ -1085,6 +1102,7 @@ function mergeTodaySnapshot(snapshot, rows) {
         completion_tokens: 0,
         total_tokens: 0,
         cache_tokens: 0,
+        fresh_input_tokens: 0,
         input_tokens: 0,
         gpt_input_tokens: 0,
         claude_input_tokens: 0,
@@ -1100,9 +1118,10 @@ function mergeTodaySnapshot(snapshot, rows) {
       token.quota += row.quota || 0;
       token.prompt_tokens += row.prompt_tokens || 0;
       token.completion_tokens += row.completion_tokens || 0;
-      token.total_tokens += (row.prompt_tokens || 0) + (row.completion_tokens || 0);
+      token.total_tokens += totalUsageTokens(row.prompt_tokens, row.completion_tokens, row.cache_tokens, row.usage_semantic);
       token.cache_tokens += row.cache_tokens || 0;
-      const familyInput = weightedInputTokens(row.prompt_tokens, row.cache_tokens, row.model_name);
+      token.fresh_input_tokens += freshInputTokens(row.prompt_tokens, row.cache_tokens, row.usage_semantic);
+      const familyInput = weightedInputTokens(row.prompt_tokens, row.cache_tokens, row.model_name, row.usage_semantic);
       token.input_tokens += familyInput;
       if (/(gpt|codex)/i.test(row.model_name || '')) token.gpt_input_tokens += familyInput;
       if (/claude/i.test(row.model_name || '')) token.claude_input_tokens += familyInput;
@@ -1140,19 +1159,15 @@ async function getTodayAggregation() {
       SUM(l.quota) FILTER (WHERE l.type = 2) as quota,
       SUM(l.prompt_tokens) FILTER (WHERE l.type = 2) as prompt_tokens,
       SUM(l.completion_tokens) FILTER (WHERE l.type = 2) as completion_tokens,
-      SUM(COALESCE(l.prompt_tokens, 0) + COALESCE(l.completion_tokens, 0)) FILTER (WHERE l.type = 2) as total_tokens,
+      SUM(${RAW_TOTAL_TOKENS_EXPR}) FILTER (WHERE l.type = 2) as total_tokens,
       SUM(COALESCE(m.cache_tokens, 0)) FILTER (WHERE l.type = 2) as cache_tokens,
-      SUM(GREATEST(COALESCE(l.prompt_tokens, 0) - COALESCE(m.cache_tokens, 0), 0)) FILTER (WHERE l.type = 2) as fresh_input_tokens,
-      SUM(GREATEST(COALESCE(l.prompt_tokens, 0) - COALESCE(m.cache_tokens, 0), 0)
-        + COALESCE(m.cache_tokens, 0) * CASE WHEN LOWER(COALESCE(l.model_name, '')) IN ('gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna') THEN 0.1 ELSE 0.2 END)
-        FILTER (WHERE l.type = 2) as input_tokens,
+      SUM(${RAW_FRESH_INPUT_TOKENS_EXPR}) FILTER (WHERE l.type = 2) as fresh_input_tokens,
+      SUM(${RAW_INPUT_TOKENS_EXPR}) FILTER (WHERE l.type = 2) as input_tokens,
       SUM(CASE WHEN LOWER(COALESCE(l.model_name, '')) ~ '(gpt|codex)' THEN
-        GREATEST(COALESCE(l.prompt_tokens, 0) - COALESCE(m.cache_tokens, 0), 0)
-          + COALESCE(m.cache_tokens, 0) * CASE WHEN LOWER(COALESCE(l.model_name, '')) IN ('gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna') THEN 0.1 ELSE 0.2 END
+        ${RAW_INPUT_TOKENS_EXPR}
         ELSE 0 END) FILTER (WHERE l.type = 2) as gpt_input_tokens,
       SUM(CASE WHEN LOWER(COALESCE(l.model_name, '')) LIKE '%claude%' THEN
-        GREATEST(COALESCE(l.prompt_tokens, 0) - COALESCE(m.cache_tokens, 0), 0)
-          + COALESCE(m.cache_tokens, 0) * CASE WHEN LOWER(COALESCE(l.model_name, '')) IN ('gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna') THEN 0.1 ELSE 0.2 END
+        ${RAW_INPUT_TOKENS_EXPR}
         ELSE 0 END) FILTER (WHERE l.type = 2) as claude_input_tokens,
       SUM(CASE WHEN LOWER(COALESCE(l.model_name, '')) ~ '(gpt|codex)' THEN COALESCE(m.cache_tokens, 0) ELSE 0 END)
         FILTER (WHERE l.type = 2) as gpt_cache_tokens,
@@ -1320,9 +1335,9 @@ function getUsageSource(range) {
         CASE WHEN l.type = 2 THEN COALESCE(l.quota, 0) ELSE 0 END,
         CASE WHEN l.type = 2 THEN COALESCE(l.prompt_tokens, 0) ELSE 0 END,
         CASE WHEN l.type = 2 THEN COALESCE(l.completion_tokens, 0) ELSE 0 END,
-        CASE WHEN l.type = 2 THEN COALESCE(l.prompt_tokens, 0) + COALESCE(l.completion_tokens, 0) ELSE 0 END,
+        CASE WHEN l.type = 2 THEN ${RAW_TOTAL_TOKENS_EXPR} ELSE 0 END,
         CASE WHEN l.type = 2 THEN COALESCE(m.cache_tokens, 0) ELSE 0 END,
-        CASE WHEN l.type = 2 THEN GREATEST(COALESCE(l.prompt_tokens, 0) - COALESCE(m.cache_tokens, 0), 0) ELSE 0 END,
+        CASE WHEN l.type = 2 THEN ${RAW_FRESH_INPUT_TOKENS_EXPR} ELSE 0 END,
         l.created_at, l.created_at
       FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
       WHERE l.created_at >= GREATEST($1, $2) AND l.${REQUEST_LOGS}`,
@@ -1347,9 +1362,9 @@ async function buildUsageRollupDay(dayStart) {
       COALESCE(SUM(l.quota) FILTER (WHERE l.type = 2), 0),
       COALESCE(SUM(l.prompt_tokens) FILTER (WHERE l.type = 2), 0),
       COALESCE(SUM(l.completion_tokens) FILTER (WHERE l.type = 2), 0),
-      COALESCE(SUM(COALESCE(l.prompt_tokens, 0) + COALESCE(l.completion_tokens, 0)) FILTER (WHERE l.type = 2), 0),
+      COALESCE(SUM(${RAW_TOTAL_TOKENS_EXPR}) FILTER (WHERE l.type = 2), 0),
       COALESCE(SUM(m.cache_tokens) FILTER (WHERE l.type = 2), 0),
-      COALESCE(SUM(GREATEST(COALESCE(l.prompt_tokens, 0) - COALESCE(m.cache_tokens, 0), 0)) FILTER (WHERE l.type = 2), 0),
+      COALESCE(SUM(${RAW_FRESH_INPUT_TOKENS_EXPR}) FILTER (WHERE l.type = 2), 0),
       MIN(l.created_at), MAX(l.created_at)
     FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
     WHERE l.created_at >= $1 AND l.created_at < $2 AND l.${REQUEST_LOGS}
@@ -2155,7 +2170,7 @@ async function runRealtimeRules() {
         COUNT(*) FILTER (WHERE created_at >= $1) AS cur_calls,
         COUNT(*) FILTER (WHERE created_at <  $1) AS prev_calls,
         COALESCE(SUM(quota) FILTER (WHERE created_at >= $1 AND type = 2), 0) AS cur_quota,
-        COALESCE(SUM(COALESCE(prompt_tokens,0) + COALESCE(completion_tokens,0)) FILTER (WHERE created_at >= $1 AND type = 2), 0) AS cur_tokens,
+        COALESCE(SUM(${RAW_TOTAL_TOKENS_EXPR}) FILTER (WHERE created_at >= $1 AND type = 2), 0) AS cur_tokens,
         COUNT(DISTINCT ip) FILTER (WHERE created_at >= $1 AND COALESCE(ip, '') <> '') AS cur_ips
       FROM logs WHERE created_at >= $2 AND ${REQUEST_LOGS}
       GROUP BY token_id, token_name, username, user_id
@@ -2401,7 +2416,8 @@ app.get('/api/user-analysis', async (req, res) => {
         SUM(prompt_tokens) FILTER (WHERE type = 2) as total_prompt,
         SUM(completion_tokens) FILTER (WHERE type = 2) as total_completion,
         SUM(${CACHE_TOKENS_EXPR}) FILTER (WHERE type = 2) as total_cache,
-        SUM(${RAW_FRESH_INPUT_TOKENS_EXPR}) FILTER (WHERE type = 2) as total_fresh_input
+        SUM(${RAW_FRESH_INPUT_TOKENS_EXPR}) FILTER (WHERE type = 2) as total_fresh_input,
+        SUM(${RAW_TOTAL_TOKENS_EXPR}) FILTER (WHERE type = 2) as total_tokens
       FROM logs WHERE ${filterCol} = $1 AND created_at >= $2 AND ${REQUEST_LOGS} GROUP BY user_id
     `, [filterVal, ts]);
     if (basicRes.rows.length === 0) return res.json({ success: true, data: null });
@@ -2413,10 +2429,10 @@ app.get('/api/user-analysis', async (req, res) => {
     basic.total_completion = parseInt(basic.total_completion) || 0;
     basic.total_cache = parseInt(basic.total_cache) || 0;
     basic.total_fresh_input = parseInt(basic.total_fresh_input) || 0;
+    basic.total_tokens = parseInt(basic.total_tokens) || 0;
     basic.ip_count = parseInt(basic.ip_count) || 0;
     const ips = Array.isArray(basic.ips) ? basic.ips : [];
     delete basic.ips;
-    basic.total_tokens = basic.total_prompt + basic.total_completion;
     const scriptTraceStats = await getScriptTraceStatsForFilter(filterCol, filterVal, ts);
     const autoDisableWindowStats = filterCol === 'token_id'
       ? await getScriptTraceStatsForFilter(filterCol, filterVal, Math.floor(Date.now() / 1000) - 86400)
@@ -2664,6 +2680,7 @@ app.get('/api/recent-logs', async (req, res) => {
       pool.query(`
         SELECT id, created_at, type, username, token_name, token_id, model_name, quota,
           prompt_tokens, completion_tokens, ${CACHE_TOKENS_EXPR} as cache_tokens,
+          ${RAW_FRESH_INPUT_TOKENS_EXPR} as fresh_input_tokens, ${RAW_TOTAL_TOKENS_EXPR} as total_tokens,
           channel_name, "group" as grp, ip
         FROM logs ${where}
         ORDER BY created_at DESC LIMIT $${values.length + 1} OFFSET $${values.length + 2}

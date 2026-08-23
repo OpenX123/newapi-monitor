@@ -1,6 +1,7 @@
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const dayStart = Math.floor((Date.now() / 1000 + 28800) / 86400) * 86400 - 28800;
 const days = Math.min(30, Math.max(1, parseInt((process.argv.find(arg => arg.startsWith('--days=')) || '').split('=')[1]) || 30));
+const anthropicUsage = `LOWER(COALESCE(NULLIF(SUBSTRING(l.other FROM '"usage_semantic":"([^"]+)"'), ''), '')) = 'anthropic'`;
 
 function parseOther(text) {
   try { return JSON.parse(text || '{}'); } catch { return {}; }
@@ -62,9 +63,11 @@ async function buildDay(pool, from) {
       COUNT(*), COUNT(*) FILTER (WHERE l.type = 2),
       COALESCE(SUM(l.quota) FILTER (WHERE l.type = 2), 0), COALESCE(SUM(l.prompt_tokens) FILTER (WHERE l.type = 2), 0),
       COALESCE(SUM(l.completion_tokens) FILTER (WHERE l.type = 2), 0),
-      COALESCE(SUM(COALESCE(l.prompt_tokens, 0) + COALESCE(l.completion_tokens, 0)) FILTER (WHERE l.type = 2), 0),
+      COALESCE(SUM(COALESCE(l.prompt_tokens, 0) + COALESCE(l.completion_tokens, 0)
+        + CASE WHEN ${anthropicUsage} THEN COALESCE(m.cache_tokens, 0) ELSE 0 END) FILTER (WHERE l.type = 2), 0),
       COALESCE(SUM(m.cache_tokens) FILTER (WHERE l.type = 2), 0),
-      COALESCE(SUM(GREATEST(COALESCE(l.prompt_tokens, 0) - COALESCE(m.cache_tokens, 0), 0)) FILTER (WHERE l.type = 2), 0),
+      COALESCE(SUM(CASE WHEN ${anthropicUsage} THEN COALESCE(l.prompt_tokens, 0)
+        ELSE GREATEST(COALESCE(l.prompt_tokens, 0) - COALESCE(m.cache_tokens, 0), 0) END) FILTER (WHERE l.type = 2), 0),
       MIN(l.created_at), MAX(l.created_at)
     FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
     WHERE l.created_at >= $1 AND l.created_at < $2 AND l.type IN (2, 5)
