@@ -224,8 +224,10 @@ function testUsageSemantics() {
   equal('User-Agent 增量缓存保留转义字符', extractUserAgent('{"user_agent":"client \\\"quoted\\\""}'), 'client "quoted"');
   check('7/30 天统计读取小时汇总并只直查今天', /FROM monitor_usage_rollups WHERE bucket_start >= \$1 AND bucket_start < \$2/.test(src) && /l\.created_at >= GREATEST\(\$1, \$2\)/.test(src));
   check('脚本识别读取增量 trace 字段而非解析整列 JSON', /m\.trace_type = 'claude cli trace'/.test(src) && !/async function getScriptDisableCandidates[\s\S]{0,1800}other::jsonb/.test(src));
+  check('实时聚合只对未解析日志读取 other', /m\.usage_semantic IS NOT NULL THEN m\.usage_semantic = 'anthropic' ELSE l\.other LIKE/.test(src));
+  check('Token UA 聚合不再物化完整用量源', !/if \(dimension === 'token'\)[\s\S]{0,300}WITH source AS MATERIALIZED/.test(src));
   const { metrics } = require('../backfill-usage-rollups');
-  equal('增量指标识别 Trace 与缓存 Token', metrics('{"cache_tokens":600,"admin_info":{"channel_affinity":{"reason":"Claude CLI Trace"}}}'), { userAgent: '', cacheTokens: 600, traceType: 'claude cli trace' });
+  equal('增量指标识别语义、Trace 与缓存 Token', metrics('{"cache_tokens":600,"usage_semantic":"anthropic","admin_info":{"channel_affinity":{"reason":"Claude CLI Trace"}}}'), { userAgent: '', cacheTokens: 600, usageSemantic: 'anthropic', traceType: 'claude cli trace' });
   const { parseAccessLine } = require('../backfill-user-agents');
   const access = parseAccessLine('42.48.83.151 - - [14/Aug/2026:09:13:54 +0800] "POST /v1/messages?beta=true HTTP/1.1" 200 1632 "-" "claude-cli/2.1.89 (external, cli)" "-"');
   check('访问日志能提取 IP、接口与完整 UA', access?.ip === '42.48.83.151' && access.path === '/v1/messages' && access.userAgent === 'claude-cli/2.1.89 (external, cli)');

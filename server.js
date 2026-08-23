@@ -334,6 +334,7 @@ async function initDB() {
       user_agent TEXT NOT NULL,
       matched_delta_seconds INTEGER NOT NULL,
       cache_tokens BIGINT NOT NULL DEFAULT 0,
+      usage_semantic TEXT,
       trace_type TEXT NOT NULL DEFAULT '',
       created_at INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())::INTEGER
     );
@@ -365,6 +366,7 @@ async function initDB() {
     );
   `);
   await pool.query('ALTER TABLE monitor_log_user_agents ADD COLUMN IF NOT EXISTS cache_tokens BIGINT NOT NULL DEFAULT 0');
+  await pool.query('ALTER TABLE monitor_log_user_agents ADD COLUMN IF NOT EXISTS usage_semantic TEXT');
   await pool.query("ALTER TABLE monitor_log_user_agents ADD COLUMN IF NOT EXISTS trace_type TEXT NOT NULL DEFAULT ''");
   await pool.query('ALTER TABLE monitor_usage_rollups ADD COLUMN IF NOT EXISTS fresh_input_tokens BIGINT NOT NULL DEFAULT 0');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_monitor_usage_rollups_bucket ON monitor_usage_rollups (bucket_start)');
@@ -891,9 +893,11 @@ const GPT_CACHE_WEIGHT_EXPR = `CASE WHEN LOWER(COALESCE(model_name, '')) IN ('gp
 const RAW_FRESH_INPUT_TOKENS_EXPR = `CASE WHEN ${ANTHROPIC_USAGE_EXPR} THEN COALESCE(prompt_tokens, 0) ELSE GREATEST(COALESCE(prompt_tokens, 0) - ${CACHE_TOKENS_EXPR}, 0) END`;
 const RAW_TOTAL_TOKENS_EXPR = `COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0) + CASE WHEN ${ANTHROPIC_USAGE_EXPR} THEN ${CACHE_TOKENS_EXPR} ELSE 0 END`;
 const RAW_INPUT_TOKENS_EXPR = `${RAW_FRESH_INPUT_TOKENS_EXPR} + ${CACHE_TOKENS_EXPR} * ${GPT_CACHE_WEIGHT_EXPR}`;
-const JOINED_FRESH_INPUT_TOKENS_EXPR = `CASE WHEN l.other LIKE '%"usage_semantic":"anthropic"%' THEN COALESCE(l.prompt_tokens, 0) ELSE GREATEST(COALESCE(l.prompt_tokens, 0) - COALESCE(m.cache_tokens, 0), 0) END`;
-const JOINED_TOTAL_TOKENS_EXPR = `COALESCE(l.prompt_tokens, 0) + COALESCE(l.completion_tokens, 0) + CASE WHEN l.other LIKE '%"usage_semantic":"anthropic"%' THEN COALESCE(m.cache_tokens, 0) ELSE 0 END`;
-const JOINED_INPUT_TOKENS_EXPR = `${JOINED_FRESH_INPUT_TOKENS_EXPR} + COALESCE(m.cache_tokens, 0) * ${GPT_CACHE_WEIGHT_EXPR}`;
+const JOINED_CACHE_TOKENS_EXPR = `CASE WHEN m.log_id IS NOT NULL THEN COALESCE(m.cache_tokens, 0) ELSE COALESCE(NULLIF(SUBSTRING(l.other FROM '"cache_tokens":([0-9]+)'), '')::bigint, 0) END`;
+const JOINED_ANTHROPIC_USAGE_EXPR = `CASE WHEN m.usage_semantic IS NOT NULL THEN m.usage_semantic = 'anthropic' ELSE l.other LIKE '%"usage_semantic":"anthropic"%' END`;
+const JOINED_FRESH_INPUT_TOKENS_EXPR = `CASE WHEN ${JOINED_ANTHROPIC_USAGE_EXPR} THEN COALESCE(l.prompt_tokens, 0) ELSE GREATEST(COALESCE(l.prompt_tokens, 0) - ${JOINED_CACHE_TOKENS_EXPR}, 0) END`;
+const JOINED_TOTAL_TOKENS_EXPR = `COALESCE(l.prompt_tokens, 0) + COALESCE(l.completion_tokens, 0) + CASE WHEN ${JOINED_ANTHROPIC_USAGE_EXPR} THEN ${JOINED_CACHE_TOKENS_EXPR} ELSE 0 END`;
+const JOINED_INPUT_TOKENS_EXPR = `${JOINED_FRESH_INPUT_TOKENS_EXPR} + ${JOINED_CACHE_TOKENS_EXPR} * ${GPT_CACHE_WEIGHT_EXPR}`;
 const ROLLUP_INPUT_TOKENS_EXPR = `COALESCE(fresh_input_tokens, 0) + COALESCE(cache_tokens, 0) * ${GPT_CACHE_WEIGHT_EXPR}`;
 const GPT_MODEL_EXPR = `LOWER(COALESCE(model_name, '')) ~ '(gpt|codex)'`;
 const CLAUDE_MODEL_EXPR = `LOWER(COALESCE(model_name, '')) LIKE '%claude%'`;
@@ -1028,7 +1032,7 @@ function extractCacheTokens(other) {
 }
 
 function extractUsageSemantic(other) {
-  return String(parseOtherJson(other)?.usage_semantic || '').toLowerCase();
+  return String(parseOtherJson(other)?.usage_semantic || '').toLowerCase() === 'anthropic' ? 'anthropic' : '';
 }
 
 function extractUserAgent(other) {
@@ -1049,16 +1053,16 @@ function extractTraceType(other) {
 }
 
 async function cacheLogMetrics(rows) {
-  const entries = rows.map(row => [row.id, row.user_agent || '', row.cache_tokens, row.trace_type]);
+  const entries = rows.map(row => [row.id, row.user_agent || '', row.cache_tokens, row.usage_semantic || '', row.trace_type]);
   for (let i = 0; i < entries.length; i += 500) {
     const values = [];
     const params = [];
-    for (const [id, userAgent, cacheTokens, traceType] of entries.slice(i, i + 500)) {
+    for (const [id, userAgent, cacheTokens, usageSemantic, traceType] of entries.slice(i, i + 500)) {
       const offset = params.length;
-      params.push(id, userAgent, cacheTokens, traceType);
-      values.push(`($${offset + 1}, $${offset + 2}, 0, $${offset + 3}, $${offset + 4})`);
+      params.push(id, userAgent, cacheTokens, usageSemantic, traceType);
+      values.push(`($${offset + 1}, $${offset + 2}, 0, $${offset + 3}, $${offset + 4}, $${offset + 5})`);
     }
-    await pool.query(`INSERT INTO monitor_log_user_agents (log_id, user_agent, matched_delta_seconds, cache_tokens, trace_type) VALUES ${values.join(',')} ON CONFLICT (log_id) DO UPDATE SET user_agent = CASE WHEN EXCLUDED.user_agent <> '' THEN EXCLUDED.user_agent ELSE monitor_log_user_agents.user_agent END, cache_tokens = EXCLUDED.cache_tokens, trace_type = EXCLUDED.trace_type`, params);
+    await pool.query(`INSERT INTO monitor_log_user_agents (log_id, user_agent, matched_delta_seconds, cache_tokens, usage_semantic, trace_type) VALUES ${values.join(',')} ON CONFLICT (log_id) DO UPDATE SET user_agent = CASE WHEN EXCLUDED.user_agent <> '' THEN EXCLUDED.user_agent ELSE monitor_log_user_agents.user_agent END, cache_tokens = EXCLUDED.cache_tokens, usage_semantic = EXCLUDED.usage_semantic, trace_type = EXCLUDED.trace_type`, params);
   }
 }
 
@@ -1163,7 +1167,7 @@ async function getTodayAggregation() {
       SUM(l.prompt_tokens) FILTER (WHERE l.type = 2) as prompt_tokens,
       SUM(l.completion_tokens) FILTER (WHERE l.type = 2) as completion_tokens,
       SUM(${JOINED_TOTAL_TOKENS_EXPR}) FILTER (WHERE l.type = 2) as total_tokens,
-      SUM(COALESCE(m.cache_tokens, 0)) FILTER (WHERE l.type = 2) as cache_tokens,
+      SUM(${JOINED_CACHE_TOKENS_EXPR}) FILTER (WHERE l.type = 2) as cache_tokens,
       SUM(${JOINED_FRESH_INPUT_TOKENS_EXPR}) FILTER (WHERE l.type = 2) as fresh_input_tokens,
       SUM(${JOINED_INPUT_TOKENS_EXPR}) FILTER (WHERE l.type = 2) as input_tokens,
       SUM(CASE WHEN LOWER(COALESCE(l.model_name, '')) ~ '(gpt|codex)' THEN
@@ -1172,9 +1176,9 @@ async function getTodayAggregation() {
       SUM(CASE WHEN LOWER(COALESCE(l.model_name, '')) LIKE '%claude%' THEN
         ${JOINED_INPUT_TOKENS_EXPR}
         ELSE 0 END) FILTER (WHERE l.type = 2) as claude_input_tokens,
-      SUM(CASE WHEN LOWER(COALESCE(l.model_name, '')) ~ '(gpt|codex)' THEN COALESCE(m.cache_tokens, 0) ELSE 0 END)
+      SUM(CASE WHEN LOWER(COALESCE(l.model_name, '')) ~ '(gpt|codex)' THEN ${JOINED_CACHE_TOKENS_EXPR} ELSE 0 END)
         FILTER (WHERE l.type = 2) as gpt_cache_tokens,
-      SUM(CASE WHEN LOWER(COALESCE(l.model_name, '')) LIKE '%claude%' THEN COALESCE(m.cache_tokens, 0) ELSE 0 END)
+      SUM(CASE WHEN LOWER(COALESCE(l.model_name, '')) LIKE '%claude%' THEN ${JOINED_CACHE_TOKENS_EXPR} ELSE 0 END)
         FILTER (WHERE l.type = 2) as claude_cache_tokens
     FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
     WHERE l.created_at >= $1 AND l.${REQUEST_LOGS}
@@ -1339,7 +1343,7 @@ function getUsageSource(range) {
         CASE WHEN l.type = 2 THEN COALESCE(l.prompt_tokens, 0) ELSE 0 END,
         CASE WHEN l.type = 2 THEN COALESCE(l.completion_tokens, 0) ELSE 0 END,
         CASE WHEN l.type = 2 THEN ${JOINED_TOTAL_TOKENS_EXPR} ELSE 0 END,
-        CASE WHEN l.type = 2 THEN COALESCE(m.cache_tokens, 0) ELSE 0 END,
+        CASE WHEN l.type = 2 THEN ${JOINED_CACHE_TOKENS_EXPR} ELSE 0 END,
         CASE WHEN l.type = 2 THEN ${JOINED_FRESH_INPUT_TOKENS_EXPR} ELSE 0 END,
         l.created_at, l.created_at
       FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
@@ -1366,7 +1370,7 @@ async function buildUsageRollupDay(dayStart) {
       COALESCE(SUM(l.prompt_tokens) FILTER (WHERE l.type = 2), 0),
       COALESCE(SUM(l.completion_tokens) FILTER (WHERE l.type = 2), 0),
       COALESCE(SUM(${JOINED_TOTAL_TOKENS_EXPR}) FILTER (WHERE l.type = 2), 0),
-      COALESCE(SUM(m.cache_tokens) FILTER (WHERE l.type = 2), 0),
+      COALESCE(SUM(${JOINED_CACHE_TOKENS_EXPR}) FILTER (WHERE l.type = 2), 0),
       COALESCE(SUM(${JOINED_FRESH_INPUT_TOKENS_EXPR}) FILTER (WHERE l.type = 2), 0),
       MIN(l.created_at), MAX(l.created_at)
     FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
@@ -1416,7 +1420,14 @@ async function getAggregation(range, dimension) {
   const rows = result.rows.map(parseUsageRow);
   if (dimension === 'token') {
     const uaRes = await pool.query(`
-      WITH source AS MATERIALIZED (${source.sql})
+      WITH source AS (
+        SELECT token_id, user_agent, usage_count
+        FROM monitor_usage_rollups WHERE bucket_start >= $1 AND bucket_start < $2
+        UNION ALL
+        SELECT l.token_id, COALESCE(m.user_agent, ''), 1
+        FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
+        WHERE l.created_at >= GREATEST($1, $2) AND l.type = 2
+      )
       SELECT token_id, user_agent, SUM(usage_count) AS count FROM source
       WHERE user_agent <> '' GROUP BY token_id, user_agent
     `, source.params);
