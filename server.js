@@ -883,7 +883,7 @@ async function getOrBuildCached(key, range, builder, ttlSeconds = CONFIG.cacheTt
 const REQUEST_LOGS = 'type IN (2, 5)';
 // 缓存 token 用正则从 other 文本里取，避免 other 非法 JSON 或非整数值导致整条聚合报错。
 const CACHE_TOKENS_EXPR = `COALESCE(NULLIF(SUBSTRING(other FROM '"cache_tokens":([0-9]+)'), '')::bigint, 0)`;
-const ANTHROPIC_USAGE_EXPR = `LOWER(COALESCE(NULLIF(SUBSTRING(other FROM '"usage_semantic":"([^"]+)"'), ''), '')) = 'anthropic'`;
+const ANTHROPIC_USAGE_EXPR = `other LIKE '%"usage_semantic":"anthropic"%'`;
 // 输入 Token 排序：普通模型缓存按套餐 20% 折算，GPT-5.6 按官方 cached/input 价格比 10% 折算。
 // ponytail: 只维护有不同官方缓存比的明确别名；新型号出现时再补这里。
 const GPT_CACHE_WEIGHT_EXPR = `CASE WHEN LOWER(COALESCE(model_name, '')) IN ('gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna') THEN 0.1 ELSE 0.2 END`;

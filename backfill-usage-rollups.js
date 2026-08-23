@@ -1,7 +1,7 @@
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const dayStart = Math.floor((Date.now() / 1000 + 28800) / 86400) * 86400 - 28800;
 const days = Math.min(30, Math.max(1, parseInt((process.argv.find(arg => arg.startsWith('--days=')) || '').split('=')[1]) || 30));
-const anthropicUsage = `LOWER(COALESCE(NULLIF(SUBSTRING(l.other FROM '"usage_semantic":"([^"]+)"'), ''), '')) = 'anthropic'`;
+const anthropicUsage = `l.other LIKE '%"usage_semantic":"anthropic"%'`;
 
 function parseOther(text) {
   try { return JSON.parse(text || '{}'); } catch { return {}; }
