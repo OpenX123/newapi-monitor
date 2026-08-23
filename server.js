@@ -891,6 +891,9 @@ const GPT_CACHE_WEIGHT_EXPR = `CASE WHEN LOWER(COALESCE(model_name, '')) IN ('gp
 const RAW_FRESH_INPUT_TOKENS_EXPR = `CASE WHEN ${ANTHROPIC_USAGE_EXPR} THEN COALESCE(prompt_tokens, 0) ELSE GREATEST(COALESCE(prompt_tokens, 0) - ${CACHE_TOKENS_EXPR}, 0) END`;
 const RAW_TOTAL_TOKENS_EXPR = `COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0) + CASE WHEN ${ANTHROPIC_USAGE_EXPR} THEN ${CACHE_TOKENS_EXPR} ELSE 0 END`;
 const RAW_INPUT_TOKENS_EXPR = `${RAW_FRESH_INPUT_TOKENS_EXPR} + ${CACHE_TOKENS_EXPR} * ${GPT_CACHE_WEIGHT_EXPR}`;
+const JOINED_FRESH_INPUT_TOKENS_EXPR = `CASE WHEN l.other LIKE '%"usage_semantic":"anthropic"%' THEN COALESCE(l.prompt_tokens, 0) ELSE GREATEST(COALESCE(l.prompt_tokens, 0) - COALESCE(m.cache_tokens, 0), 0) END`;
+const JOINED_TOTAL_TOKENS_EXPR = `COALESCE(l.prompt_tokens, 0) + COALESCE(l.completion_tokens, 0) + CASE WHEN l.other LIKE '%"usage_semantic":"anthropic"%' THEN COALESCE(m.cache_tokens, 0) ELSE 0 END`;
+const JOINED_INPUT_TOKENS_EXPR = `${JOINED_FRESH_INPUT_TOKENS_EXPR} + COALESCE(m.cache_tokens, 0) * ${GPT_CACHE_WEIGHT_EXPR}`;
 const ROLLUP_INPUT_TOKENS_EXPR = `COALESCE(fresh_input_tokens, 0) + COALESCE(cache_tokens, 0) * ${GPT_CACHE_WEIGHT_EXPR}`;
 const GPT_MODEL_EXPR = `LOWER(COALESCE(model_name, '')) ~ '(gpt|codex)'`;
 const CLAUDE_MODEL_EXPR = `LOWER(COALESCE(model_name, '')) LIKE '%claude%'`;
@@ -1159,15 +1162,15 @@ async function getTodayAggregation() {
       SUM(l.quota) FILTER (WHERE l.type = 2) as quota,
       SUM(l.prompt_tokens) FILTER (WHERE l.type = 2) as prompt_tokens,
       SUM(l.completion_tokens) FILTER (WHERE l.type = 2) as completion_tokens,
-      SUM(${RAW_TOTAL_TOKENS_EXPR}) FILTER (WHERE l.type = 2) as total_tokens,
+      SUM(${JOINED_TOTAL_TOKENS_EXPR}) FILTER (WHERE l.type = 2) as total_tokens,
       SUM(COALESCE(m.cache_tokens, 0)) FILTER (WHERE l.type = 2) as cache_tokens,
-      SUM(${RAW_FRESH_INPUT_TOKENS_EXPR}) FILTER (WHERE l.type = 2) as fresh_input_tokens,
-      SUM(${RAW_INPUT_TOKENS_EXPR}) FILTER (WHERE l.type = 2) as input_tokens,
+      SUM(${JOINED_FRESH_INPUT_TOKENS_EXPR}) FILTER (WHERE l.type = 2) as fresh_input_tokens,
+      SUM(${JOINED_INPUT_TOKENS_EXPR}) FILTER (WHERE l.type = 2) as input_tokens,
       SUM(CASE WHEN LOWER(COALESCE(l.model_name, '')) ~ '(gpt|codex)' THEN
-        ${RAW_INPUT_TOKENS_EXPR}
+        ${JOINED_INPUT_TOKENS_EXPR}
         ELSE 0 END) FILTER (WHERE l.type = 2) as gpt_input_tokens,
       SUM(CASE WHEN LOWER(COALESCE(l.model_name, '')) LIKE '%claude%' THEN
-        ${RAW_INPUT_TOKENS_EXPR}
+        ${JOINED_INPUT_TOKENS_EXPR}
         ELSE 0 END) FILTER (WHERE l.type = 2) as claude_input_tokens,
       SUM(CASE WHEN LOWER(COALESCE(l.model_name, '')) ~ '(gpt|codex)' THEN COALESCE(m.cache_tokens, 0) ELSE 0 END)
         FILTER (WHERE l.type = 2) as gpt_cache_tokens,
@@ -1335,9 +1338,9 @@ function getUsageSource(range) {
         CASE WHEN l.type = 2 THEN COALESCE(l.quota, 0) ELSE 0 END,
         CASE WHEN l.type = 2 THEN COALESCE(l.prompt_tokens, 0) ELSE 0 END,
         CASE WHEN l.type = 2 THEN COALESCE(l.completion_tokens, 0) ELSE 0 END,
-        CASE WHEN l.type = 2 THEN ${RAW_TOTAL_TOKENS_EXPR} ELSE 0 END,
+        CASE WHEN l.type = 2 THEN ${JOINED_TOTAL_TOKENS_EXPR} ELSE 0 END,
         CASE WHEN l.type = 2 THEN COALESCE(m.cache_tokens, 0) ELSE 0 END,
-        CASE WHEN l.type = 2 THEN ${RAW_FRESH_INPUT_TOKENS_EXPR} ELSE 0 END,
+        CASE WHEN l.type = 2 THEN ${JOINED_FRESH_INPUT_TOKENS_EXPR} ELSE 0 END,
         l.created_at, l.created_at
       FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
       WHERE l.created_at >= GREATEST($1, $2) AND l.${REQUEST_LOGS}`,
@@ -1362,9 +1365,9 @@ async function buildUsageRollupDay(dayStart) {
       COALESCE(SUM(l.quota) FILTER (WHERE l.type = 2), 0),
       COALESCE(SUM(l.prompt_tokens) FILTER (WHERE l.type = 2), 0),
       COALESCE(SUM(l.completion_tokens) FILTER (WHERE l.type = 2), 0),
-      COALESCE(SUM(${RAW_TOTAL_TOKENS_EXPR}) FILTER (WHERE l.type = 2), 0),
+      COALESCE(SUM(${JOINED_TOTAL_TOKENS_EXPR}) FILTER (WHERE l.type = 2), 0),
       COALESCE(SUM(m.cache_tokens) FILTER (WHERE l.type = 2), 0),
-      COALESCE(SUM(${RAW_FRESH_INPUT_TOKENS_EXPR}) FILTER (WHERE l.type = 2), 0),
+      COALESCE(SUM(${JOINED_FRESH_INPUT_TOKENS_EXPR}) FILTER (WHERE l.type = 2), 0),
       MIN(l.created_at), MAX(l.created_at)
     FROM logs l LEFT JOIN monitor_log_user_agents m ON m.log_id = l.id
     WHERE l.created_at >= $1 AND l.created_at < $2 AND l.${REQUEST_LOGS}
