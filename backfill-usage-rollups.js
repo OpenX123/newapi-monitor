@@ -89,7 +89,7 @@ async function main() {
     const since = dayStart - (days - 1) * 86400;
     const metricResult = await backfillMetrics(pool, since);
     const { rows: cursorRows } = await pool.query('SELECT COALESCE(MAX(id), 0) AS max_id FROM logs');
-    await pool.query(`INSERT INTO monitor_kv (key, value) VALUES ('metrics:last_log_id', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [String(cursorRows[0].max_id)]);
+    await pool.query(`INSERT INTO monitor_kv (key, value) VALUES ('metrics:last_log_id', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [String(metricResult.lastId || cursorRows[0].max_id)]);
     const rollups = [];
     for (let day = since; day < dayStart; day += 86400) {
       rollups.push({ day, rows: await buildDay(pool, day) });

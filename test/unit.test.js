@@ -228,6 +228,7 @@ function testUsageSemantics() {
   check('Token UA 聚合不再物化完整用量源', !/if \(dimension === 'token'\)[\s\S]{0,300}WITH source AS MATERIALIZED/.test(src));
   const { metrics } = require('../backfill-usage-rollups');
   equal('增量指标识别语义、Trace 与缓存 Token', metrics('{"cache_tokens":600,"usage_semantic":"anthropic","admin_info":{"channel_affinity":{"reason":"Claude CLI Trace"}}}'), { userAgent: '', cacheTokens: 600, usageSemantic: 'anthropic', traceType: 'claude cli trace' });
+  check('回填游标不越过最后实际处理的日志', /String\(metricResult\.lastId \|\| cursorRows\[0\]\.max_id\)/.test(fs.readFileSync(path.join(__dirname, '..', 'backfill-usage-rollups.js'), 'utf8')));
   const { parseAccessLine } = require('../backfill-user-agents');
   const access = parseAccessLine('42.48.83.151 - - [14/Aug/2026:09:13:54 +0800] "POST /v1/messages?beta=true HTTP/1.1" 200 1632 "-" "claude-cli/2.1.89 (external, cli)" "-"');
   check('访问日志能提取 IP、接口与完整 UA', access?.ip === '42.48.83.151' && access.path === '/v1/messages' && access.userAgent === 'claude-cli/2.1.89 (external, cli)');
