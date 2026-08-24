@@ -1549,19 +1549,24 @@ async function getSnapshotTodayCached() {
 const ERROR_ROWS_LIMIT = parseInt(process.env.ERROR_ROWS_LIMIT) || 200000;
 
 async function getErrorAnalysis(range) {
-  return await getOrBuildCached(`error-analysis:v4:${range}`, range, async () => {
+  return await getOrBuildCached(`error-analysis:v5:${range}`, range, async () => {
     const ts = getRangeTs(range);
 
     const [countRes, channelCountRes, errorRes] = await Promise.all([
       pool.query(`SELECT COUNT(*) as cnt FROM logs WHERE created_at >= $1 AND ${REQUEST_LOGS}`, [ts]),
       pool.query(`
         SELECT
-          COALESCE(NULLIF(channel_id::text, ''), 'unknown') AS channel_key,
-          COALESCE(NULLIF(channel_name, ''), 'unknown') AS channel_name,
+          COALESCE(NULLIF(l.channel_id, 0)::text, 'unknown') AS channel_key,
+          COALESCE(
+            NULLIF(c.name, ''),
+            MAX(NULLIF(l.channel_name, '')) FILTER (WHERE l.channel_name !~ '^[0-9]+$'),
+            'unknown'
+          ) AS channel_name,
           COUNT(*) AS total_requests
-        FROM logs
-        WHERE created_at >= $1 AND ${REQUEST_LOGS}
-        GROUP BY COALESCE(NULLIF(channel_id::text, ''), 'unknown'), COALESCE(NULLIF(channel_name, ''), 'unknown')
+        FROM logs l
+        LEFT JOIN channels c ON c.id = l.channel_id
+        WHERE l.created_at >= $1 AND l.${REQUEST_LOGS}
+        GROUP BY l.channel_id, c.name
       `, [ts]),
       // 关键：字段解析和「是否失败」的判断都下推到 SQL，绝不把 other 整列传回 Node。
       // 原来这里会把范围内所有带 JSON 的消费日志全查回来再在 JS 里过滤：
@@ -1607,6 +1612,15 @@ async function getErrorAnalysis(range) {
       channel_name: r.channel_name,
       total_requests: parseInt(r.total_requests) || 0,
     }]));
+    const channelNameMap = new Map();
+    for (const [key, value] of channelTotalMap) {
+      if (value.channel_name !== 'unknown') channelNameMap.set(key, value.channel_name);
+    }
+    for (const r of errorRes.rows) {
+      const channelKey = r.resolved_channel_key || 'unknown';
+      const rawName = r.resolved_channel_raw || '';
+      if (!channelNameMap.has(channelKey) && rawName && !/^\d+$/.test(rawName)) channelNameMap.set(channelKey, rawName);
+    }
 
     // SQL 已经完成解析与过滤，这里只做类型规整
     const normalizedRows = errorRes.rows.map(r => ({
@@ -1619,7 +1633,7 @@ async function getErrorAnalysis(range) {
       token_id: parseInt(r.token_id) || 0,
       model_name: r.model_name || '',
       resolved_channel_key: r.resolved_channel_key || 'unknown',
-      resolved_channel: r.resolved_channel_raw || r.resolved_channel_key || 'unknown',
+      resolved_channel: channelNameMap.get(r.resolved_channel_key || 'unknown') || 'unknown',
       status_code: r.status_code || 'unknown',
       error_type: r.error_type || 'unknown',
       stream_status: r.stream_status || '',

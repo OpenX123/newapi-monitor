@@ -207,6 +207,8 @@ function testUsageSemantics() {
   check('报错分析不再把 other 整列传回 Node', !/SELECT id, created_at, type, content[\s\S]{0,200}channel_id, channel_name, other\s*\n\s*FROM logs/.test(src));
   check('报错分析跳过不兼容的 Unicode 转义', /REPLACE\(other, chr\(92\) \|\| 'u0000', ''\) IS JSON/.test(src) && /REPLACE\(other, chr\(92\) \|\| 'u0000', ''\)::jsonb/.test(src));
   check('报错明细有行数上限兜底', /LIMIT \$2/.test(src) && /ERROR_ROWS_LIMIT/.test(src));
+  check('报错分析按渠道 ID 汇总并优先使用渠道表名称', /LEFT JOIN channels c ON c\.id = l\.channel_id/.test(src) && /GROUP BY l\.channel_id, c\.name/.test(src));
+  check('报错分析不再把纯数字渠道 ID 当名称展示', /!channelNameMap\.has\(channelKey\) && rawName && !\/\^\\d\+\$\/\.test\(rawName\)/.test(src) && /channelNameMap\.get\(r\.resolved_channel_key \|\| 'unknown'\) \|\| 'unknown'/.test(src) && /error-analysis:v5/.test(src));
   check('聚合缓存带版本号', /CACHE_SCHEMA_VERSION/.test(src));
   check('脚本告警同时按模型名统计 Claude/GPT', /model_name[\s\S]{0,180}claude_calls[\s\S]{0,180}gpt_calls/.test(src));
   check('非聚焦告警可分别关闭', /CONFIG\.alertUsageAnomaly && triggers\.length/.test(src) && /CONFIG\.alertDailyLimit && t\.count/.test(src));
