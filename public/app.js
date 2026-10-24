@@ -120,6 +120,7 @@ const COLUMNS = {
     { key: '#', label: '#' },
     { key: 'username', label: '用户', sortable: true },
     { key: 'token_count', label: 'Token数', sortable: true },
+    { key: 'ip_count', label: 'IP 数量', sortable: true },
     { key: 'count', label: '调用次数', sortable: true },
     { key: 'total_tokens', label: '总 Token', sortable: true },
     { key: 'quota', label: '费用', sortable: true },
@@ -285,10 +286,28 @@ function gotoPage(p) {
   renderTableBody();
 }
 
+// ==================== 共享使用判定 ====================
+// 来源 IP 数达到阈值即视为多人共用同一账号；红色只保留给这一种信号
+function shareThreshold(dim) {
+  const raw = dim === 'token' ? config.shareIpPerToken : config.shareIpPerUser;
+  return Math.max(2, parseInt(raw) || 2);
+}
+function isSharedRow(r, dim) {
+  return (r.ip_count || 0) >= shareThreshold(dim);
+}
+function sharedBadge(r, dim) {
+  if (!isSharedRow(r, dim)) return '';
+  const ips = r.ip_count || 0;
+  const threshold = shareThreshold(dim);
+  const who = dim === 'token' ? 'Token' : '用户';
+  return `<span class="share-badge" title="${who}「${escapeHtml((r.username || r.token_name || '-').toString())}」来源 IP ${ips} 个，达到阈值 ${threshold}，疑似多人共用同一账号">👥 共享使用</span>`;
+}
+
 function renderTokenRow(t, i, limit) {
   const overLimit = t.count > limit;
   const pct = Math.min(t.count / limit * 100, 100);
   const isWl = whitelistIds.has(t.token_id);
+  const shared = isSharedRow(t, 'token');
   const models = t.models ? Object.entries(t.models).sort((a,b) => b[1]-a[1]).slice(0,3)
     .map(([m,c]) => `<span class="model-tag">${m}×${c}</span>`).join('') : '';
   const status = tokenStatuses[t.token_id];
@@ -297,14 +316,14 @@ function renderTokenRow(t, i, limit) {
     ? `<span title="仅按 Terra 成本计入 ${t.cost_priced_calls.toLocaleString()} 次 Sol/Terra 调用">${formatUSDValue(t.cost_usd)}</span>`
     : '--';
   return `
-    <tr class="${overLimit && !isWl ? 'over-limit' : ''}">
+    <tr class="${shared ? 'row-shared' : ''}">
       <td>${i+1}</td>
       <td><strong>${t.token_name || '-'}</strong><br><span class="dim">ID: ${t.token_id}</span></td>
       ${tokenUsageCell(t)}
       ${tokenFamilyCells(t)}
-      <td><div class="count-bar"><span>${t.count}</span><div class="count-bar-bg"><div class="count-bar-fill ${overLimit?'danger':''}" style="width:${pct}%"></div></div></div></td>
-      <td>${t.ip_count || 0}</td>
-      <td>${t.username}${isWl ? ' <span class="wl-badge"><svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>' : ''}</td>
+      <td><div class="count-bar" title="${overLimit ? `超过日调用上限 ${limit}` : ''}"><span>${t.count}</span><div class="count-bar-bg"><div class="count-bar-fill ${overLimit?'warn':''}" style="width:${pct}%"></div></div></div></td>
+      <td class="${shared ? 'share-ip-count' : ''}">${t.ip_count || 0}</td>
+      <td>${t.username}${isWl ? ' <span class="wl-badge"><svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>' : ''}${sharedBadge(t, 'token')}</td>
       <td>${formatUSD(t.quota)}</td>
       <td>${cost}</td>
       <td><div class="model-tags">${models}</div></td>
@@ -315,7 +334,8 @@ function renderTokenRow(t, i, limit) {
     </tr>`;
 }
 function renderUserRow(r, i) {
-  return `<tr><td>${i+1}</td><td><strong>${r.username || '-'}</strong></td><td>${r.token_count || '-'}</td><td>${r.count}</td>${tokenUsageCell(r)}<td>${formatUSD(r.quota)}</td><td><button class="btn-analyze" onclick="analyzeItem('user', '${r.username}', '${r.username}')">分析</button></td></tr>`;
+  const shared = isSharedRow(r, 'user');
+  return `<tr class="${shared ? 'row-shared' : ''}"><td>${i+1}</td><td><strong>${r.username || '-'}</strong>${sharedBadge(r, 'user')}</td><td>${r.token_count || '-'}</td><td class="${shared ? 'share-ip-count' : ''}">${r.ip_count || 0}</td><td>${r.count}</td>${tokenUsageCell(r)}<td>${formatUSD(r.quota)}</td><td><button class="btn-analyze" onclick="analyzeItem('user', '${r.username}', '${r.username}')">分析</button></td></tr>`;
 }
 function renderModelRow(r, i) {
   return `<tr><td>${i+1}</td><td><span class="model-tag">${r.model_name || '-'}</span></td><td>${r.count}</td>${tokenUsageCell(r)}<td>${formatUSD(r.quota)}</td></tr>`;
@@ -1048,6 +1068,7 @@ function loadSettingsUI() {
   set('cfgSurgeCostUsd', config.surgeCostUsd ?? 5);
   set('cfgShareIpPerToken', config.shareIpPerToken ?? 2);
   set('cfgShareUsersPerIp', config.shareUsersPerIp ?? 2);
+  set('cfgShareIpPerUser', config.shareIpPerUser ?? 2);
   set('cfgSubscriptionAlertPct', config.subscriptionAlertPct ?? 20);
   set('cfgSmtpHost', config.smtpHost || '');
   set('cfgSmtpPort', config.smtpPort || 587);
@@ -1151,6 +1172,7 @@ document.getElementById('btnSaveConfig').addEventListener('click', async () => {
     surgeCostUsd: parseFloat(val('cfgSurgeCostUsd')) || 0,
     shareIpPerToken: parseInt(val('cfgShareIpPerToken')) || 2,
     shareUsersPerIp: parseInt(val('cfgShareUsersPerIp')) || 2,
+    shareIpPerUser: parseInt(val('cfgShareIpPerUser')) || 2,
     subscriptionAlertPct: parseFloat(val('cfgSubscriptionAlertPct')) || 0,
   };
   // 密钥类字段：留空 = 不修改，填了才提交

@@ -171,7 +171,7 @@ function testWiring() {
   const put = extract("app.put('/api/config'", "app.post('/api/notify/test'");
   const keys = ['dailyLimit', 'notifyEmail', 'smtpHost', 'smtpPort', 'smtpUser', 'notifyScript',
     'alertDailyLimit', 'alertUsageAnomaly', 'alertIpUsers', 'alertSubscription', 'scriptClaudeAlertCalls', 'scriptGptAlertCalls', 'disablePolicy', 'disableOnScript', 'ruleEnabled', 'surgeWindowMin', 'surgeCalls', 'surgeRatio',
-    'surgeCostUsd', 'shareIpPerToken', 'shareUsersPerIp', 'alertCooldownMin', 'subscriptionAlertPct'];
+    'surgeCostUsd', 'shareIpPerToken', 'shareUsersPerIp', 'shareIpPerUser', 'alertCooldownMin', 'subscriptionAlertPct'];
   const broken = keys.filter(k => !kv.includes(k) || !pub.includes(k) || !put.includes(k));
   check('配置项在持久化/读取/写入三处齐全', broken.length === 0, broken.join('、'));
 
@@ -236,6 +236,45 @@ function testUsageSemantics() {
   check('访问日志能提取 IP、接口与完整 UA', access?.ip === '42.48.83.151' && access.path === '/v1/messages' && access.userAgent === 'claude-cli/2.1.89 (external, cli)');
 }
 
+// ---------- 共享使用标注 ----------
+function testSharedUsage() {
+  section('共享使用标注');
+  const src = serverSource();
+  const js = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+  const css = fs.readFileSync(path.join(__dirname, '..', 'public', 'style.css'), 'utf8');
+
+  // 抽出前端真实实现来判断，避免测一份复制品
+  const slice = js.slice(js.indexOf('function shareThreshold'), js.indexOf('function renderTokenRow'));
+  check('共享判定实现在前端可见', slice.includes('function shareThreshold') && slice.includes('function isSharedRow'));
+  const shared = eval(`(function(){ const config = { shareIpPerToken: 2, shareIpPerUser: 2 };
+    const escapeHtml = t => String(t).replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    ${slice}
+    return { shareThreshold, isSharedRow, sharedBadge }; })()`);
+
+  equal('用户阈值取单用户最多 IP 数', shared.shareThreshold('user'), 2);
+  equal('Token 阈值取单 Token 最多 IP 数', shared.shareThreshold('token'), 2);
+  check('达到阈值判定为共享', shared.isSharedRow({ ip_count: 2 }, 'user') === true);
+  check('未达阈值不算共享', shared.isSharedRow({ ip_count: 1 }, 'user') === false);
+  check('共享行带「共享使用」徽章', shared.sharedBadge({ ip_count: 3, username: 'alice' }, 'user').includes('共享使用'));
+  check('非共享行没有徽章', shared.sharedBadge({ ip_count: 1, username: 'alice' }, 'user') === '');
+
+  const loose = eval(`(function(){ const config = { shareIpPerToken: 1, shareIpPerUser: 1 };
+    ${slice}
+    return { shareThreshold, isSharedRow }; })()`);
+  equal('阈值最低按 2 个 IP 生效', loose.shareThreshold('user'), 2);
+  check('单个 IP 永远不算共享', loose.isSharedRow({ ip_count: 1 }, 'user') === false);
+
+  const userCols = js.slice(js.indexOf('  user: ['), js.indexOf('  model: ['));
+  check('用户排行有「IP 数量」列', /key: 'ip_count', label: 'IP 数量'/.test(userCols));
+  check('用户维度统计来源 IP 数', /user:\s*\{ group: 'username'.*COUNT\(DISTINCT NULLIF\(ip, ''\)\) as ip_count/.test(src));
+  check('共享使用有独立配置项', /shareIpPerUser: parseInt\(process\.env\.SHARE_IP_PER_USER\)/.test(src) && /shareIpPerUser: CONFIG\.shareIpPerUser/.test(src));
+
+  check('排行表不再按调用次数整行标红', !/overLimit && !isWl \? 'over-limit'/.test(js));
+  check('次数超限改为橙色提示', /count-bar-fill \$\{overLimit\?'warn':''\}/.test(js) && !/count-bar-fill \$\{overLimit\?'danger':''\}/.test(js));
+  check('超标 Token 统计卡用橙色', /stat-card count-warn/.test(fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8')) && /\.stat-card\.count-warn \.stat-value \{ color: var\(--warn\)/.test(css));
+  check('共享行有独立红色样式', /tr\.row-shared \{ background: rgba\(255,77,79/.test(css) && /\.share-badge \{/.test(css));
+}
+
 (async () => {
   await testFeishu();
   testNotifyOverrides();
@@ -243,5 +282,6 @@ function testUsageSemantics() {
   testConfigSafety();
   testWiring();
   testUsageSemantics();
+  testSharedUsage();
   process.exit(summary() ? 0 : 1);
 })();

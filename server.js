@@ -66,6 +66,7 @@ const CONFIG = {
   surgeCostUsd: parseFloat(process.env.SURGE_COST_USD) || 5,        // 窗口内费用阈值（美元）
   shareIpPerToken: parseInt(process.env.SHARE_IP_PER_TOKEN) || 2,   // 单 Token 窗口内 IP 数
   shareUsersPerIp: parseInt(process.env.SHARE_USERS_PER_IP) || 2,   // 单 IP 窗口内用户数
+  shareIpPerUser: parseInt(process.env.SHARE_IP_PER_USER) || 2,     // 单用户来源 IP 数：面板标注「共享使用」的阈值
   alertCooldownMin: parseInt(process.env.ALERT_COOLDOWN_MIN) || 30, // 同一对象同类告警的冷却时间
   // 订阅余量低于此百分比时提醒续费，设为 0 关闭
   subscriptionAlertPct: process.env.SUBSCRIPTION_ALERT_PCT != null ? parseFloat(process.env.SUBSCRIPTION_ALERT_PCT) : 20,
@@ -423,6 +424,7 @@ const KV_CONFIG_KEYS = {
   surgeCostUsd: v => parseFloat(v) || 5,
   shareIpPerToken: v => parseInt(v) || 2,
   shareUsersPerIp: v => parseInt(v) || 2,
+  shareIpPerUser: v => Math.max(1, parseInt(v) || 2),
   alertCooldownMin: v => parseInt(v) || 30,
   subscriptionAlertPct: v => (v === '' ? 0 : parseFloat(v) || 0),
 };
@@ -1403,7 +1405,7 @@ async function getAggregation(range, dimension) {
   const dims = {
     token: { group: 'token_id, token_name, username, user_id', select: `token_id, token_name, username, user_id,
       COUNT(DISTINCT NULLIF(ip, '')) as ip_count` },
-    user:  { group: 'username', select: 'username, COUNT(DISTINCT token_id) as token_count' },
+    user:  { group: 'username', select: "username, COUNT(DISTINCT token_id) as token_count, COUNT(DISTINCT NULLIF(ip, '')) as ip_count" },
     model: { group: 'model_name', select: 'model_name' },
     group: { group: '"group"', select: '"group" as grp' },
     channel: { group: 'channel_id, channel_name', select: 'channel_id as channel, channel_name' },
@@ -2822,6 +2824,7 @@ function publicConfig() {
     surgeCostUsd: CONFIG.surgeCostUsd,
     shareIpPerToken: CONFIG.shareIpPerToken,
     shareUsersPerIp: CONFIG.shareUsersPerIp,
+    shareIpPerUser: CONFIG.shareIpPerUser,
     alertCooldownMin: CONFIG.alertCooldownMin,
     subscriptionAlertPct: CONFIG.subscriptionAlertPct,
     channels: {
@@ -2880,6 +2883,7 @@ app.put('/api/config', async (req, res) => {
   await apply('surgeCostUsd', body.surgeCostUsd, v => Math.max(0, parseFloat(v) || 0));
   await apply('shareIpPerToken', body.shareIpPerToken, v => Math.max(1, parseInt(v) || 2));
   await apply('shareUsersPerIp', body.shareUsersPerIp, v => Math.max(1, parseInt(v) || 2));
+  await apply('shareIpPerUser', body.shareIpPerUser, v => Math.max(1, parseInt(v) || 2));
   await apply('alertCooldownMin', body.alertCooldownMin, v => Math.max(1, parseInt(v) || 30));
   await apply('subscriptionAlertPct', body.subscriptionAlertPct, v => Math.min(100, Math.max(0, parseFloat(v) || 0)));
   // 空字符串 = 保持原值；显式传 null 才是清空

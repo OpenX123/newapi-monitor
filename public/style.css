@@ -94,6 +94,8 @@ tr.row-new td:first-child { box-shadow: inset 3px 0 0 #2ecc71; }
 }
 .stat-card:hover { border-color: var(--accent); }
 .stat-card.warn .stat-value { color: var(--danger); }
+/* 超标 Token 等「按次数」的数字用橙色，红色只留给共享使用 */
+.stat-card.count-warn .stat-value { color: var(--warn); }
 .stat-value { font-size: 28px; font-weight: 700; color: var(--accent); }
 .stat-label { font-size: 12px; color: var(--text-dim); margin-top: 4px; }
 
@@ -157,6 +159,17 @@ tbody tr:hover { background: rgba(255,255,255,0.03); }
 .wl-badge { color: var(--success); font-size: 11px; }
 tr.over-limit { background: rgba(255,77,79,0.08); }
 tr.over-limit:hover { background: rgba(255,77,79,0.12); }
+/* 共享使用：红色只留给「多人共用同一账号」这一个信号 */
+tr.row-shared { background: rgba(255,77,79,0.08); }
+tr.row-shared:hover { background: rgba(255,77,79,0.12); }
+.share-badge {
+  display: inline-flex; align-items: center; gap: 3px;
+  margin-left: 6px; padding: 1px 8px; border-radius: 999px;
+  font-size: 11px; white-space: nowrap;
+  background: rgba(255,77,79,0.15); color: var(--danger);
+  border: 1px solid rgba(255,77,79,0.3);
+}
+.share-ip-count { color: var(--danger); font-weight: 600; }
 
 /* 模型标签 */
 .model-tags { display: flex; flex-wrap: wrap; gap: 4px; }
@@ -223,6 +236,7 @@ tr.over-limit:hover { background: rgba(255,77,79,0.12); }
 .count-bar-bg { flex: 1; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; max-width: 100px; }
 .count-bar-fill { height: 100%; border-radius: 3px; background: var(--accent); transition: width 0.3s; }
 .count-bar-fill.danger { background: var(--danger); }
+.count-bar-fill.warn { background: var(--warn); }
 
 /* 图表 */
 .chart-row { margin-bottom: 16px; }

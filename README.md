@@ -82,6 +82,7 @@ npm run test:db # 集成测试，把面板会发出的每条 SQL 在真实库上
 | `SURGE_COST_USD` | 窗口内费用阈值（美元） | `5` |
 | `SHARE_IP_PER_TOKEN` | 单 Token 窗口内 IP 数阈值 | `2` |
 | `SHARE_USERS_PER_IP` | 单 IP 窗口内账号数阈值 | `2` |
+| `SHARE_IP_PER_USER` | 单用户来源 IP 数阈值，达到即在面板标注「共享使用」并标红 | `2` |
 | `ALERT_COOLDOWN_MIN` | 同类告警冷却（分钟） | `30` |
 | `DISABLE_POLICY` | 超限处置：`notify_only`（仅告警）/ `auto`（自动禁用） | `notify_only` |
 | `DISABLE_ON_SCRIPT` | 脚本行为是否也自动禁用（需 `DISABLE_POLICY=auto`） | `false` |

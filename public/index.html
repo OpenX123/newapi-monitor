@@ -53,7 +53,7 @@
         <div class="stat-value" id="statTokens">-</div>
         <div class="stat-label">活跃 Token</div>
       </div>
-      <div class="stat-card warn">
+      <div class="stat-card count-warn">
         <div class="stat-value" id="statOverLimit">-</div>
         <div class="stat-label">超标 Token</div>
       </div>
@@ -375,6 +375,11 @@
             <label>单 IP 最多账号数</label>
             <input type="number" id="cfgShareUsersPerIp" min="1">
             <span class="setting-hint">同一 IP 下出现多个账号即告警</span>
+          </div>
+          <div class="setting-item">
+            <label>单用户最多 IP 数</label>
+            <input type="number" id="cfgShareIpPerUser" min="1">
+            <span class="setting-hint">同一账号来源 IP 达到此数，排行表标注「共享使用」并标红</span>
           </div>
         </div>
         <div class="setting-item">
