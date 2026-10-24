@@ -275,6 +275,54 @@ function testSharedUsage() {
   check('共享行有独立红色样式', /tr\.row-shared \{ background: rgba\(255,77,79/.test(css) && /\.share-badge \{/.test(css));
 }
 
+// ---------- IP 归属地 ----------
+function testGeoLookup() {
+  section('IP 归属地');
+  const src = serverSource();
+  const js = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+  const css = fs.readFileSync(path.join(__dirname, '..', 'public', 'style.css'), 'utf8');
+
+  const isPublicIp = eval(`(function(){ ${extract('function isPublicIp(ip) {', '// 国家/省/市去重后拼成一行标签')} return isPublicIp; })()`);
+  const normalizeGeo = eval(`(function(){ ${extract('function normalizeGeo(country, region, city, isp) {', 'function httpJson(')} return normalizeGeo; })()`);
+
+  check('公网 IPv4 判定为可查询', isPublicIp('112.32.67.1') === true);
+  check('公网 IPv6 判定为可查询', isPublicIp('240e:1234::1') === true);
+  check('内网地址不查归属地', isPublicIp('192.168.1.10') === false && isPublicIp('10.0.0.1') === false);
+  check('回环与链路本地不查归属地', isPublicIp('127.0.0.1') === false && isPublicIp('169.254.1.1') === false);
+  check('CGNAT 与保留段不查归属地', isPublicIp('100.64.0.1') === false && isPublicIp('172.16.0.1') === false);
+  check('回环 IPv6 不查归属地', isPublicIp('::1') === false);
+  check('占位符与非法值不查归属地', isPublicIp('(未记录)') === false && isPublicIp('') === false && isPublicIp('999.1.1.1') === false);
+
+  const geo = normalizeGeo('新加坡', 'North West', '新加坡', 'Aofei Data');
+  equal('归属地拼成一行标签', geo.label, '新加坡 · North West');
+  equal('归属地保留 ISP', geo.isp, 'Aofei Data');
+  equal('重复地名只出现一次', normalizeGeo('中国', '安徽', '安徽', 'x').label, '中国 · 安徽');
+  equal('缺省字段不产生多余分隔符', normalizeGeo('中国', '', '', '').label, '中国');
+
+  check('提供批量归属地接口', /app\.post\('\/api\/geo'/.test(src));
+  check('归属地结果按 IP 缓存', /cacheSetJson\(`geo:\$\{ip\}`/.test(src) && /geoCacheTtlSeconds/.test(src));
+  check('归属地查询有免费接口兜底', /ip-api\.com\/batch/.test(src) && /ipwho\.is/.test(src));
+  check('批量查询按 100 个 IP 分片', /const GEO_BATCH_SIZE = 100/.test(src));
+  check('归属地来源可切换且兜底限量', /geoProvider: String\(process\.env\.GEO_PROVIDER/.test(src) && /const GEO_FALLBACK_LIMIT = 20/.test(src));
+  check('ip-api 批量查询带上 query 字段', /fields=status,query,country,regionName,city,isp/.test(src));
+  check('归属地可整体关闭', /geoEnabled: String\(process\.env\.GEO_ENABLED/.test(src) && /geoEnabled: CONFIG\.geoEnabled/.test(src));
+
+  const ipCols = js.slice(js.indexOf('  ip: ['), js.indexOf('};', js.indexOf('  ip: [')));
+  check('按 IP 排行有归属地列', /key: 'geo', label: '归属地'/.test(ipCols));
+  check('调用记录与分析弹窗都挂了归属地', /geoCell\(r\.ip\)/.test(js) && /geoCell\(ip\)/.test(js));
+  check('归属地异步补齐不阻塞首屏', /async function enrichGeo/.test(js) && /api\('\/api\/geo', 'POST'/.test(js));
+  check('归属地有独立样式', /\.geo-text \{/.test(css) && /\.ip-cell \{/.test(css));
+
+  const slice = js.slice(js.indexOf('function geoCell('), js.indexOf('function renderTokenRow('));
+  const frontend = eval(`(function(){ const escapeHtml = t => String(t).replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    ${slice}
+    return { geoCell }; })()`);
+  const cell = frontend.geoCell('112.32.67.1');
+  check('IP 单元格带 data-geo-ip 标记', cell.includes('data-geo-ip="112.32.67.1"'));
+  check('IP 单元格预留归属地位置', cell.includes('geo-text'));
+  check('IP 文本做 HTML 转义', frontend.geoCell('<script>').includes('&lt;script&gt;'));
+}
+
 (async () => {
   await testFeishu();
   testNotifyOverrides();
@@ -283,5 +331,6 @@ function testSharedUsage() {
   testWiring();
   testUsageSemantics();
   testSharedUsage();
+  testGeoLookup();
   process.exit(summary() ? 0 : 1);
 })();

@@ -70,6 +70,11 @@ const CONFIG = {
   alertCooldownMin: parseInt(process.env.ALERT_COOLDOWN_MIN) || 30, // 同一对象同类告警的冷却时间
   // 订阅余量低于此百分比时提醒续费，设为 0 关闭
   subscriptionAlertPct: process.env.SUBSCRIPTION_ALERT_PCT != null ? parseFloat(process.env.SUBSCRIPTION_ALERT_PCT) : 20,
+  // IP 归属地：免费接口（ip-api 批量 + ipwho.is 兜底），命中后缓存 30 天
+  geoEnabled: String(process.env.GEO_ENABLED || 'true').toLowerCase() !== 'false',
+  geoProvider: String(process.env.GEO_PROVIDER || 'ip-api').toLowerCase(),
+  geoCacheTtlSeconds: parseInt(process.env.GEO_CACHE_TTL_SECONDS) || 2592000,
+  geoTimeoutMs: parseInt(process.env.GEO_TIMEOUT_MS) || 12000,
 };
 let pollTimer = null;
 let ruleTimer = null;
@@ -493,6 +498,21 @@ async function cacheGetJson(key) {
   }
 }
 
+async function cacheGetJsonMany(keys) {
+  if (!redisReady || !keys.length) return keys.map(() => null);
+  try {
+    const values = await redis.mGet(keys.map(cacheKey));
+    return values.map(v => {
+      if (!v) return null;
+      try { return JSON.parse(v); } catch { return null; }
+    });
+  } catch (err) {
+    redisReady = false;
+    console.error('Redis 批量读取失败:', err.message);
+    return keys.map(() => null);
+  }
+}
+
 async function cacheSetJson(key, value, ttlSeconds = CONFIG.cacheTtlSeconds) {
   if (!redisReady) return;
   try {
@@ -540,6 +560,169 @@ async function withCacheLock(lockName, fn) {
     console.error('Redis 锁失败:', err.message);
     return await fn();
   }
+}
+
+// ==================== IP 归属地 ====================
+// 免费来源：ip-api.com（批量 100 个/次，支持 zh-CN）+ ipwho.is（HTTPS 兜底）
+// 归属地变化很慢，命中缓存后 30 天内不再请求外部接口
+const GEO_BATCH_SIZE = 100;
+const GEO_FALLBACK_LIMIT = 20; // 兜底接口逐个查，一次最多查这么多
+const geoMemoryCache = new Map();
+
+function isPublicIp(ip) {
+  const s = String(ip || '').trim();
+  if (!s) return false;
+  if (s.includes(':')) {
+    const low = s.toLowerCase();
+    if (low === '::1' || low.startsWith('fc') || low.startsWith('fd') || low.startsWith('fe80')) return false;
+    return /^[0-9a-f:]+$/.test(low);
+  }
+  const parts = s.split('.');
+  if (parts.length !== 4) return false;
+  const n = parts.map(p => parseInt(p, 10));
+  if (n.some(p => !Number.isInteger(p) || p < 0 || p > 255)) return false;
+  const [a, b] = n;
+  if (a === 0 || a === 10 || a === 127) return false;
+  if (a === 169 && b === 254) return false;
+  if (a === 172 && b >= 16 && b <= 31) return false;
+  if (a === 192 && b === 168) return false;
+  if (a === 100 && b >= 64 && b <= 127) return false; // CGNAT
+  return true;
+}
+
+// 国家/省/市去重后拼成一行标签（新加坡这类会重复出现）
+function normalizeGeo(country, region, city, isp) {
+  const parts = [country, region, city].map(v => String(v || '').trim()).filter(Boolean);
+  const uniq = [];
+  for (const p of parts) if (!uniq.some(u => u.toLowerCase() === p.toLowerCase())) uniq.push(p);
+  return {
+    country: String(country || '').trim(),
+    region: String(region || '').trim(),
+    city: String(city || '').trim(),
+    isp: String(isp || '').trim(),
+    label: uniq.join(' · '),
+  };
+}
+
+function httpJson(url, options = {}) {
+  return new Promise((resolve, reject) => {
+    const mod = url.startsWith('https:') ? https : http;
+    const req = mod.request(url, options, (res) => {
+      let body = '';
+      res.on('data', (chunk) => {
+        body += chunk;
+        if (body.length > 4 * 1024 * 1024) { req.destroy(new Error('响应过大')); }
+      });
+      res.on('end', () => {
+        if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
+        try { resolve(JSON.parse(body)); } catch (err) { reject(err); }
+      });
+    });
+    req.setTimeout(CONFIG.geoTimeoutMs, () => req.destroy(new Error('归属地接口超时')));
+    req.on('error', reject);
+    if (options.body) req.write(options.body);
+    req.end();
+  });
+}
+
+// ip-api.com：批量查询，支持中文（免费版限 45 次/分钟、单次最多 100 个 IP）
+// 注意：fields 里必须带 query，否则响应里没有 IP 字段、无法与请求对应
+async function fetchGeoFromIpApi(ips) {
+  const out = {};
+  for (let i = 0; i < ips.length; i += GEO_BATCH_SIZE) {
+    const chunk = ips.slice(i, i + GEO_BATCH_SIZE);
+    const body = JSON.stringify(chunk);
+    const options = {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      body,
+    };
+    const url = 'http://ip-api.com/batch?lang=zh-CN&fields=status,query,country,regionName,city,isp';
+    let res = null;
+    for (let attempt = 0; attempt < 2 && !res; attempt++) {
+      try {
+        res = await httpJson(url, options);
+      } catch (err) {
+        if (attempt === 0) await sleep(800);
+        else throw err;
+      }
+    }
+    if (!Array.isArray(res)) continue;
+    res.forEach((item, index) => {
+      if (!item || item.status !== 'success') return;
+      // 正常带 query；缺失时按批量响应顺序回退对应
+      const ip = item.query || chunk[index];
+      if (!ip) return;
+      out[ip] = normalizeGeo(item.country, item.regionName, item.city, item.isp);
+    });
+  }
+  return out;
+}
+
+// ipwho.is：HTTPS 兜底，无批量接口，英文地名
+async function fetchGeoFromIpWho(ips) {
+  const out = {};
+  const concurrency = 4;
+  for (let i = 0; i < ips.length; i += concurrency) {
+    const chunk = ips.slice(i, i + concurrency);
+    const results = await Promise.all(chunk.map(async (ip) => {
+      try {
+        const d = await httpJson(`https://ipwho.is/${encodeURIComponent(ip)}`);
+        if (!d || d.success === false) return null;
+        return [ip, normalizeGeo(d.country, d.region, d.city, (d.connection || {}).isp)];
+      } catch {
+        return null;
+      }
+    }));
+    for (const r of results) if (r) out[r[0]] = r[1];
+  }
+  return out;
+}
+async function lookupGeo(ips) {
+  const result = {};
+  const pending = [];
+  for (const raw of ips) {
+    const ip = String(raw || '').trim();
+    if (!ip) continue;
+    const hit = geoMemoryCache.get(ip);
+    if (hit) { result[ip] = hit; continue; }
+    if (!pending.includes(ip)) pending.push(ip);
+  }
+  if (!pending.length) return result;
+
+  // Redis 批量取缓存
+  const cached = await cacheGetJsonMany(pending.map(ip => `geo:${ip}`));
+  const misses = [];
+  pending.forEach((ip, i) => {
+    if (cached[i]) { geoMemoryCache.set(ip, cached[i]); result[ip] = cached[i]; }
+    else misses.push(ip);
+  });
+  if (!misses.length) return result;
+
+  let fetched = {};
+  const provider = CONFIG.geoProvider === 'ipwho' ? 'ipwho' : 'ip-api';
+  try {
+    fetched = provider === 'ipwho'
+      ? await fetchGeoFromIpWho(misses.slice(0, GEO_FALLBACK_LIMIT))
+      : await fetchGeoFromIpApi(misses);
+  } catch (err) {
+    console.error(`${provider} 归属地查询失败:`, err.message);
+  }
+  // 主源没查到的，用 ipwho.is 兜底（逐个查，限量避免打爆对方接口）
+  const stillMissing = misses.filter(ip => !fetched[ip]).slice(0, GEO_FALLBACK_LIMIT);
+  if (stillMissing.length && provider !== 'ipwho') {
+    try {
+      fetched = { ...fetched, ...(await fetchGeoFromIpWho(stillMissing)) };
+    } catch (err) {
+      console.error('ipwho.is 归属地查询失败:', err.message);
+    }
+  }
+  for (const [ip, geo] of Object.entries(fetched)) {
+    geoMemoryCache.set(ip, geo);
+    result[ip] = geo;
+    await cacheSetJson(`geo:${ip}`, geo, CONFIG.geoCacheTtlSeconds);
+  }
+  return result;
 }
 
 // ==================== one-api 请求封装 ====================
@@ -2326,6 +2509,28 @@ app.get('/api/stats', async (req, res) => {
   res.json({ success: true, data });
 });
 
+// IP 归属地：批量查公开 IP，内网/保留地址直接跳过
+app.post('/api/geo', async (req, res) => {
+  if (!CONFIG.geoEnabled) return res.json({ success: true, data: {} });
+  const raw = Array.isArray(req.body && req.body.ips) ? req.body.ips : [];
+  const ips = [];
+  for (const item of raw) {
+    const ip = String(item || '').trim();
+    if (!ip || ips.includes(ip)) continue;
+    if (!isPublicIp(ip)) continue;
+    ips.push(ip);
+    if (ips.length >= 300) break;
+  }
+  if (!ips.length) return res.json({ success: true, data: {} });
+  try {
+    const data = await lookupGeo(ips);
+    res.json({ success: true, data });
+  } catch (err) {
+    console.error('归属地查询失败:', err.message);
+    res.json({ success: true, data: {} });
+  }
+});
+
 app.get('/api/trend', async (req, res) => {
   const range = req.query.range || 'today';
   const data = await getOrBuildCached(`trend:${range}`, range, () => getHourlyTrend(range));
@@ -2827,6 +3032,8 @@ function publicConfig() {
     shareIpPerUser: CONFIG.shareIpPerUser,
     alertCooldownMin: CONFIG.alertCooldownMin,
     subscriptionAlertPct: CONFIG.subscriptionAlertPct,
+    geoEnabled: CONFIG.geoEnabled,
+    geoProvider: CONFIG.geoProvider,
     channels: {
       email: Boolean(getTransporter()),
       feishu: Boolean(CONFIG.feishuWebhook),

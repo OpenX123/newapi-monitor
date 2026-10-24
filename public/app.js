@@ -150,6 +150,7 @@ const COLUMNS = {
   ip: [
     { key: '#', label: '#' },
     { key: 'ip', label: '客户端 IP', sortable: true },
+    { key: 'geo', label: '归属地', sortable: false },
     { key: 'count', label: '调用次数', sortable: true },
     { key: 'user_count', label: '活跃用户', sortable: true },
     { key: 'token_count', label: '活跃 Token', sortable: true },
@@ -255,6 +256,7 @@ function renderTableBody() {
   }).join('');
 
   renderPagination(rows.length);
+  enrichGeo();
 }
 
 function renderPagination(totalItems) {
@@ -303,6 +305,50 @@ function sharedBadge(r, dim) {
   return `<span class="share-badge" title="${who}「${escapeHtml((r.username || r.token_name || '-').toString())}」来源 IP ${ips} 个，达到阈值 ${threshold}，疑似多人共用同一账号">👥 共享使用</span>`;
 }
 
+// ==================== IP 归属地 ====================
+// 服务端批量查询并缓存；表格先渲染、归属地异步补齐，不阻塞首屏
+const geoCache = new Map();
+let geoRequesting = false;
+
+function geoCell(ip, showIp = true) {
+  const safe = escapeHtml(String(ip || ''));
+  const ipText = showIp ? `<span class="ip-text">${safe}</span>` : '';
+  return `<span class="ip-cell" data-geo-ip="${safe}">${ipText}<span class="geo-text"></span></span>`;
+}
+
+function fillGeoNodes() {
+  document.querySelectorAll('[data-geo-ip]').forEach(el => {
+    const geo = geoCache.get(el.dataset.geoIp);
+    const slot = el.querySelector('.geo-text');
+    if (!slot || !geo) return;
+    slot.textContent = geo.label || '';
+    slot.title = geo.isp ? `ISP：${geo.isp}` : '';
+  });
+}
+
+async function enrichGeo() {
+  if (config.geoEnabled === false) return;
+  const nodes = Array.from(document.querySelectorAll('[data-geo-ip]'));
+  if (!nodes.length) return;
+  const missing = [];
+  for (const el of nodes) {
+    const ip = el.dataset.geoIp;
+    if (!ip || geoCache.has(ip) || missing.includes(ip)) continue;
+    missing.push(ip);
+  }
+  if (!missing.length) { fillGeoNodes(); return; }
+  if (geoRequesting) { setTimeout(enrichGeo, 600); return; }
+  geoRequesting = true;
+  try {
+    const res = await api('/api/geo', 'POST', { ips: missing });
+    if (res.success && res.data) {
+      for (const [ip, geo] of Object.entries(res.data)) geoCache.set(ip, geo);
+    }
+  } catch {}
+  geoRequesting = false;
+  fillGeoNodes();
+}
+
 function renderTokenRow(t, i, limit) {
   const overLimit = t.count > limit;
   const pct = Math.min(t.count / limit * 100, 100);
@@ -349,7 +395,7 @@ function renderChannelRow(r, i) {
 function renderIpRow(r, i) {
   const isMissing = r.ip === '(未记录)';
   const action = isMissing ? '-' : `<button class="btn-analyze" onclick="showIpLogs('${r.ip.replace(/'/g, "\\'")}')">查看调用</button>`;
-  return `<tr><td>${i + 1}</td><td><strong>${r.ip}</strong></td><td>${formatNumber(r.count)}</td><td>${r.user_count}</td><td>${r.token_count}</td><td>${formatTime(r.first_at)}</td><td>${formatTime(r.last_at)} ${action}</td></tr>`;
+  return `<tr><td>${i + 1}</td><td><strong>${r.ip}</strong></td><td class="geo-cell">${isMissing ? '-' : geoCell(r.ip, false)}</td><td>${formatNumber(r.count)}</td><td>${r.user_count}</td><td>${r.token_count}</td><td>${formatTime(r.first_at)}</td><td>${formatTime(r.last_at)} ${action}</td></tr>`;
 }
 
 // 实时规则产生的告警类型
@@ -850,7 +896,7 @@ async function loadLogs(page) {
     const total = Number(r.total_tokens) || 0;
     const isNew = !isFirstRender && logsPage === 1 && !previous.has(String(r.id));
     return `<tr class="${isNew ? 'row-new' : ''}">
-      <td>${formatTime(r.created_at)}</td><td>${r.ip || '-'}</td><td>${r.username}</td><td><span class="dim">#${r.token_id}</span> ${r.token_name || ''}</td>
+      <td>${formatTime(r.created_at)}</td><td>${r.ip ? geoCell(r.ip) : '-'}</td><td>${r.username}</td><td><span class="dim">#${r.token_id}</span> ${r.token_name || ''}</td>
       <td><span class="model-tag">${r.model_name}</span>${failed ? ' <span class="dim">失败</span>' : ''}</td>
       <td>${failed ? '-' : formatUSD(r.quota)}</td>
       <td>${(r.fresh_input_tokens||0).toLocaleString()}${r.cache_tokens > 0 ? `<br><span class="dim">缓存 ${(r.cache_tokens).toLocaleString()}</span>` : ''}</td>
@@ -860,6 +906,7 @@ async function loadLogs(page) {
     </tr>`;
   }).join('');
   seenLogIds = current;
+  enrichGeo();
   // 分页
   const totalPages = Math.ceil(total / pageSize);
   const pag = document.getElementById('logsPagination');
@@ -1295,7 +1342,7 @@ async function analyzeItem(type, value, displayName) {
 
   html += `<div class="analysis-ip-panel">
     <strong>来源 IP · ${b.ip_count || 0} 个</strong>
-    <div class="analysis-ip-list">${(d.ips || []).map(ip => `<span>${escapeHtml(ip)}</span>`).join('') || '<span>未记录</span>'}</div>
+    <div class="analysis-ip-list">${(d.ips || []).map(ip => `<span class="ip-chip">${geoCell(ip)}</span>`).join('') || '<span>未记录</span>'}</div>
   </div>`;
 
   html += `<div class="analysis-card full ua-summary-card">
@@ -1415,6 +1462,7 @@ async function analyzeItem(type, value, displayName) {
 
   html += '</div>'; // close analysis-grid
   document.getElementById('modalBody').innerHTML = html;
+  enrichGeo();
 
   // === 渲染 Chart.js 图表 ===
   const chartColors = ['#4a9eff','#ff6b6b','#feca57','#48dbfb','#ff9ff3','#54a0ff','#5f27cd','#01a3a4','#f368e0','#ff9f43'];

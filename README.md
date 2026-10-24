@@ -84,6 +84,9 @@ npm run test:db # 集成测试，把面板会发出的每条 SQL 在真实库上
 | `SHARE_USERS_PER_IP` | 单 IP 窗口内账号数阈值 | `2` |
 | `SHARE_IP_PER_USER` | 单用户来源 IP 数阈值，达到即在面板标注「共享使用」并标红 | `2` |
 | `ALERT_COOLDOWN_MIN` | 同类告警冷却（分钟） | `30` |
+| `GEO_ENABLED` | 是否展示 IP 归属地（关掉后不外发任何 IP） | `true` |
+| `GEO_PROVIDER` | 归属地来源：`ip-api`（批量、中文）/ `ipwho`（HTTPS、英文地名） | `ip-api` |
+| `GEO_CACHE_TTL_SECONDS` | 归属地缓存时长（秒） | `2592000`（30 天） |
 | `DISABLE_POLICY` | 超限处置：`notify_only`（仅告警）/ `auto`（自动禁用） | `notify_only` |
 | `DISABLE_ON_SCRIPT` | 脚本行为是否也自动禁用（需 `DISABLE_POLICY=auto`） | `false` |
 | `SUBSCRIPTION_ALERT_PCT` | 订阅余量低于此百分比时提醒续费，`0` 关闭 | `20` |
